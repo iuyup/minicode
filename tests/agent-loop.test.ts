@@ -4,6 +4,7 @@ import test from "node:test";
 import { AgentLoop } from "../src/agent/agent-loop.ts";
 import type { AgentTool, ChatModel, JsonValue, ModelRequest, ModelResponse } from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
+import { WorkingLedger } from "../src/agent/working-ledger.ts";
 
 const emptyTool: AgentTool<JsonValue> = {
   name: "inspect",
@@ -25,7 +26,7 @@ test("the loop appends a tool result before the model gives its final answer", a
       callCount += 1;
       if (callCount === 1) {
         assert.equal(request.messages.at(-1)?.role, "user");
-        assert.match(request.workingState, /none yet/);
+        assert.match(request.workingState, /暂无/);
         return {
           kind: "tool_calls",
           content: "Need evidence.",
@@ -42,13 +43,15 @@ test("the loop appends a tool result before the model gives its final answer", a
         content: "confirmed-fact",
       });
       assert.match(request.workingState, /confirmed-fact/);
-      return { kind: "final", content: "Used confirmed-fact." };
+      return { kind: "final", content: "已使用 confirmed-fact。" };
     },
   };
 
-  const result = await new AgentLoop(model, new ToolRegistry([emptyTool])).run("Inspect the project.");
+  const result = await new AgentLoop(model, new ToolRegistry([emptyTool]), {
+    workspaceRoot: process.cwd(),
+  }).run("检查项目。");
 
-  assert.equal(result.answer, "Used confirmed-fact.");
+  assert.equal(result.answer, "已使用 confirmed-fact。");
   assert.deepEqual(
     result.events.map((event) => event.type),
     [
@@ -78,11 +81,13 @@ test("an unknown tool still receives a terminal lifecycle event and a tool error
       const toolMessage = request.messages.at(-1);
       assert.equal(toolMessage?.role, "tool");
       assert.equal(toolMessage?.status, "error");
-      return { kind: "final", content: "I received the tool error." };
+      return { kind: "final", content: "我已收到工具错误。" };
     },
   };
 
-  const result = await new AgentLoop(model, new ToolRegistry([emptyTool])).run("Use a missing tool.");
+  const result = await new AgentLoop(model, new ToolRegistry([emptyTool]), {
+    workspaceRoot: process.cwd(),
+  }).run("使用不存在的工具。");
   const finalized = result.events.find((event) => event.type === "tool_finalized");
 
   assert.deepEqual(finalized, {
@@ -91,6 +96,15 @@ test("an unknown tool still receives a terminal lifecycle event and a tool error
     toolCallId: "missing-1",
     toolName: "missing_tool",
     status: "error",
-    detail: "Unknown tool: missing_tool",
+    detail: "未知工具：missing_tool",
   });
+});
+
+test("任务账本只保留紧凑的工具观察摘要", () => {
+  const ledger = new WorkingLedger("验证摘要长度");
+  ledger.record({ toolName: "read_file", status: "success", summary: "a".repeat(600) });
+
+  const rendered = ledger.render();
+  assert.match(rendered, /任务账本摘要已截断/);
+  assert.ok(rendered.length < 600);
 });

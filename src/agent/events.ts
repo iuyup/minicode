@@ -1,6 +1,18 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
 export type AgentEvent =
   | { type: "model_requested"; step: number }
   | { type: "tool_call"; step: number; toolCallId: string; toolName: string }
+  | {
+      type: "policy_decision";
+      step: number;
+      toolCallId: string;
+      toolName: string;
+      decision: "allowed" | "blocked";
+      path: string;
+      reason: string;
+    }
   | { type: "tool_execution_started"; step: number; toolCallId: string; toolName: string }
   | {
       type: "tool_finalized";
@@ -18,5 +30,81 @@ export class InMemoryEventLog {
 
   record(event: AgentEvent): void {
     this.events.push(event);
+  }
+}
+
+export interface AgentEventAuditLog {
+  record(event: AgentEvent): void;
+  flush(): Promise<void>;
+}
+
+interface SanitizedAuditEvent {
+  timestamp: string;
+  type: AgentEvent["type"];
+  step: number;
+  toolCallId?: string;
+  toolName?: string;
+  decision?: "allowed" | "blocked";
+  status?: "success" | "error";
+  path?: string;
+  reason?: string;
+  detailLength?: number;
+}
+
+function sanitize(event: AgentEvent): SanitizedAuditEvent {
+  const base = { timestamp: new Date().toISOString(), type: event.type, step: event.step };
+  switch (event.type) {
+    case "tool_call":
+    case "tool_execution_started":
+      return { ...base, toolCallId: event.toolCallId, toolName: event.toolName };
+    case "policy_decision":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        decision: event.decision,
+        path: event.path,
+        reason: event.reason,
+      };
+    case "tool_finalized":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        status: event.status,
+        detailLength: event.detail.length,
+      };
+    case "model_requested":
+    case "agent_completed":
+    case "agent_stopped":
+      return base;
+  }
+}
+
+/**
+ * 持久化审计只保留生命周期元数据；工具结果、补丁内容和模型上下文不写入 JSONL。
+ */
+export class JsonlAuditLog implements AgentEventAuditLog {
+  readonly #pending: AgentEvent[] = [];
+  readonly filePath: string;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
+
+  record(event: AgentEvent): void {
+    this.#pending.push(event);
+  }
+
+  async flush(): Promise<void> {
+    if (this.#pending.length === 0) {
+      return;
+    }
+
+    const events = [...this.#pending];
+    const output = `${events.map((event) => JSON.stringify(sanitize(event))).join("\n")}\n`;
+    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    await fs.appendFile(this.filePath, output, "utf8");
+    this.#pending.splice(0, events.length);
   }
 }

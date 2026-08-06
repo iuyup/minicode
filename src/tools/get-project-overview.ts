@@ -16,13 +16,13 @@ function validateEmptyObject(input: JsonValue): ValidationResult<EmptyInput> {
 
 export const getProjectOverview: AgentTool<EmptyInput> = {
   name: "get_project_overview",
-  description: "Return the confirmed scope of the offline first-week demo.",
+  description: "返回当前离线演示已确认的能力边界。",
   validate: validateEmptyObject,
   async execute(_input, context): Promise<string> {
     return [
-      `Task received: ${context.task}`,
-      "This first-week build has an Agent Loop, typed tool contract, FakeModel, working ledger, lifecycle events, CLI demo, and tests.",
-      "It intentionally has no live model, file mutation, shell execution, or policy layer yet.",
+      `收到的任务：${context.task}`,
+      "当前实现包含 Agent Loop、工具契约、FakeModel、任务级账本、生命周期事件、只读工作区工具、CLI 演示和测试。",
+      "它仍未接入真实模型、文件修改、补丁应用、命令执行或持久化审计。",
     ].join(" ");
   },
 };

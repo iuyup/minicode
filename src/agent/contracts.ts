@@ -53,9 +53,26 @@ export type ValidationResult<T> =
 export interface ToolExecutionContext {
   task: string;
   step: number;
+  workspaceRoot: string;
+  executionMode?: ToolExecutionMode;
+  requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  recordPolicyDecision?: (decision: ToolPolicyDecision) => void;
 }
 
-export interface AgentTool<TInput extends JsonValue = JsonValue> {
+export type ToolExecutionMode = "propose" | "apply";
+
+export interface EditApprovalRequest {
+  path: string;
+  preview: string;
+}
+
+export interface ToolPolicyDecision {
+  decision: "allowed" | "blocked";
+  path: string;
+  reason: string;
+}
+
+export interface AgentTool<TInput = JsonValue> {
   name: string;
   description: string;
   validate(input: JsonValue): ValidationResult<TInput>;

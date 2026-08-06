@@ -1,30 +1,52 @@
 import type { ChatModel, ModelRequest, ModelResponse, ToolResultMessage } from "../agent/contracts.ts";
 
 /**
- * A deterministic stand-in for an LLM. It makes the first tool call, then
- * proves that the second model turn can see the ToolResultMessage.
+ * 确定性的 LLM 替身：先搜索，再读取真实源文件，最后基于 ToolResultMessage 回答。
  */
 export class FakeModel implements ChatModel {
   async complete(request: ModelRequest): Promise<ModelResponse> {
-    const overview = request.messages.find(
+    const searchResult = request.messages.find(
       (message): message is ToolResultMessage =>
-        message.role === "tool" && message.name === "get_project_overview",
+        message.role === "tool" && message.name === "search_text",
+    );
+    const fileResult = request.messages.find(
+      (message): message is ToolResultMessage =>
+        message.role === "tool" && message.name === "read_file",
     );
 
-    if (!overview) {
+    if (!searchResult) {
       return {
         kind: "tool_calls",
-        content: "I need the local project overview before answering.",
-        toolCalls: [{ id: "call-overview-1", name: "get_project_overview", input: {} }],
+        content: "我需要先在真实工作区中定位未知工具的处理逻辑。",
+        toolCalls: [{ id: "call-search-1", name: "search_text", input: { query: "未知工具", path: "src" } }],
       };
     }
 
+    if (!fileResult) {
+      return {
+        kind: "tool_calls",
+        content: "搜索结果给出了候选位置，我需要读取对应源码确认细节。",
+        toolCalls: [
+          {
+            id: "call-read-1",
+            name: "read_file",
+            input: { path: "src/agent/agent-loop.ts", startLine: 100, endLine: 130 },
+          },
+        ],
+      };
+    }
+
+    const evidence =
+      fileResult.content.split("\n").find((line) => line.includes("未知工具")) ??
+      fileResult.content.split("\n").at(-1) ??
+      "未找到可展示的源码行。";
     return {
       kind: "final",
       content: [
-        "Offline loop completed.",
-        `Evidence from the tool: ${overview.content}`,
-        "The model did not receive a hard-coded answer; it answered after the ToolResultMessage was appended.",
+        "只读代码侦察闭环已完成。",
+        `代码证据：${evidence}`,
+        `搜索工具已确认候选位置：${searchResult.content.split("\n").find((line) => line.includes("agent-loop.ts")) ?? "未显示候选位置。"}`,
+        "模型是在 search_text 和 read_file 的结果写回消息历史后，才给出该结论。",
       ].join("\n"),
     };
   }

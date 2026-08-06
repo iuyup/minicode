@@ -1,11 +1,14 @@
 import type {
   AgentMessage,
   ChatModel,
+  EditApprovalRequest,
   JsonValue,
   ToolCall,
+  ToolExecutionMode,
   ToolResultMessage,
 } from "./contracts.ts";
-import { InMemoryEventLog, type AgentEvent } from "./events.ts";
+import path from "node:path";
+import { InMemoryEventLog, type AgentEvent, type AgentEventAuditLog } from "./events.ts";
 import { ToolRegistry } from "./tool-registry.ts";
 import { WorkingLedger } from "./working-ledger.ts";
 
@@ -17,31 +20,43 @@ export interface AgentRunResult {
 }
 
 export interface AgentLoopOptions {
+  workspaceRoot: string;
   maxSteps?: number;
   systemPrompt?: string;
+  executionMode?: ToolExecutionMode;
+  requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  auditLog?: AgentEventAuditLog;
 }
 
 const DEFAULT_SYSTEM_PROMPT = [
-  "You are a coding agent running in an offline demonstration.",
-  "Use a tool when you need a fact, and use the returned tool result as evidence.",
-  "Do not invent a tool result.",
+  "你是一个运行在离线演示中的 Coding Agent。",
+  "需要事实时必须调用工具，并将工具结果作为证据。",
+  "不得编造工具结果。",
 ].join(" ");
 
 export class AgentLoop {
   private readonly model: ChatModel;
   private readonly tools: ToolRegistry;
+  readonly #workspaceRoot: string;
   readonly #maxSteps: number;
   readonly #systemPrompt: string;
+  readonly #executionMode: ToolExecutionMode;
+  readonly #requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  readonly #auditLog?: AgentEventAuditLog;
 
   constructor(
     model: ChatModel,
     tools: ToolRegistry,
-    options: AgentLoopOptions = {},
+    options: AgentLoopOptions,
   ) {
     this.model = model;
     this.tools = tools;
+    this.#workspaceRoot = path.resolve(options.workspaceRoot);
     this.#maxSteps = options.maxSteps ?? 6;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    this.#executionMode = options.executionMode ?? "propose";
+    this.#requestEditApproval = options.requestEditApproval;
+    this.#auditLog = options.auditLog;
   }
 
   async run(task: string): Promise<AgentRunResult> {
@@ -52,45 +67,49 @@ export class AgentLoop {
     const events = new InMemoryEventLog();
     const ledger = new WorkingLedger(task);
 
-    for (let step = 1; step <= this.#maxSteps; step += 1) {
-      events.record({ type: "model_requested", step });
-      const response = await this.model.complete({
-        messages,
-        tools: this.tools.describe(),
-        workingState: ledger.render(),
-      });
-
-      if (response.kind === "final") {
-        messages.push({ role: "assistant", content: response.content });
-        events.record({ type: "agent_completed", step });
-        return {
-          answer: response.content,
+    try {
+      for (let step = 1; step <= this.#maxSteps; step += 1) {
+        this.recordEvent(events, { type: "model_requested", step });
+        const response = await this.model.complete({
           messages,
-          events: events.events,
+          tools: this.tools.describe(),
           workingState: ledger.render(),
-        };
-      }
-
-      messages.push({
-        role: "assistant",
-        content: response.content,
-        toolCalls: response.toolCalls,
-      });
-
-      for (const toolCall of response.toolCalls) {
-        const result = await this.executeToolCall(toolCall, task, step, events);
-        messages.push(result);
-        ledger.record({
-          toolName: result.name,
-          status: result.status,
-          summary: result.content,
         });
-      }
-    }
 
-    const reason = `Reached maxSteps=${this.#maxSteps} without a final answer.`;
-    events.record({ type: "agent_stopped", step: this.#maxSteps, reason });
-    throw new Error(reason);
+        if (response.kind === "final") {
+          messages.push({ role: "assistant", content: response.content });
+          this.recordEvent(events, { type: "agent_completed", step });
+          return {
+            answer: response.content,
+            messages,
+            events: events.events,
+            workingState: ledger.render(),
+          };
+        }
+
+        messages.push({
+          role: "assistant",
+          content: response.content,
+          toolCalls: response.toolCalls,
+        });
+
+        for (const toolCall of response.toolCalls) {
+          const result = await this.executeToolCall(toolCall, task, step, events);
+          messages.push(result);
+          ledger.record({
+            toolName: result.name,
+            status: result.status,
+            summary: result.content,
+          });
+        }
+      }
+
+      const reason = `达到最大步数 maxSteps=${this.#maxSteps}，但模型尚未给出最终回答。`;
+      this.recordEvent(events, { type: "agent_stopped", step: this.#maxSteps, reason });
+      throw new Error(reason);
+    } finally {
+      await this.#auditLog?.flush();
+    }
   }
 
   private async executeToolCall(
@@ -99,7 +118,7 @@ export class AgentLoop {
     step: number,
     events: InMemoryEventLog,
   ): Promise<ToolResultMessage> {
-    events.record({
+    this.recordEvent(events, {
       type: "tool_call",
       step,
       toolCallId: toolCall.id,
@@ -112,7 +131,7 @@ export class AgentLoop {
         events,
         step,
         toolCall,
-        `Unknown tool: ${toolCall.name}`,
+        `未知工具：${toolCall.name}`,
       );
     }
 
@@ -121,7 +140,7 @@ export class AgentLoop {
       return this.finalizeError(events, step, toolCall, validation.error);
     }
 
-    events.record({
+    this.recordEvent(events, {
       type: "tool_execution_started",
       step,
       toolCallId: toolCall.id,
@@ -129,8 +148,23 @@ export class AgentLoop {
     });
 
     try {
-      const content = await tool.execute(validation.value, { task, step });
-      events.record({
+      const content = await tool.execute(validation.value, {
+        task,
+        step,
+        workspaceRoot: this.#workspaceRoot,
+        executionMode: this.#executionMode,
+        requestEditApproval: this.#requestEditApproval,
+        recordPolicyDecision: (decision) => {
+          this.recordEvent(events, {
+            type: "policy_decision",
+            step,
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            ...decision,
+          });
+        },
+      });
+      this.recordEvent(events, {
         type: "tool_finalized",
         step,
         toolCallId: toolCall.id,
@@ -147,7 +181,7 @@ export class AgentLoop {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return this.finalizeError(events, step, toolCall, `Tool failed: ${message}`);
+      return this.finalizeError(events, step, toolCall, `工具执行失败：${message}`);
     }
   }
 
@@ -157,7 +191,7 @@ export class AgentLoop {
     toolCall: ToolCall,
     content: string,
   ): ToolResultMessage {
-    events.record({
+    this.recordEvent(events, {
       type: "tool_finalized",
       step,
       toolCallId: toolCall.id,
@@ -172,5 +206,10 @@ export class AgentLoop {
       status: "error",
       content,
     };
+  }
+
+  private recordEvent(events: InMemoryEventLog, event: AgentEvent): void {
+    events.record(event);
+    this.#auditLog?.record(event);
   }
 }

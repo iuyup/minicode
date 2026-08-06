@@ -9,7 +9,7 @@
   },
   "scripts": {
     "demo": "node src/cli.ts",
-    "test": "node --test tests/agent-loop.test.ts",
+    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts",
     "check": "tsc -p tsconfig.json"
   },
   "devDependencies": {

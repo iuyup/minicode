@@ -1,6 +1,6 @@
 # Mini Coding Agent
 
-一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。第一周只实现离线闭环，不接入任何真实模型，也不修改用户项目文件。
+一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码侦察与受控补丁闭环；不接入真实模型，不执行任意命令。
 
 ## 已完成的闭环
 
@@ -13,34 +13,49 @@
   -> FakeModel 基于结果给出最终回答
 ```
 
-当前实现刻意只包含：
+当前实现包含：
 
 - `AgentLoop`：最大轮数控制、消息历史和工具调度；
 - `AgentTool`：工具名、描述、参数校验和执行函数的契约；
 - `ToolRegistry`：工具按名字查找，禁止重复注册；
 - `WorkingLedger`：只记录当前任务已验证的观察结果；
-- 生命周期事件：`tool_call`、`tool_execution_started`、`tool_finalized`；
+- 生命周期事件：`tool_call`、`policy_decision`、`tool_execution_started`、`tool_finalized`；
 - `FakeModel`：确定性模拟“先调用工具，再读取工具结果”的两轮模型行为；
-- Node 内置测试：验证成功和未知工具失败都拥有完整终态。
+- 只读工具：`list_files`、`search_text`、`read_file`；
+- 受控写工具：`apply_patch`，仅允许唯一的精确文本替换；
+- `WorkspacePolicy`：只允许工作区相对路径，拒绝越界、受保护路径和扫描中的符号链接；
+- `JsonlAuditLog`：将脱敏的生命周期元数据追加写入 JSONL；
+- Node 内置测试：验证成功、未知工具、受保护路径、输出截断、补丁确认和审计终态。
 
-这不是可用的生产 Coding Agent。文件读写、补丁、命令执行、路径策略、持久化审计和真实模型适配会在后续阶段逐步加入。
+路径策略是 Agent 层防护，不是操作系统沙箱。`apply_patch` 只允许修改已存在的小型 UTF-8 文本文件，禁止受保护路径；确认前后会比对文件字节，以避免覆盖确认期间发生的修改。
 
 ## 运行
 
-要求：Node.js 22.18 或以上。项目没有 npm 依赖，Node 的 TypeScript type stripping 会直接运行 `.ts` 文件。
+要求：Node.js 22.18 或以上。先安装开发依赖以运行 TypeScript 类型检查；Node 的 TypeScript type stripping 会直接运行 `.ts` 文件。
 
 ```powershell
-cd C:\Users\CX10\Desktop\mini-coding-agent
-cmd.exe /d /c npm run demo -- "解释第一周离线闭环"
+cd C:\Users\CX10\Desktop\minicode
+cmd.exe /d /c npm install
+cmd.exe /d /c npm run demo -- --workspace . "说明未知工具为何仍有完整的终态事件"
 cmd.exe /d /c npm test
 cmd.exe /d /c npm run check
 ```
 
 本机 PowerShell 会拦截 `npm.ps1`，所以示例通过 `cmd.exe` 调用 npm 的 Windows 命令入口。在未受该执行策略影响的终端中，直接使用 `npm run demo`、`npm test` 和 `npm run check` 即可。
 
+`apply_patch` 默认处于 `propose` 模式，只输出补丁预览、不写文件。只有在交互式终端传入 `--apply`，并输入精确的 `APPLY` 后才会原子写入：
+
+```powershell
+cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问题"
+```
+
+当前 `FakeModel` 的演示流程只会检索和读取源码，不会自行发起补丁；受控写入由测试中的脚本化模型覆盖。每次 CLI 运行都会在 `reports/tool-audit.jsonl` 追加审计记录，也可用 `--audit <path>` 改写位置。审计通过共同的 `toolCallId` 关联 `tool_call`、`policy_decision` 与 `tool_finalized`，但不保存模型上下文、文件内容或补丁原文。
+
 ## 当前取舍
 
 - 不引入 LangGraph 或 Agent SDK：本阶段的目标是看清 Loop、消息和工具之间的最小契约。
 - 不接真实模型：FakeModel 让循环、错误路径和测试完全可重复；真实调用会单独说明目的、风险和文件影响后再进行。
 - 不并发：先保证消息顺序、错误终态和可测试性，副作用工具的并发留到后续按资源设计。
+- 不开放任意文件写入：补丁只能对唯一旧文本做替换，默认预览，写入必须人工确认。
 - 不把 Working Ledger 当长期记忆：它只保存这一轮任务中由工具确认的事实。
+- 不读取受保护路径：`.git`、`node_modules`、`.env` 和 `.env.*` 不会出现在目录、搜索或读取结果中。
