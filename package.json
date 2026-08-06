@@ -1,0 +1,19 @@
+{
+  "name": "mini-coding-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small, auditable coding-agent learning project.",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "demo": "node src/cli.ts",
+    "test": "node --test tests/agent-loop.test.ts",
+    "check": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  }
+}
