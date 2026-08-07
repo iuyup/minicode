@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import type { ToolExecutionMetadata } from "./contracts.ts";
+
 export type AgentEvent =
   | { type: "model_requested"; step: number }
   | { type: "tool_call"; step: number; toolCallId: string; toolName: string }
@@ -21,6 +23,7 @@ export type AgentEvent =
       toolName: string;
       status: "success" | "error";
       detail: string;
+      metadata?: ToolExecutionMetadata;
     }
   | { type: "agent_completed"; step: number }
   | { type: "agent_stopped"; step: number; reason: string };
@@ -49,6 +52,27 @@ interface SanitizedAuditEvent {
   path?: string;
   reason?: string;
   detailLength?: number;
+  action?: string;
+  exitCode?: number | null;
+  durationMs?: number;
+  outputLength?: number;
+  outputTruncated?: boolean;
+  timedOut?: boolean;
+}
+
+function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExecutionMetadata | undefined {
+  if (!metadata) {
+    return undefined;
+  }
+
+  const sanitized: ToolExecutionMetadata = {};
+  if (metadata.action !== undefined) sanitized.action = metadata.action;
+  if (metadata.exitCode !== undefined) sanitized.exitCode = metadata.exitCode;
+  if (metadata.durationMs !== undefined) sanitized.durationMs = metadata.durationMs;
+  if (metadata.outputLength !== undefined) sanitized.outputLength = metadata.outputLength;
+  if (metadata.outputTruncated !== undefined) sanitized.outputTruncated = metadata.outputTruncated;
+  if (metadata.timedOut !== undefined) sanitized.timedOut = metadata.timedOut;
+  return sanitized;
 }
 
 function sanitize(event: AgentEvent): SanitizedAuditEvent {
@@ -73,6 +97,7 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
         toolName: event.toolName,
         status: event.status,
         detailLength: event.detail.length,
+        ...sanitizeMetadata(event.metadata),
       };
     case "model_requested":
     case "agent_completed":

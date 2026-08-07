@@ -1,3 +1,4 @@
+import { ToolExecutionError } from "./contracts.ts";
 import type {
   AgentMessage,
   ChatModel,
@@ -5,6 +6,8 @@ import type {
   JsonValue,
   ToolCall,
   ToolExecutionMode,
+  ToolExecutionMetadata,
+  ToolExecutionOutput,
   ToolResultMessage,
 } from "./contracts.ts";
 import path from "node:path";
@@ -148,7 +151,7 @@ export class AgentLoop {
     });
 
     try {
-      const content = await tool.execute(validation.value, {
+      const execution = await tool.execute(validation.value, {
         task,
         step,
         workspaceRoot: this.#workspaceRoot,
@@ -164,24 +167,27 @@ export class AgentLoop {
           });
         },
       });
+      const output: ToolExecutionOutput = typeof execution === "string" ? { content: execution } : execution;
       this.recordEvent(events, {
         type: "tool_finalized",
         step,
         toolCallId: toolCall.id,
         toolName: toolCall.name,
         status: "success",
-        detail: content,
+        detail: output.content,
+        metadata: output.metadata,
       });
       return {
         role: "tool",
         toolCallId: toolCall.id,
         name: toolCall.name,
         status: "success",
-        content,
+        content: output.content,
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return this.finalizeError(events, step, toolCall, `工具执行失败：${message}`);
+      const metadata = error instanceof ToolExecutionError ? error.metadata : undefined;
+      return this.finalizeError(events, step, toolCall, `工具执行失败：${message}`, metadata);
     }
   }
 
@@ -190,6 +196,7 @@ export class AgentLoop {
     step: number,
     toolCall: ToolCall,
     content: string,
+    metadata?: ToolExecutionMetadata,
   ): ToolResultMessage {
     this.recordEvent(events, {
       type: "tool_finalized",
@@ -198,6 +205,7 @@ export class AgentLoop {
       toolName: toolCall.name,
       status: "error",
       detail: content,
+      ...(metadata ? { metadata } : {}),
     });
     return {
       role: "tool",

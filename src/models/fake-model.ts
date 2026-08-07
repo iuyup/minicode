@@ -5,6 +5,41 @@ import type { ChatModel, ModelRequest, ModelResponse, ToolResultMessage } from "
  */
 export class FakeModel implements ChatModel {
   async complete(request: ModelRequest): Promise<ModelResponse> {
+    const task = request.messages.find((message) => message.role === "user")?.content ?? "";
+    const requestedCheck = /(?:运行|执行).*(?:测试|test)|npm\s+test/i.test(task)
+      ? "test"
+      : /(?:运行|执行).*(?:类型检查|检查|check)|npm\s+run\s+check/i.test(task)
+        ? "check"
+        : undefined;
+    const projectCheckResult = request.messages.find(
+      (message): message is ToolResultMessage =>
+        message.role === "tool" && message.name === "run_project_check",
+    );
+
+    if (requestedCheck) {
+      if (!projectCheckResult) {
+        return {
+          kind: "tool_calls",
+          content: "任务要求固定项目验证，我会调用受限验证工具。",
+          toolCalls: [{ id: "call-project-check-1", name: "run_project_check", input: { action: requestedCheck } }],
+        };
+      }
+      return {
+        kind: "final",
+        content: [
+          "受限项目验证闭环已完成。",
+          `验证动作：${requestedCheck}`,
+          `工具终态：${projectCheckResult.status}`,
+          `工具证据：${projectCheckResult.content
+            .split("\n")
+            .filter((line) => line.trim() !== "")
+            .slice(0, 8)
+            .join(" | ")}`,
+          "模型只选择固定动作，不传入命令字符串、参数或工作目录。",
+        ].join("\n"),
+      };
+    }
+
     const searchResult = request.messages.find(
       (message): message is ToolResultMessage =>
         message.role === "tool" && message.name === "search_text",

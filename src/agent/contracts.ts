@@ -72,11 +72,37 @@ export interface ToolPolicyDecision {
   reason: string;
 }
 
-export interface AgentTool<TInput = JsonValue> {
+export interface ToolExecutionMetadata {
+  action?: string;
+  exitCode?: number | null;
+  durationMs?: number;
+  outputLength?: number;
+  outputTruncated?: boolean;
+  timedOut?: boolean;
+}
+
+export interface ToolExecutionOutput {
+  content: string;
+  metadata?: ToolExecutionMetadata;
+}
+
+export type ToolExecutionResult = string | ToolExecutionOutput;
+
+export class ToolExecutionError extends Error {
+  readonly metadata?: ToolExecutionMetadata;
+
+  constructor(message: string, metadata?: ToolExecutionMetadata) {
+    super(message);
+    this.name = "ToolExecutionError";
+    this.metadata = metadata;
+  }
+}
+
+export interface AgentTool<TInput = JsonValue, TOutput extends ToolExecutionResult = string> {
   name: string;
   description: string;
   validate(input: JsonValue): ValidationResult<TInput>;
-  execute(input: TInput, context: ToolExecutionContext): Promise<string>;
+  execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
 }
 
 export interface ModelRequest {

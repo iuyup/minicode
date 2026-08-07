@@ -11,6 +11,7 @@ import { applyPatch } from "./tools/apply-patch.ts";
 import { getProjectOverview } from "./tools/get-project-overview.ts";
 import { listFiles } from "./tools/list-files.ts";
 import { readFile } from "./tools/read-file.ts";
+import { runProjectCheck } from "./tools/run-project-check.ts";
 import { searchText } from "./tools/search-text.ts";
 
 interface CliArguments {
@@ -77,7 +78,7 @@ async function requestTerminalApproval(request: EditApprovalRequest): Promise<bo
 }
 
 const { task, workspaceRoot, executionMode, auditPath } = parseArguments(process.argv.slice(2));
-const registry = new ToolRegistry([getProjectOverview, listFiles, searchText, readFile, applyPatch]);
+const registry = new ToolRegistry([getProjectOverview, listFiles, searchText, readFile, applyPatch, runProjectCheck]);
 const agent = new AgentLoop(new FakeModel(), registry, {
   workspaceRoot,
   executionMode,
