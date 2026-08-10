@@ -3,9 +3,10 @@ import process from "node:process";
 import readline from "node:readline/promises";
 
 import { AgentLoop } from "./agent/agent-loop.ts";
-import type { EditApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
+import type { ChatModel, EditApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
 import { JsonlAuditLog } from "./agent/events.ts";
 import { ToolRegistry } from "./agent/tool-registry.ts";
+import { DeepSeekModel, deepSeekDefaults } from "./models/deepseek-model.ts";
 import { FakeModel } from "./models/fake-model.ts";
 import { applyPatch } from "./tools/apply-patch.ts";
 import { getProjectOverview } from "./tools/get-project-overview.ts";
@@ -19,12 +20,16 @@ interface CliArguments {
   workspaceRoot: string;
   executionMode: ToolExecutionMode;
   auditPath: string;
+  modelProvider: "fake" | "deepseek";
+  deepseekModel: string;
 }
 
 function parseArguments(args: string[]): CliArguments {
   let workspaceRoot = process.cwd();
   let executionMode: ToolExecutionMode = "propose";
   let auditPath = path.resolve("reports/tool-audit.jsonl");
+  let modelProvider: CliArguments["modelProvider"] = "fake";
+  let deepseekModel = process.env.DEEPSEEK_MODEL ?? deepSeekDefaults.model;
   const taskParts: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -51,6 +56,24 @@ function parseArguments(args: string[]): CliArguments {
       index += 1;
       continue;
     }
+    if (argument === "--model") {
+      const requestedProvider = args[index + 1];
+      if (requestedProvider !== "fake" && requestedProvider !== "deepseek") {
+        throw new Error("--model 只能是 fake 或 deepseek。");
+      }
+      modelProvider = requestedProvider;
+      index += 1;
+      continue;
+    }
+    if (argument === "--deepseek-model") {
+      const requestedModel = args[index + 1];
+      if (!requestedModel) {
+        throw new Error("--deepseek-model 后必须提供模型标识。");
+      }
+      deepseekModel = requestedModel;
+      index += 1;
+      continue;
+    }
     taskParts.push(argument);
   }
 
@@ -59,7 +82,20 @@ function parseArguments(args: string[]): CliArguments {
     workspaceRoot,
     executionMode,
     auditPath,
+    modelProvider,
+    deepseekModel,
   };
+}
+
+function createModel(argumentsValue: CliArguments): ChatModel {
+  if (argumentsValue.modelProvider === "fake") {
+    return new FakeModel();
+  }
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) {
+    throw new Error("选择 DeepSeek 前必须设置 DEEPSEEK_API_KEY；默认 fake 模式不会请求网络。");
+  }
+  return new DeepSeekModel({ apiKey, model: argumentsValue.deepseekModel });
 }
 
 async function requestTerminalApproval(request: EditApprovalRequest): Promise<boolean> {
@@ -77,17 +113,39 @@ async function requestTerminalApproval(request: EditApprovalRequest): Promise<bo
   }
 }
 
-const { task, workspaceRoot, executionMode, auditPath } = parseArguments(process.argv.slice(2));
-const registry = new ToolRegistry([getProjectOverview, listFiles, searchText, readFile, applyPatch, runProjectCheck]);
-const agent = new AgentLoop(new FakeModel(), registry, {
+const argumentsValue = parseArguments(process.argv.slice(2));
+const { task, workspaceRoot, executionMode, auditPath, modelProvider, deepseekModel } = argumentsValue;
+const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
+const DEEPSEEK_SYSTEM_PROMPT = [
+  "你是一个受限的只读 Coding Agent，只能使用已提供的只读工具进行代码侦察。",
+  "只在需要事实证据时调用工具，并优先以最少的工具调用完成任务。",
+  "同一轮最多请求两个工具；不要重复列出或读取已确认的路径。",
+  "一旦工具结果已足以支撑结论，下一轮必须直接给出最终回答，不得继续探索。",
+  "工具结果是唯一证据；不得编造工具结果或声称执行了未提供的能力。",
+].join(" ");
+const registry = new ToolRegistry(
+  modelProvider === "deepseek"
+    ? readOnlyTools
+    : [...readOnlyTools, applyPatch, runProjectCheck],
+);
+const agent = new AgentLoop(createModel(argumentsValue), registry, {
   workspaceRoot,
   executionMode,
+  ...(modelProvider === "deepseek"
+    ? {
+        systemPrompt: DEEPSEEK_SYSTEM_PROMPT,
+        maxToolCallsPerStep: 2,
+        maxToolCalls: 6,
+      }
+    : {}),
   requestEditApproval: executionMode === "apply" ? requestTerminalApproval : undefined,
   auditLog: new JsonlAuditLog(auditPath),
 });
 const result = await agent.run(task);
 
 console.log("=== 生命周期事件 ===");
+console.log(`模型：${modelProvider === "deepseek" ? `DeepSeek / ${deepseekModel}` : "FakeModel（离线）"}`);
+console.log(`工具权限：${modelProvider === "deepseek" ? "只读侦察" : "离线全量演示"}`);
 for (const event of result.events) {
   if (event.type === "tool_finalized") {
     console.log(`${event.type} (${event.status}) -> ${event.toolName}`);

@@ -102,6 +102,16 @@ async function writeAtomically(targetPath: string, content: string): Promise<voi
 export const applyPatch: AgentTool<ApplyPatchInput> = {
   name: "apply_patch",
   description: "按精确旧文本替换为新文本；默认只生成预览，写入前必须经过人工确认。",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "工作区内的相对文件路径。" },
+      oldText: { type: "string", description: "目标文件中唯一出现的原文本。" },
+      newText: { type: "string", description: "替换后的文本，可为空。" },
+    },
+    required: ["path", "oldText", "newText"],
+    additionalProperties: false,
+  },
   validate,
   async execute(input, context): Promise<string> {
     const policy = new WorkspacePolicy(context.workspaceRoot);

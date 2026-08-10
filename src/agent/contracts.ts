@@ -44,6 +44,7 @@ export type AgentMessage =
 export interface ToolDescription {
   name: string;
   description: string;
+  parameters: JsonObject;
 }
 
 export type ValidationResult<T> =
@@ -101,6 +102,7 @@ export class ToolExecutionError extends Error {
 export interface AgentTool<TInput = JsonValue, TOutput extends ToolExecutionResult = string> {
   name: string;
   description: string;
+  parameters: JsonObject;
   validate(input: JsonValue): ValidationResult<TInput>;
   execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
 }

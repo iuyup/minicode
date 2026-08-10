@@ -22,6 +22,11 @@ function validate(input: JsonValue): ValidationResult<ListFilesInput> {
 export const listFiles: AgentTool<ListFilesInput> = {
   name: "list_files",
   description: "列出工作区中指定目录的一层内容；不显示受保护目录或符号链接。",
+  parameters: {
+    type: "object",
+    properties: { path: { type: "string", description: "工作区内的相对目录，默认根目录。" } },
+    additionalProperties: false,
+  },
   validate,
   async execute(input, context): Promise<string> {
     const policy = new WorkspacePolicy(context.workspaceRoot);

@@ -48,6 +48,16 @@ function validate(input: JsonValue): ValidationResult<ReadFileInput> {
 export const readFile: AgentTool<ReadFileInput> = {
   name: "read_file",
   description: "读取工作区内的文本文件，可按行号范围读取；输出带行号并限制长度。",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "工作区内的相对文件路径。" },
+      startLine: { type: "integer", minimum: 1, description: "起始行号，默认 1。" },
+      endLine: { type: "integer", minimum: 1, description: "结束行号。" },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
   validate,
   async execute(input, context): Promise<string> {
     const policy = new WorkspacePolicy(context.workspaceRoot);

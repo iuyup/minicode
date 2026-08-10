@@ -17,6 +17,6 @@ export class ToolRegistry {
   }
 
   describe(): ToolDescription[] {
-    return [...this.#tools.values()].map(({ name, description }) => ({ name, description }));
+    return [...this.#tools.values()].map(({ name, description, parameters }) => ({ name, description, parameters }));
   }
 }

@@ -17,12 +17,13 @@ function validateEmptyObject(input: JsonValue): ValidationResult<EmptyInput> {
 export const getProjectOverview: AgentTool<EmptyInput> = {
   name: "get_project_overview",
   description: "返回当前离线演示已确认的能力边界。",
+  parameters: { type: "object", properties: {}, additionalProperties: false },
   validate: validateEmptyObject,
   async execute(_input, context): Promise<string> {
     return [
       `收到的任务：${context.task}`,
-      "当前实现包含 Agent Loop、工具契约、FakeModel、任务级账本、生命周期事件、只读工作区工具、CLI 演示和测试。",
-      "它仍未接入真实模型、文件修改、补丁应用、命令执行或持久化审计。",
+      "当前实现包含 Agent Loop、工具契约、任务级账本、生命周期事件、只读工作区工具、受控补丁、受限项目验证、CLI 演示和测试。",
+      "默认使用离线 FakeModel；只有明确选择 DeepSeek 模型并配置环境变量后才会发起网络请求。",
     ].join(" ");
   },
 };

@@ -65,6 +65,15 @@ function containsBinaryMarker(content: Buffer): boolean {
 export const searchText: AgentTool<SearchTextInput> = {
   name: "search_text",
   description: "在工作区目录中按字面文本搜索，返回路径、行号和有限上下文。",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "要查找的非空字面文本。" },
+      path: { type: "string", description: "工作区内的相对目录，默认根目录。" },
+    },
+    required: ["query"],
+    additionalProperties: false,
+  },
   validate,
   async execute(input, context): Promise<string> {
     const policy = new WorkspacePolicy(context.workspaceRoot);

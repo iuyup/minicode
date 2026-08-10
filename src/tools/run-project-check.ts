@@ -162,6 +162,14 @@ export function createRunProjectCheckTool(
   return {
     name: "run_project_check",
     description: "在工作区根目录运行固定验证动作；只允许 test（npm test）或 check（npm run check）。",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["test", "check"], description: "固定验证动作。" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
     validate,
     async execute(input, context): Promise<ToolExecutionOutput> {
       context.recordPolicyDecision?.({

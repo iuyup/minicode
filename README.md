@@ -1,6 +1,6 @@
 # Mini Coding Agent
 
-一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码侦察、受控补丁与受限项目验证闭环；不接入真实模型，也不接受任意命令。
+一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码侦察、受控补丁、受限项目验证，以及 DeepSeek 模型适配；默认仍不联网，也不接受任意命令。
 
 ## 已完成的闭环
 
@@ -21,6 +21,7 @@
 - `WorkingLedger`：只记录当前任务已验证的观察结果；
 - 生命周期事件：`tool_call`、`policy_decision`、`tool_execution_started`、`tool_finalized`；
 - `FakeModel`：确定性模拟“先调用工具，再读取工具结果”的两轮模型行为；
+- `DeepSeekModel`：通过官方 OpenAI 兼容 Chat Completions 接口把模型回复转换为内部工具调用；
 - 只读工具：`list_files`、`search_text`、`read_file`；
 - 受控写工具：`apply_patch`，仅允许唯一的精确文本替换；
 - 受限验证工具：`run_project_check`，只允许 `test` 和 `check` 两个固定动作；
@@ -44,6 +45,23 @@ cmd.exe /d /c npm run check
 
 本机 PowerShell 会拦截 `npm.ps1`，所以示例通过 `cmd.exe` 调用 npm 的 Windows 命令入口。在未受该执行策略影响的终端中，直接使用 `npm run demo`、`npm test` 和 `npm run check` 即可。
 
+## DeepSeek 模型适配
+
+默认模型是离线 `FakeModel`。只有显式传入 `--model deepseek` 且设置 `DEEPSEEK_API_KEY` 后，CLI 才会向 DeepSeek 发起网络请求。默认模型为 `deepseek-v4-flash`，可用 `--deepseek-model` 或 `DEEPSEEK_MODEL` 覆盖。
+
+```powershell
+$env:DEEPSEEK_API_KEY = "在此设置你的密钥"
+cmd.exe /d /c npm run demo -- --model deepseek --workspace . "解释当前 AgentLoop 的工具错误终态"
+```
+
+适配器使用官方 `https://api.deepseek.com/chat/completions` 接口、非流式调用和非思考模式；单次请求最多生成 2,048 tokens，并在 30 秒后超时。模型得到系统提示、用户任务、已注册工具的 JSON Schema，以及当前会话中的工具结果。在当前 CLI 的 DeepSeek 模式下，能够外发的是项目概览、目录列表、搜索结果和源码片段；不会向模型暴露补丁或项目验证工具。不要在不信任工作区或含敏感内容的任务中启用该模式。API Key 只从环境变量读取，绝不写入审计、报告或仓库。
+
+DeepSeek 模式默认只暴露 `get_project_overview`、`list_files`、`search_text` 和 `read_file`；不向真实模型暴露 `apply_patch` 或 `run_project_check`。工具参数即使不符合 JSON 或 Schema，也会先进入本地 `validate`，再被拒绝为标准工具错误终态。DeepSeek 官方文档说明该 API 使用 OpenAI 兼容格式，工具调用结果需要由客户端执行后回传。[官方快速开始](https://api-docs.deepseek.com/) [官方工具调用文档](https://api-docs.deepseek.com/guides/tool_calls)
+
+真实模型可能持续请求更多证据而不自行结束。为控制这一类不收敛行为，DeepSeek 模式有专用提示词，并限制每个模型轮次最多受理 2 个工具调用、每个任务最多受理 6 个。超出的调用不会执行，但仍会得到 `tool_call -> tool_finalized(error)` 的完整终态和标准错误结果，模型可据此收敛；`maxSteps=6` 保留为最后一道循环保护。这些限制约束成本和执行范围，不能保证任何模型一定给出正确答案。
+
+2026-08-10 的第一次真实 DeepSeek 冒烟测试复现了这个问题：模型在 6 个轮次中成功完成 15 次只读侦察，但没有返回最终答案，运行时因 `maxSteps=6` 主动停止。随后加入上述收敛提示词与工具预算，并通过本地 24 项自动化测试；本次修复尚未进行第二次真实 API 验证，因此不能据此声称真实模型已经稳定收敛。
+
 `apply_patch` 默认处于 `propose` 模式，只输出补丁预览、不写文件。只有在交互式终端传入 `--apply`，并输入精确的 `APPLY` 后才会原子写入：
 
 ```powershell
@@ -59,7 +77,7 @@ cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问
 ## 当前取舍
 
 - 不引入 LangGraph 或 Agent SDK：本阶段的目标是看清 Loop、消息和工具之间的最小契约。
-- 不接真实模型：FakeModel 让循环、错误路径和测试完全可重复；真实调用会单独说明目的、风险和文件影响后再进行。
+- 默认不接真实模型：FakeModel 让循环、错误路径和测试完全可重复；DeepSeek 仅在显式选择后联网，真实调用会单独说明目的、风险和文件影响后再进行。
 - 不并发：先保证消息顺序、错误终态和可测试性，副作用工具的并发留到后续按资源设计。
 - 不开放任意文件写入：补丁只能对唯一旧文本做替换，默认预览，写入必须人工确认。
 - 不开放任意命令：模型只能选择固定的 `test` 或 `check` 动作，不能传入命令、参数、环境变量或工作目录。

@@ -1,5 +1,18 @@
 import type { ChatModel, ModelRequest, ModelResponse, ToolResultMessage } from "../agent/contracts.ts";
 
+function findUnknownToolLocation(searchContent: string): { path: string; startLine: number; endLine: number } {
+  const match = searchContent.match(/^(src\/agent\/agent-loop\.ts):(\d+):.*未知工具/m);
+  if (!match) {
+    return { path: "src/agent/agent-loop.ts", startLine: 1, endLine: 40 };
+  }
+  const lineNumber = Number(match[2]);
+  return {
+    path: match[1],
+    startLine: Math.max(1, lineNumber - 3),
+    endLine: lineNumber + 3,
+  };
+}
+
 /**
  * 确定性的 LLM 替身：先搜索，再读取真实源文件，最后基于 ToolResultMessage 回答。
  */
@@ -58,6 +71,7 @@ export class FakeModel implements ChatModel {
     }
 
     if (!fileResult) {
+      const location = findUnknownToolLocation(searchResult.content);
       return {
         kind: "tool_calls",
         content: "搜索结果给出了候选位置，我需要读取对应源码确认细节。",
@@ -65,7 +79,7 @@ export class FakeModel implements ChatModel {
           {
             id: "call-read-1",
             name: "read_file",
-            input: { path: "src/agent/agent-loop.ts", startLine: 100, endLine: 130 },
+            input: location,
           },
         ],
       };
