@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 
-import type { AgentTool, JsonValue, ValidationResult } from "../agent/contracts.ts";
+import type { AgentTool, JsonValue, ToolExecutionOutput, ValidationResult } from "../agent/contracts.ts";
 import { WorkspaceAccessError, WorkspacePolicy } from "../workspace/workspace-policy.ts";
 import { validateLineNumber, validateObjectWithKeys } from "./input-validation.ts";
 
@@ -45,7 +45,7 @@ function validate(input: JsonValue): ValidationResult<ReadFileInput> {
   };
 }
 
-export const readFile: AgentTool<ReadFileInput> = {
+export const readFile: AgentTool<ReadFileInput, ToolExecutionOutput> = {
   name: "read_file",
   description: "读取工作区内的文本文件，可按行号范围读取；输出带行号并限制长度。",
   parameters: {
@@ -59,7 +59,7 @@ export const readFile: AgentTool<ReadFileInput> = {
     additionalProperties: false,
   },
   validate,
-  async execute(input, context): Promise<string> {
+  async execute(input, context): Promise<ToolExecutionOutput> {
     const policy = new WorkspacePolicy(context.workspaceRoot);
     const file = await policy.resolveReadPath(input.path);
     const stat = await fs.stat(file.absolutePath);
@@ -89,13 +89,16 @@ export const readFile: AgentTool<ReadFileInput> = {
       return `${file.relativePath}:${number} | ${line.slice(0, MAX_LINE_CHARS)}${truncated ? " [行内容已截断]" : ""}`;
     });
 
-    return [
-      `文件：${file.relativePath}`,
-      `读取范围：${startLine}-${actualEndLine} / 共 ${lines.length} 行`,
-      ...renderedLines,
-      ...(actualEndLine < requestedEndLine
-        ? [`[已截断：单次最多读取 ${MAX_READ_LINES} 行，请从第 ${actualEndLine + 1} 行继续读取]`]
-        : []),
-    ].join("\n");
+    return {
+      content: [
+        `文件：${file.relativePath}`,
+        `读取范围：${startLine}-${actualEndLine} / 共 ${lines.length} 行`,
+        ...renderedLines,
+        ...(actualEndLine < requestedEndLine
+          ? [`[已截断：单次最多读取 ${MAX_READ_LINES} 行，请从第 ${actualEndLine + 1} 行继续读取]`]
+          : []),
+      ].join("\n"),
+      sourceEvidence: [{ path: file.relativePath, startLine, endLine: actualEndLine }],
+    };
   },
 };

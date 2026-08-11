@@ -44,11 +44,13 @@ test("只读工具只返回工作区中的可见文本证据，并限制输出�
     assert.match(searched, /src\/example.ts:2: export const needle/);
 
     const read = await readFile.execute({ path: "src/example.ts", startLine: 2, endLine: 2 }, context(workspace));
-    assert.match(read, /src\/example.ts:2 \| export const needle = 'confirmed';/);
+    assert.match(read.content, /src\/example.ts:2 \| export const needle = 'confirmed';/);
+    assert.deepEqual(read.sourceEvidence, [{ path: "src/example.ts", startLine: 2, endLine: 2 }]);
 
     const truncated = await readFile.execute({ path: "long.txt", startLine: 1, endLine: 100 }, context(workspace));
-    assert.match(truncated, /单次最多读取 80 行/);
-    assert.doesNotMatch(truncated, /long.txt:81 \|/);
+    assert.match(truncated.content, /单次最多读取 80 行/);
+    assert.doesNotMatch(truncated.content, /long.txt:81 \|/);
+    assert.deepEqual(truncated.sourceEvidence, [{ path: "long.txt", startLine: 1, endLine: 80 }]);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }

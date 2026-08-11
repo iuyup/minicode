@@ -33,6 +33,7 @@ export interface ToolResultMessage {
   name: string;
   status: "success" | "error";
   content: string;
+  sourceEvidence?: readonly SourceEvidence[];
 }
 
 export type AgentMessage =
@@ -82,9 +83,16 @@ export interface ToolExecutionMetadata {
   timedOut?: boolean;
 }
 
+export interface SourceEvidence {
+  path: string;
+  startLine: number;
+  endLine: number;
+}
+
 export interface ToolExecutionOutput {
   content: string;
   metadata?: ToolExecutionMetadata;
+  sourceEvidence?: readonly SourceEvidence[];
 }
 
 export type ToolExecutionResult = string | ToolExecutionOutput;

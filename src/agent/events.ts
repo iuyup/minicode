@@ -25,6 +25,12 @@ export type AgentEvent =
       detail: string;
       metadata?: ToolExecutionMetadata;
     }
+  | {
+      type: "final_answer_rejected";
+      step: number;
+      reason: "missing_read_file_evidence" | "missing_source_citation" | "unverified_source_citation";
+      sourceEvidenceCount: number;
+    }
   | { type: "agent_completed"; step: number }
   | { type: "agent_stopped"; step: number; reason: string };
 
@@ -58,6 +64,7 @@ interface SanitizedAuditEvent {
   outputLength?: number;
   outputTruncated?: boolean;
   timedOut?: boolean;
+  sourceEvidenceCount?: number;
 }
 
 function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExecutionMetadata | undefined {
@@ -98,6 +105,12 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
         status: event.status,
         detailLength: event.detail.length,
         ...sanitizeMetadata(event.metadata),
+      };
+    case "final_answer_rejected":
+      return {
+        ...base,
+        reason: event.reason,
+        sourceEvidenceCount: event.sourceEvidenceCount,
       };
     case "model_requested":
     case "agent_completed":
