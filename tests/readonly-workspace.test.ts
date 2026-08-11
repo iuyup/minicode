@@ -28,8 +28,8 @@ async function createWorkspace(): Promise<string> {
   return workspace;
 }
 
-function context(workspaceRoot: string) {
-  return { task: "只读工具测试", step: 1, workspaceRoot };
+function context(workspaceRoot: string, requireSourceEvidence = false) {
+  return { task: "只读工具测试", step: 1, workspaceRoot, requireSourceEvidence };
 }
 
 test("只读工具只返回工作区中的可见文本证据，并限制输出范围", async () => {
@@ -98,6 +98,35 @@ test("越界和受保护文件会变成标准化错误终态，而不是被读�
     if (finalized?.type === "tool_finalized") {
       assert.equal(finalized.status, "error");
     }
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("源码证据模式强制搜索和读取范围位于 src", async () => {
+  const workspace = await createWorkspace();
+  const sourceContext = context(workspace, true);
+  try {
+    const searched = await searchText.execute({ query: "needle" }, sourceContext);
+    assert.match(searched, /范围：src/);
+    assert.match(searched, /src\/example.ts:2: export const needle/);
+    assert.doesNotMatch(searched, /README.md/);
+
+    const read = await readFile.execute({ path: "src/example.ts", startLine: 2, endLine: 2 }, sourceContext);
+    assert.match(read.content, /src\/example.ts:2 \| export const needle/);
+
+    await assert.rejects(
+      searchText.execute({ query: "公开", path: "." }, sourceContext),
+      /源码证据模式只允许在 src 目录内搜索/,
+    );
+    await assert.rejects(
+      readFile.execute({ path: "README.md" }, sourceContext),
+      /源码证据模式只允许读取 src 目录内的文件/,
+    );
+    await assert.rejects(
+      readFile.execute({ path: "src/../README.md" }, sourceContext),
+      /源码证据模式只允许读取 src 目录内的文件/,
+    );
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }

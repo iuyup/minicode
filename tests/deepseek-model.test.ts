@@ -95,6 +95,26 @@ test("DeepSeekModel 发送 OpenAI 兼容请求，并显式关闭思考模式", a
   assert.deepEqual(messages[3], { role: "tool", tool_call_id: "prior-1", content: "目录：src" });
 });
 
+test("DeepSeekModel 在最终修复轮省略工具定义", async () => {
+  let capturedInit: RequestInit | undefined;
+  const model = new DeepSeekModel({
+    apiKey: "test-key",
+    fetchImplementation: async (_input, init) => {
+      capturedInit = init;
+      return jsonResponse({ choices: [{ message: { role: "assistant", content: "已修正。" } }] });
+    },
+  });
+  const request: ModelRequest = { ...requestFixture(), tools: [] };
+
+  await model.complete(request);
+
+  assert.equal(typeof capturedInit?.body, "string");
+  const body = JSON.parse(capturedInit?.body as string) as Record<string, unknown>;
+  assert.equal("tools" in body, false);
+  assert.equal("tool_choice" in body, false);
+  assert.deepEqual(body.thinking, { type: "disabled" });
+});
+
 test("DeepSeekModel 将工具调用映射回内部 ToolCall，并保留无效 JSON 供本地校验", async () => {
   const responses = [
     jsonResponse({

@@ -56,6 +56,7 @@ export interface ToolExecutionContext {
   task: string;
   step: number;
   workspaceRoot: string;
+  requireSourceEvidence?: boolean;
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   recordPolicyDecision?: (decision: ToolPolicyDecision) => void;

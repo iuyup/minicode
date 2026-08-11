@@ -20,6 +20,18 @@ const listFilesTool: AgentTool = {
   },
 };
 
+const sourceSearchTool: AgentTool = {
+  name: "search_text",
+  description: "Search source code for a test.",
+  parameters: emptyParameters,
+  validate(input) {
+    return { ok: true, value: input };
+  },
+  async execute() {
+    return "src/agent/agent-loop.ts:10: candidate implementation";
+  },
+};
+
 const sourceReadTool: AgentTool<JsonValue, ToolExecutionOutput> = {
   name: "read_file",
   description: "Return an inspected source range for a test.",
@@ -27,7 +39,8 @@ const sourceReadTool: AgentTool<JsonValue, ToolExecutionOutput> = {
   validate(input) {
     return { ok: true, value: input };
   },
-  async execute() {
+  async execute(_input, context) {
+    assert.equal(context.requireSourceEvidence, true);
     return {
       content: "src/agent/agent-loop.ts:10 | const tool = this.tools.find(toolCall.name);",
       sourceEvidence: [{ path: "src/agent/agent-loop.ts", startLine: 10, endLine: 20 }],
@@ -35,50 +48,34 @@ const sourceReadTool: AgentTool<JsonValue, ToolExecutionOutput> = {
   },
 };
 
-test("source-evidence mode asks for a repair when the answer has no read_file evidence", async () => {
-  let callCount = 0;
+test("source-evidence mode stops an answer without read_file evidence", async () => {
+  const recordedEvents: AgentEvent[] = [];
+  const auditLog: AgentEventAuditLog = {
+    record(event) {
+      recordedEvents.push(event);
+    },
+    async flush() {},
+  };
   const model: ChatModel = {
-    async complete(request: ModelRequest): Promise<ModelResponse> {
-      callCount += 1;
-      if (callCount === 1) {
-        return {
-          kind: "tool_calls",
-          content: "I will inspect the documentation index.",
-          toolCalls: [{ id: "list-1", name: "list_files", input: {} }],
-        };
-      }
-      if (callCount === 2) {
-        return { kind: "final", content: "The explanation is in README.md:1." };
-      }
-      if (callCount === 3) {
-        const repair = request.messages.at(-1);
-        assert.equal(repair?.role, "user");
-        assert.match(repair?.content ?? "", /尚未成功读取任何源码文件/);
-        return {
-          kind: "tool_calls",
-          content: "I need implementation evidence.",
-          toolCalls: [{ id: "read-1", name: "read_file", input: { path: "src/agent/agent-loop.ts" } }],
-        };
-      }
-      return { kind: "final", content: "代码证据：src/agent/agent-loop.ts:12。" };
+    async complete(): Promise<ModelResponse> {
+      return { kind: "final", content: "The explanation is in README.md:1." };
     },
   };
 
-  const result = await new AgentLoop(model, new ToolRegistry([listFilesTool, sourceReadTool]), {
-    workspaceRoot: process.cwd(),
-    requireSourceEvidence: true,
-  }).run("Explain the implementation.");
-
-  assert.equal(result.answer, "代码证据：src/agent/agent-loop.ts:12。");
-  assert.deepEqual(result.sourceEvidence, [
-    { path: "src/agent/agent-loop.ts", startLine: 10, endLine: 20 },
-  ]);
+  await assert.rejects(
+    new AgentLoop(model, new ToolRegistry([listFilesTool, sourceReadTool]), {
+      workspaceRoot: process.cwd(),
+      requireSourceEvidence: true,
+      auditLog,
+    }).run("Explain the implementation."),
+    /最终回答缺少已读取源码，无法进行无工具修复/,
+  );
   assert.deepEqual(
-    result.events.filter((event) => event.type === "final_answer_rejected"),
+    recordedEvents.filter((event) => event.type === "final_answer_rejected"),
     [
       {
         type: "final_answer_rejected",
-        step: 2,
+        step: 1,
         reason: "missing_read_file_evidence",
         sourceEvidenceCount: 0,
       },
@@ -110,6 +107,219 @@ test("source-evidence mode accepts a citation inside a successfully read source 
   assert.equal(result.events.some((event) => event.type === "final_answer_rejected"), false);
 });
 
+test("source-evidence mode accepts a fully verified source range citation", async () => {
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      callCount += 1;
+      return callCount === 1
+        ? {
+            kind: "tool_calls",
+            content: "I will read the implementation.",
+            toolCalls: [{ id: "read-1", name: "read_file", input: { path: "src/agent/agent-loop.ts" } }],
+          }
+        : { kind: "final", content: "The lookup is implemented in src/agent/agent-loop.ts:10-20." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(result.events.some((event) => event.type === "final_answer_rejected"), false);
+});
+
+test("source-evidence mode allows one supplemental search-read pair then forces a final answer", async () => {
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount === 1 || callCount === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["search_text", "read_file"]);
+        return {
+          kind: "tool_calls",
+          content: callCount === 1 ? "Search first." : "Read the first source range.",
+          toolCalls: [
+            callCount === 1
+              ? { id: "search-1", name: "search_text", input: {} }
+              : { id: "read-2", name: "read_file", input: {} },
+          ],
+        };
+      }
+      if (callCount === 3) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["search_text", "read_file"]);
+        return {
+          kind: "tool_calls",
+          content: "Search for the handler.",
+          toolCalls: [{ id: "search-3", name: "search_text", input: {} }],
+        };
+      }
+      if (callCount === 4) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["read_file"]);
+        return {
+          kind: "tool_calls",
+          content: "Read the handler.",
+          toolCalls: [{ id: "read-4", name: "read_file", input: {} }],
+        };
+      }
+
+      assert.deepEqual(request.tools, []);
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:10-20." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([sourceSearchTool, sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(callCount, 5);
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "tool_call").map((event) => event.toolName),
+    ["search_text", "read_file", "search_text", "read_file"],
+  );
+  assert.deepEqual(result.events.at(-1), { type: "agent_completed", step: 5 });
+});
+
+test("source-evidence mode rejects a second supplemental search request", async () => {
+  let searchExecutions = 0;
+  const trackingSearchTool: AgentTool = {
+    ...sourceSearchTool,
+    async execute() {
+      searchExecutions += 1;
+      return "unexpected search execution";
+    },
+  };
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Read source.",
+          toolCalls: [{ id: "read-1", name: "read_file", input: {} }],
+        };
+      }
+      if (callCount === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["search_text", "read_file"]);
+        return {
+          kind: "tool_calls",
+          content: "Search for the handler.",
+          toolCalls: [{ id: "search-2", name: "search_text", input: {} }],
+        };
+      }
+      if (callCount === 3) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["read_file"]);
+        return {
+          kind: "tool_calls",
+          content: "Try a second supplemental search.",
+          toolCalls: [{ id: "search-3", name: "search_text", input: {} }],
+        };
+      }
+
+      const rejected = request.messages.at(-1);
+      assert.equal(rejected?.role, "tool");
+      assert.equal(rejected?.status, "error");
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:10-20." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([trackingSearchTool, sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(searchExecutions, 1);
+  assert.deepEqual(
+    result.events.find((event) => event.type === "tool_finalized" && event.toolCallId === "search-3"),
+    {
+      type: "tool_finalized",
+      step: 3,
+      toolCallId: "search-3",
+      toolName: "search_text",
+      status: "error",
+      detail: "源码取证状态不允许该工具；请按当前阶段继续定位、读取或给出最终回答。",
+    },
+  );
+});
+
+test("source-evidence mode grants one final-only turn when the last normal step reads source", async () => {
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount <= 5) {
+        return {
+          kind: "tool_calls",
+          content: "Keep searching.",
+          toolCalls: [{ id: `search-${callCount}`, name: "search_text", input: {} }],
+        };
+      }
+      if (callCount === 6) {
+        return {
+          kind: "tool_calls",
+          content: "Read the source at the last normal step.",
+          toolCalls: [{ id: "read-6", name: "read_file", input: {} }],
+        };
+      }
+
+      assert.deepEqual(request.tools, []);
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:10-20." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([sourceSearchTool, sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 6,
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(callCount, 7);
+  assert.deepEqual(result.events.at(-1), { type: "agent_completed", step: 7 });
+});
+
+test("source-evidence completion turn stops before executing a requested tool", async () => {
+  const recordedEvents: AgentEvent[] = [];
+  const auditLog: AgentEventAuditLog = {
+    record(event) {
+      recordedEvents.push(event);
+    },
+    async flush() {},
+  };
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount <= 2) {
+        return {
+          kind: "tool_calls",
+          content: "Read source.",
+          toolCalls: [{ id: `read-${callCount}`, name: "read_file", input: {} }],
+        };
+      }
+
+      assert.deepEqual(request.tools, []);
+      return {
+        kind: "tool_calls",
+        content: "Try another read.",
+        toolCalls: [{ id: "read-3", name: "read_file", input: {} }],
+      };
+    },
+  };
+
+  await assert.rejects(
+    new AgentLoop(model, new ToolRegistry([sourceReadTool]), {
+      workspaceRoot: process.cwd(),
+      requireSourceEvidence: true,
+      auditLog,
+    }).run("Explain the implementation."),
+    /源码取证已收集足够证据，本轮只能给出最终回答/,
+  );
+  assert.equal(recordedEvents.filter((event) => event.type === "tool_call").length, 2);
+});
+
 test("source-evidence mode rejects a citation outside the read source range", async () => {
   let callCount = 0;
   const model: ChatModel = {
@@ -123,13 +333,14 @@ test("source-evidence mode rejects a citation outside the read source range", as
         };
       }
       if (callCount === 2) {
-        return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:99." };
+        return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:12-21." };
       }
 
       const repair = request.messages.at(-1);
       assert.equal(repair?.role, "user");
       assert.match(repair?.content ?? "", /未在本轮已读取范围内/);
-      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:12." };
+      assert.match(repair?.content ?? "", /`src\/agent\/agent-loop\.ts:10-20`/);
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:10-20." };
     },
   };
 
@@ -138,7 +349,7 @@ test("source-evidence mode rejects a citation outside the read source range", as
     requireSourceEvidence: true,
   }).run("Explain the implementation.");
 
-  assert.equal(result.answer, "The lookup happens at src/agent/agent-loop.ts:12.");
+  assert.equal(result.answer, "The lookup happens at src/agent/agent-loop.ts:10-20.");
   assert.deepEqual(
     result.events.filter((event) => event.type === "final_answer_rejected"),
     [
@@ -160,9 +371,21 @@ test("source-evidence mode stops after a second rejected final answer", async ()
     },
     async flush() {},
   };
+  let callCount = 0;
   const model: ChatModel = {
-    async complete(): Promise<ModelResponse> {
-      return { kind: "final", content: "I cannot cite source evidence." };
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Read the implementation.",
+          toolCalls: [{ id: "read-1", name: "read_file", input: { path: "src/agent/agent-loop.ts" } }],
+        };
+      }
+      if (callCount === 3) {
+        assert.deepEqual(request.tools, []);
+      }
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:99." };
     },
   };
 
@@ -178,10 +401,115 @@ test("source-evidence mode stops after a second rejected final answer", async ()
     recordedEvents.map((event) => event.type),
     [
       "model_requested",
+      "tool_call",
+      "tool_execution_started",
+      "tool_finalized",
+      "model_requested",
       "final_answer_rejected",
       "model_requested",
       "final_answer_rejected",
       "agent_stopped",
     ],
   );
+});
+
+test("source-evidence mode grants one final-only repair turn after a last-step rejection", async () => {
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Read the implementation first.",
+          toolCalls: [{ id: "read-1", name: "read_file", input: { path: "src/agent/agent-loop.ts" } }],
+        };
+      }
+      if (callCount <= 5) {
+        return {
+          kind: "tool_calls",
+          content: "Inspect another directory.",
+          toolCalls: [{ id: `list-${callCount}`, name: "list_files", input: {} }],
+        };
+      }
+      if (callCount === 6) {
+        return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:99." };
+      }
+
+      assert.deepEqual(request.tools, []);
+      const repair = request.messages.at(-1);
+      assert.equal(repair?.role, "user");
+      assert.match(repair?.content ?? "", /未在本轮已读取范围内/);
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:12." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([listFilesTool, sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 6,
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(callCount, 7);
+  assert.equal(result.answer, "The lookup happens at src/agent/agent-loop.ts:12.");
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "final_answer_rejected"),
+    [
+      {
+        type: "final_answer_rejected",
+        step: 6,
+        reason: "unverified_source_citation",
+        sourceEvidenceCount: 1,
+      },
+    ],
+  );
+  assert.deepEqual(result.events.at(-1), { type: "agent_completed", step: 7 });
+});
+
+test("source-evidence repair turn stops before executing a requested tool", async () => {
+  const recordedEvents: AgentEvent[] = [];
+  const auditLog: AgentEventAuditLog = {
+    record(event) {
+      recordedEvents.push(event);
+    },
+    async flush() {},
+  };
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Read the implementation.",
+          toolCalls: [{ id: "read-1", name: "read_file", input: { path: "src/agent/agent-loop.ts" } }],
+        };
+      }
+      if (callCount === 2) {
+        return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:99." };
+      }
+
+      assert.deepEqual(request.tools, []);
+      return {
+        kind: "tool_calls",
+        content: "Try another read.",
+        toolCalls: [{ id: "read-2", name: "read_file", input: { path: "src/agent/agent-loop.ts" } }],
+      };
+    },
+  };
+
+  await assert.rejects(
+    new AgentLoop(model, new ToolRegistry([sourceReadTool]), {
+      workspaceRoot: process.cwd(),
+      requireSourceEvidence: true,
+      auditLog,
+    }).run("Explain the implementation."),
+    /源码证据修复轮只能给出最终回答/,
+  );
+  assert.equal(recordedEvents.filter((event) => event.type === "tool_call").length, 1);
+  assert.deepEqual(recordedEvents.at(-1), {
+    type: "agent_stopped",
+    step: 3,
+    reason: "源码证据修复轮只能给出最终回答，不能请求工具。",
+  });
 });

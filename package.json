@@ -9,7 +9,7 @@
   },
   "scripts": {
     "demo": "node src/cli.ts",
-    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/deepseek-model.test.ts tests/source-evidence.test.ts",
+    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/deepseek-model.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts",
     "check": "tsc -p tsconfig.json"
   },
   "devDependencies": {

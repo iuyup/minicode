@@ -156,15 +156,19 @@ export class DeepSeekModel implements ChatModel {
         body: JSON.stringify({
           model: this.#model,
           messages: request.messages.map(toApiMessage),
-          tools: request.tools.map((tool) => ({
-            type: "function",
-            function: {
-              name: tool.name,
-              description: tool.description,
-              parameters: tool.parameters,
-            },
-          })),
-          tool_choice: "auto",
+          ...(request.tools.length > 0
+            ? {
+                tools: request.tools.map((tool) => ({
+                  type: "function",
+                  function: {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                  },
+                })),
+                tool_choice: "auto",
+              }
+            : {}),
           thinking: { type: "disabled" },
           max_tokens: this.#maxTokens,
           stream: false,

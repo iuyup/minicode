@@ -44,6 +44,8 @@ const DEFAULT_SYSTEM_PROMPT = [
 ].join(" ");
 
 const MAX_FINAL_ANSWER_REPAIRS = 1;
+const MAX_SOURCE_EVIDENCE_READS = 2;
+const MAX_SOURCE_EVIDENCE_SEARCHES_BEFORE_READ = 2;
 
 type SourceEvidenceRejectionReason =
   | "missing_read_file_evidence"
@@ -54,7 +56,7 @@ type SourceEvidenceValidation =
   | { ok: true }
   | { ok: false; reason: SourceEvidenceRejectionReason };
 
-const SOURCE_CITATION_PATTERN = /((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md)):(\d+)(?=$|[\s`)\]，,.;:!?；。])/gm;
+const SOURCE_CITATION_PATTERN = /((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md)):(\d+)(?:-(\d+))?(?=$|[\s`)\]，,.;:!?；。])/gm;
 
 function normalizePositiveLimit(value: number | undefined, optionName: string): number {
   if (value === undefined) {
@@ -73,7 +75,8 @@ function validateSourceEvidence(answer: string, sourceEvidence: readonly SourceE
 
   const citations = Array.from(answer.matchAll(SOURCE_CITATION_PATTERN), (match) => ({
     path: match[1],
-    line: Number(match[2]),
+    startLine: Number(match[2]),
+    endLine: Number(match[3] ?? match[2]),
   }));
   if (citations.length === 0) {
     return { ok: false, reason: "missing_source_citation" };
@@ -82,8 +85,9 @@ function validateSourceEvidence(answer: string, sourceEvidence: readonly SourceE
   const areAllCitationsVerified = citations.every((citation) => sourceEvidence.some(
     (evidence) =>
       evidence.path === citation.path &&
-      citation.line >= evidence.startLine &&
-      citation.line <= evidence.endLine,
+      citation.startLine <= citation.endLine &&
+      citation.startLine >= evidence.startLine &&
+      citation.endLine <= evidence.endLine,
   ));
   return areAllCitationsVerified
     ? { ok: true }
@@ -92,7 +96,12 @@ function validateSourceEvidence(answer: string, sourceEvidence: readonly SourceE
 
 function formatSourceEvidence(sourceEvidence: readonly SourceEvidence[]): string {
   return sourceEvidence
-    .map((evidence) => `${evidence.path}:${evidence.startLine}-${evidence.endLine}`)
+    .map((evidence) => {
+      const citation = evidence.startLine === evidence.endLine
+        ? `${evidence.path}:${evidence.startLine}`
+        : `${evidence.path}:${evidence.startLine}-${evidence.endLine}`;
+      return `\`${citation}\``;
+    })
     .join("、");
 }
 
@@ -107,12 +116,12 @@ function sourceEvidenceRepairMessage(
   }[reason];
   const evidenceText = sourceEvidence.length === 0
     ? "暂无已验证源码范围。"
-    : `本轮已验证范围：${formatSourceEvidence(sourceEvidence)}。`;
+    : `可直接复制的已验证引用：${formatSourceEvidence(sourceEvidence)}。`;
   return [
     `你的上一条最终回答未通过本地源码证据校验：${reasonText}`,
     evidenceText,
-    "如需补充证据，可以调用 read_file；重答时只能引用本轮成功 read_file 的源码，并至少包含一条 `path:line`。",
-    "不要引用 README、agent.md 或未读取文件来证明实现机制；若证据不足，请明确说明。",
+    "本次为无工具修复轮；删除上一版中的全部源码引用，至少原样使用一条上面的引用。引用可以是 `path:line` 或 `path:startLine-endLine`，不得输出清单外的任何源码路径或行号。",
+    "不得请求工具，不要引用 README、agent.md 或未读取文件来证明实现机制；若原结论需要未读取源码支持，应删去该结论。",
   ].join(" ");
 }
 
@@ -170,21 +179,51 @@ export class AgentLoop {
     const ledger = new WorkingLedger(task);
     let acceptedToolCalls = 0;
     let finalAnswerRepairs = 0;
+    let sourceEvidenceRepairPending = false;
+    let sourceEvidenceCompletionPending = false;
+    let extraFinalOnlyTurnUsed = false;
+    let successfulSourceReadCalls = 0;
+    let sourceSearchCallsBeforeEvidence = 0;
+    let supplementalSourceSearchUsed = false;
+    let maximumStep = this.#maxSteps;
     const sourceEvidence: SourceEvidence[] = [];
 
     try {
-      for (let step = 1; step <= this.#maxSteps; step += 1) {
+      for (let step = 1; step <= maximumStep; step += 1) {
+        const isSourceEvidenceRepairTurn = sourceEvidenceRepairPending;
+        const isSourceEvidenceCompletionTurn = sourceEvidenceCompletionPending;
+        sourceEvidenceRepairPending = false;
+        sourceEvidenceCompletionPending = false;
+        const isSourceEvidenceFinalTurn = isSourceEvidenceRepairTurn || isSourceEvidenceCompletionTurn;
+        const availableTools = isSourceEvidenceFinalTurn
+          ? []
+          : this.getAvailableToolDescriptions(
+              sourceEvidence,
+              sourceSearchCallsBeforeEvidence,
+              supplementalSourceSearchUsed,
+            );
+        const allowedToolNames = this.#requireSourceEvidence
+          ? new Set(availableTools.map((tool) => tool.name))
+          : undefined;
         this.recordEvent(events, { type: "model_requested", step });
         let response: ModelResponse;
         try {
           response = await this.model.complete({
             messages,
-            tools: this.tools.describe(),
+            tools: availableTools,
             workingState: ledger.render(),
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const reason = `模型请求失败：${message}`;
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          throw new Error(reason);
+        }
+
+        if (isSourceEvidenceFinalTurn && response.kind === "tool_calls") {
+          const reason = isSourceEvidenceRepairTurn
+            ? "源码证据修复轮只能给出最终回答，不能请求工具。"
+            : "源码取证已收集足够证据，本轮只能给出最终回答，不能请求工具。";
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
         }
@@ -201,12 +240,27 @@ export class AgentLoop {
               reason: sourceEvidenceValidation.reason,
               sourceEvidenceCount: sourceEvidence.length,
             });
+            if (sourceEvidenceValidation.reason === "missing_read_file_evidence") {
+              const reason = "最终回答缺少已读取源码，无法进行无工具修复。";
+              this.recordEvent(events, { type: "agent_stopped", step, reason });
+              throw new Error(reason);
+            }
             if (finalAnswerRepairs >= MAX_FINAL_ANSWER_REPAIRS) {
               const reason = "最终回答连续两次未通过源码证据校验。";
               this.recordEvent(events, { type: "agent_stopped", step, reason });
               throw new Error(reason);
             }
+            if (step === maximumStep && extraFinalOnlyTurnUsed) {
+              const reason = "最终回答未通过源码证据校验，且额外无工具回答轮次已用尽。";
+              this.recordEvent(events, { type: "agent_stopped", step, reason });
+              throw new Error(reason);
+            }
             finalAnswerRepairs += 1;
+            sourceEvidenceRepairPending = true;
+            if (step === maximumStep) {
+              extraFinalOnlyTurnUsed = true;
+              maximumStep += 1;
+            }
             messages.push({
               role: "user",
               content: sourceEvidenceRepairMessage(sourceEvidenceValidation.reason, sourceEvidence),
@@ -231,15 +285,43 @@ export class AgentLoop {
         });
 
         for (const [toolCallIndex, toolCall] of response.toolCalls.entries()) {
-          const rejectionReason = this.getToolCallRejectionReason(toolCallIndex, acceptedToolCalls);
+          const rejectionReason = this.getToolCallRejectionReason(
+            toolCall,
+            toolCallIndex,
+            acceptedToolCalls,
+            allowedToolNames,
+          );
           const result = rejectionReason
             ? this.rejectToolCall(toolCall, step, events, rejectionReason)
             : await this.executeToolCall(toolCall, task, step, events);
           if (!rejectionReason) {
             acceptedToolCalls += 1;
           }
+          const hadSourceEvidence = sourceEvidence.length > 0;
           messages.push(result);
           appendSourceEvidence(sourceEvidence, result.sourceEvidence);
+          if (this.#requireSourceEvidence && !rejectionReason && result.name === "search_text") {
+            if (hadSourceEvidence) {
+              supplementalSourceSearchUsed = true;
+            } else {
+              sourceSearchCallsBeforeEvidence += 1;
+            }
+          }
+          if (
+            this.#requireSourceEvidence &&
+            result.name === "read_file" &&
+            result.status === "success" &&
+            (result.sourceEvidence?.length ?? 0) > 0
+          ) {
+            successfulSourceReadCalls += 1;
+            if (successfulSourceReadCalls >= MAX_SOURCE_EVIDENCE_READS || step === maximumStep) {
+              sourceEvidenceCompletionPending = true;
+              if (step === maximumStep && !extraFinalOnlyTurnUsed) {
+                extraFinalOnlyTurnUsed = true;
+                maximumStep += 1;
+              }
+            }
+          }
           ledger.record({
             toolName: result.name,
             status: result.status,
@@ -248,15 +330,46 @@ export class AgentLoop {
         }
       }
 
-      const reason = `达到最大步数 maxSteps=${this.#maxSteps}，但模型尚未给出最终回答。`;
-      this.recordEvent(events, { type: "agent_stopped", step: this.#maxSteps, reason });
+      const reason = `达到最大步数 maxSteps=${maximumStep}，但模型尚未给出最终回答。`;
+      this.recordEvent(events, { type: "agent_stopped", step: maximumStep, reason });
       throw new Error(reason);
     } finally {
       await this.#auditLog?.flush();
     }
   }
 
-  private getToolCallRejectionReason(toolCallIndex: number, acceptedToolCalls: number): string | undefined {
+  private getAvailableToolDescriptions(
+    sourceEvidence: readonly SourceEvidence[],
+    sourceSearchCallsBeforeEvidence: number,
+    supplementalSourceSearchUsed: boolean,
+  ) {
+    const descriptions = this.tools.describe();
+    if (!this.#requireSourceEvidence) {
+      return descriptions;
+    }
+
+    const sourceTools = descriptions.filter(
+      (tool) => tool.name === "search_text" || tool.name === "read_file",
+    );
+    if (sourceEvidence.length === 0) {
+      return sourceSearchCallsBeforeEvidence >= MAX_SOURCE_EVIDENCE_SEARCHES_BEFORE_READ
+        ? sourceTools.filter((tool) => tool.name === "read_file")
+        : sourceTools;
+    }
+    return supplementalSourceSearchUsed
+      ? sourceTools.filter((tool) => tool.name === "read_file")
+      : sourceTools;
+  }
+
+  private getToolCallRejectionReason(
+    toolCall: ToolCall,
+    toolCallIndex: number,
+    acceptedToolCalls: number,
+    allowedToolNames: ReadonlySet<string> | undefined,
+  ): string | undefined {
+    if (allowedToolNames && !allowedToolNames.has(toolCall.name)) {
+      return "源码取证状态不允许该工具；请按当前阶段继续定位、读取或给出最终回答。";
+    }
     if (toolCallIndex >= this.#maxToolCallsPerStep) {
       return `本轮工具调用超过上限 maxToolCallsPerStep=${this.#maxToolCallsPerStep}；请基于本轮其余工具结果给出最终回答。`;
     }
@@ -321,6 +434,7 @@ export class AgentLoop {
         task,
         step,
         workspaceRoot: this.#workspaceRoot,
+        requireSourceEvidence: this.#requireSourceEvidence,
         executionMode: this.#executionMode,
         requestEditApproval: this.#requestEditApproval,
         recordPolicyDecision: (decision) => {

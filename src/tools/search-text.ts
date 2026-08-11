@@ -62,6 +62,10 @@ function containsBinaryMarker(content: Buffer): boolean {
   return content.includes(0);
 }
 
+function isSourcePath(relativePath: string): boolean {
+  return relativePath === "src" || relativePath.startsWith("src/");
+}
+
 export const searchText: AgentTool<SearchTextInput> = {
   name: "search_text",
   description: "在工作区目录中按字面文本搜索，返回路径、行号和有限上下文。",
@@ -77,7 +81,11 @@ export const searchText: AgentTool<SearchTextInput> = {
   validate,
   async execute(input, context): Promise<string> {
     const policy = new WorkspacePolicy(context.workspaceRoot);
-    const scope = await policy.resolveReadPath(input.path ?? ".");
+    const requestedPath = input.path ?? (context.requireSourceEvidence ? "src" : ".");
+    const scope = await policy.resolveReadPath(requestedPath);
+    if (context.requireSourceEvidence && !isSourcePath(scope.relativePath)) {
+      throw new WorkspaceAccessError("源码证据模式只允许在 src 目录内搜索。");
+    }
     const scopeStat = await fs.stat(scope.absolutePath);
     if (!scopeStat.isDirectory()) {
       throw new WorkspaceAccessError(`search_text 只能搜索目录：${scope.relativePath}`);

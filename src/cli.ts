@@ -123,22 +123,28 @@ async function requestTerminalApproval(request: EditApprovalRequest): Promise<bo
 const argumentsValue = parseArguments(process.argv.slice(2));
 const { task, workspaceRoot, executionMode, auditPath, modelProvider, deepseekModel, requireSourceEvidence } = argumentsValue;
 const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
+const sourceEvidenceTools = [searchText, readFile] as const;
 const DEEPSEEK_SYSTEM_PROMPT = [
   "你是一个受限的只读 Coding Agent，只能使用已提供的只读工具进行代码侦察。",
   "只在需要事实证据时调用工具，并优先以最少的工具调用完成任务。",
-  "同一轮最多请求两个工具；不要重复列出或读取已确认的路径。",
+  "遵守当前提供的工具集和单轮调用额度；不要重复列出、搜索或读取已确认的路径。",
   "一旦工具结果已足以支撑结论，下一轮必须直接给出最终回答，不得继续探索。",
   "工具结果是唯一证据；不得编造工具结果或声称执行了未提供的能力。",
 ].join(" ");
 const DEEPSEEK_SOURCE_EVIDENCE_PROMPT = [
-  "当前任务要求可验证的源码证据。解释实现机制前，必须先在 src 中搜索并用 read_file 读取命中源码。",
-  "最终回答只能使用本轮成功读取过的源码作为实现证据，并至少包含一条 `path:line` 格式引用。",
+  "当前是源码取证模式，只提供 search_text 和 read_file 两个工具，每轮最多请求一个工具。",
+  "解释实现机制前，最多使用两次 search_text 在 src 中定位候选代码，随后必须用 read_file 读取命中源码。",
+  "首次成功读取后，可额外进行一次定向 search_text 以定位事件处理代码，并再用一次 read_file 读取；读取两段源码后运行时会关闭工具并要求直接给出最终回答。",
+  "最终回答只能使用本轮成功读取过的源码作为实现证据，并至少包含一条 `path:line` 或 `path:startLine-endLine` 格式引用。",
   "README、agent.md、目录列表和搜索结果不能替代实现源码；不要引用未读取的文件或行号。",
+  "若收到源码证据修复反馈，下一轮只能给出最终回答，不得请求工具。",
 ].join(" ");
 const registry = new ToolRegistry(
-  modelProvider === "deepseek"
-    ? readOnlyTools
-    : [...readOnlyTools, applyPatch, runProjectCheck],
+  requireSourceEvidence
+    ? sourceEvidenceTools
+    : modelProvider === "deepseek"
+      ? readOnlyTools
+      : [...readOnlyTools, applyPatch, runProjectCheck],
 );
 const agent = new AgentLoop(createModel(argumentsValue), registry, {
   workspaceRoot,
@@ -149,7 +155,7 @@ const agent = new AgentLoop(createModel(argumentsValue), registry, {
         systemPrompt: requireSourceEvidence
           ? `${DEEPSEEK_SYSTEM_PROMPT} ${DEEPSEEK_SOURCE_EVIDENCE_PROMPT}`
           : DEEPSEEK_SYSTEM_PROMPT,
-        maxToolCallsPerStep: 2,
+        maxToolCallsPerStep: requireSourceEvidence ? 1 : 2,
         maxToolCalls: 6,
       }
     : {}),
@@ -160,7 +166,7 @@ const result = await agent.run(task);
 
 console.log("=== 生命周期事件 ===");
 console.log(`模型：${modelProvider === "deepseek" ? `DeepSeek / ${deepseekModel}` : "FakeModel（离线）"}`);
-console.log(`工具权限：${modelProvider === "deepseek" ? "只读侦察" : "离线全量演示"}`);
+console.log(`工具权限：${requireSourceEvidence ? "只读源码取证" : modelProvider === "deepseek" ? "只读侦察" : "离线全量演示"}`);
 console.log(`源码证据校验：${requireSourceEvidence ? "已启用" : "未启用"}`);
 for (const event of result.events) {
   if (event.type === "tool_finalized") {

@@ -14,6 +14,10 @@ const MAX_FILE_BYTES = 256 * 1024;
 const MAX_READ_LINES = 80;
 const MAX_LINE_CHARS = 240;
 
+function isSourcePath(relativePath: string): boolean {
+  return relativePath === "src" || relativePath.startsWith("src/");
+}
+
 function validate(input: JsonValue): ValidationResult<ReadFileInput> {
   const object = validateObjectWithKeys(input, ["path", "startLine", "endLine"]);
   if (!object.ok) {
@@ -62,6 +66,9 @@ export const readFile: AgentTool<ReadFileInput, ToolExecutionOutput> = {
   async execute(input, context): Promise<ToolExecutionOutput> {
     const policy = new WorkspacePolicy(context.workspaceRoot);
     const file = await policy.resolveReadPath(input.path);
+    if (context.requireSourceEvidence && !isSourcePath(file.relativePath)) {
+      throw new WorkspaceAccessError("源码证据模式只允许读取 src 目录内的文件。");
+    }
     const stat = await fs.stat(file.absolutePath);
     if (!stat.isFile()) {
       throw new WorkspaceAccessError(`read_file 只能读取普通文件：${file.relativePath}`);
