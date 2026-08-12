@@ -45,6 +45,50 @@ cmd.exe /d /c npm run check
 
 本机 PowerShell 会拦截 `npm.ps1`，所以示例通过 `cmd.exe` 调用 npm 的 Windows 命令入口。在未受该执行策略影响的终端中，直接使用 `npm run demo`、`npm test` 和 `npm run check` 即可。
 
+## 交互入口：mini
+
+`demo` 用于单次复现与自动化验证；`mini` 是轻量交互入口。它使用 Pi 的 `@mariozechner/pi-tui` 进行差量渲染和多行输入编辑，启动后进入备用终端屏幕：顶部显示模型、权限和工作区，中部保留对话，底部固定编辑器与状态栏。它保留最近 6 轮的“用户任务 + 最终回答”上下文，不会把工具原文跨轮塞回模型；每个新任务仍独立执行工具、生成审计终态并重新校验源码证据。
+
+```powershell
+cd C:\Users\CX10\Desktop\minicode
+cmd.exe /d /c npm run mini
+```
+
+工具调用在主屏默认折叠为简短状态；按 `Ctrl+O` 或输入 `/details` 可展开最近的生命周期事件。`Ctrl+V` 会读取 Windows 系统剪贴板中的文本并插入输入框，输入内容不会写入审计；超过 32,000 字符时拒绝插入。可用命令：`/help`、`/status`、`/clear`、`/details`、`/exit`。`Ctrl+C` 在空闲时退出；执行中的任务不会被静默中断。
+
+默认启动的 `FakeModel` 只用于可重复的离线演示，不理解自由任务，也不会自主修改代码。要运行真实 Agent，须显式选择 DeepSeek。默认是只读模式：
+
+```powershell
+cmd.exe /d /c npm run mini -- --model deepseek --deepseek-model deepseek-v4-flash --require-source-evidence
+```
+
+要进行受控修改，使用显式编辑模式：
+
+```powershell
+cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace .
+```
+
+编辑模式只额外开放 `apply_patch` 和固定的 `run_project_check`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；任何其他输入都会取消，文件保持不变。模型只能选择 `test` 或 `check` 验证动作，不能执行任意命令、Git 操作或写入受保护路径。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次；`--require-source-evidence` 是只读取证模式，不能与 `--mode edit` 同时使用。
+
+### 可复位编辑冒烟测试
+
+仓库提供了故意带有一个小缺陷的模板 `fixtures/edit-smoke`。以下命令会将它复制到被 Git 忽略的隔离工作区 `playground/edit-smoke`；每次重新执行都会恢复初始缺陷，因此真实模型不会修改 MiniCode 自身。
+
+```powershell
+cmd.exe /d /c npm run prepare:edit-smoke
+cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace playground\edit-smoke --audit reports\edit-smoke-reject.jsonl
+```
+
+输入以下任务，待 diff 出现后输入任意非 `APPLY` 内容，验收“取消不写入”：
+
+```text
+修复 src/greeting.js 中 formatGreeting 缺少结尾感叹号的问题。先读取目标文件，只做最小修改；在我确认补丁后运行 test 验证。
+```
+
+随后再次运行 `npm run prepare:edit-smoke`，将审计文件改为 `reports\edit-smoke-apply.jsonl`，重复任务并输入 `APPLY`。验收标准是：读取 `src/greeting.js` 后才出现补丁、写入前显示 diff、`npm test` 成功、审计中有完整终态且不含补丁正文。
+
+若要在该机器上直接使用 `mini` 而非 `npm run mini`，可在确认本项目可信后执行一次 `cmd.exe /d /c npm link`；此操作会创建指向当前项目的本机全局命令。该仓库通过 `package.json` 的 `bin` 字段注册 `mini`，不会发布 npm 包。
+
 ## DeepSeek 模型适配
 
 默认模型是离线 `FakeModel`。只有显式传入 `--model deepseek` 且设置 `DEEPSEEK_API_KEY` 后，CLI 才会向 DeepSeek 发起网络请求。默认模型为 `deepseek-v4-flash`，可用 `--deepseek-model` 或 `DEEPSEEK_MODEL` 覆盖。
@@ -68,7 +112,7 @@ DeepSeek 模式默认只暴露 `get_project_overview`、`list_files`、`search_t
 cmd.exe /d /c npm run demo -- --model deepseek --deepseek-model deepseek-v4-flash --workspace . --require-source-evidence --audit reports\deepseek-source-evidence-smoke.jsonl "解释未知工具为何仍有完整的终态事件"
 ```
 
-2026-08-11 的首次真实证据模式测试发现了最后一轮边界：模型在第 6 轮给出越界引用，运行时正确记录 `final_answer_rejected`，但旧循环没有剩余轮次可供重答。定向修复虽已通过本地 31 项自动化测试与离线 CLI 演示，修复后的真实测试又暴露出另一条路径：模型先后消耗了 6 次 `get_project_overview`、`list_files` 与 `search_text`，首次 `read_file` 因总预算耗尽被拒绝，最终没有源码证据可引用。为将取证目标落实到工具权限上，`--require-source-evidence` 现在只注册 `search_text` 与 `read_file`，并将单轮受理数收紧为 1；普通 DeepSeek 侦察模式不受影响。一次后续真实运行已在第 4 轮成功完成并给出有效引用，但也表明提示词不足以约束搜索范围：模型曾以 `.` 搜索并看到了非源码文档。因此该模式现在在运行时将无路径搜索固定为 `src`，拒绝搜索或读取 `src/` 之外的路径；`.gitignore` 不再被误当作 Agent 的读取权限边界。又一次真实运行表明，提示词也不足以让模型在读到源码后停止探索：它在第 4 轮已读源码后继续搜索，直至第 6 轮仍未回答。首次状态机修复虽让模型停止搜索，却错误地禁止了寻找事件处理层的必要补充证据，导致最终解释只基于注册表而不够成立。当前状态机采用固定的两段证据链：最多两次初始搜索后必须首次读取；首次读取后可进行一次定向补充搜索和一次补充读取；第二次成功读取后关闭工具并要求最终回答。这样最多正好占用 6 个常规轮次，且仍只访问 `src/`。若第 6 个常规轮刚读到源码，才额外给予第 7 个无工具最终回答轮；该额外轮与引用修复共用一次上限，工具受理上限仍为 6。该改动已通过本地验证，仍需一次真实 DeepSeek 测试才可判断模型是否稳定收敛。
+2026-08-11 的首次真实证据模式测试发现了最后一轮边界：模型在第 6 轮给出越界引用，运行时正确记录 `final_answer_rejected`，但旧循环没有剩余轮次可供重答。定向修复虽已通过本地 31 项自动化测试与离线 CLI 演示，修复后的真实测试又暴露出另一条路径：模型先后消耗了 6 次 `get_project_overview`、`list_files` 与 `search_text`，首次 `read_file` 因总预算耗尽被拒绝，最终没有源码证据可引用。为将取证目标落实到工具权限上，`--require-source-evidence` 现在只注册 `search_text` 与 `read_file`，并将单轮受理数收紧为 1；普通 DeepSeek 侦察模式不受影响。一次后续真实运行已在第 4 轮成功完成并给出有效引用，但也表明提示词不足以约束搜索范围：模型曾以 `.` 搜索并看到了非源码文档。因此该模式现在在运行时将无路径搜索固定为 `src`，拒绝搜索或读取 `src/` 之外的路径；`.gitignore` 不再被误当作 Agent 的读取权限边界。又一次真实运行表明，提示词也不足以让模型在读到源码后停止探索：它在第 4 轮已读源码后继续搜索，直至第 6 轮仍未回答。首次状态机修复虽让模型停止搜索，却错误地禁止了寻找事件处理层的必要补充证据，导致最终解释只基于注册表而不够成立。当前状态机采用固定的两段证据链：最多两次初始搜索后必须首次读取；首次读取后可进行一次定向补充搜索和一次补充读取；第二次成功读取后关闭工具并要求最终回答。这样最多正好占用 6 个常规轮次，且仍只访问 `src/`。若第 6 个常规轮刚读到源码，才额外给予第 7 个无工具最终回答轮；该额外轮与引用修复共用一次上限，工具受理上限仍为 6。最新真实测试进一步证明，仅从工具列表中移除 `search_text` 不能保证模型不再返回它：两次被本地安全拒绝的调用耗尽了可用轮次。为此，当状态机只允许 `read_file` 时，适配器会向 DeepSeek 发送官方的具名 `tool_choice`，强制该函数调用；本地注册表与错误终态仍是不可绕过的安全边界。该改动已通过本地验证，仍需一次真实 DeepSeek 测试确认该模型在非思考模式下会稳定遵守强制选择。
 
 `apply_patch` 默认处于 `propose` 模式，只输出补丁预览、不写文件。只有在交互式终端传入 `--apply`，并输入精确的 `APPLY` 后才会原子写入：
 

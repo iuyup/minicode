@@ -42,10 +42,17 @@ export type AgentMessage =
   | AssistantMessage
   | ToolResultMessage;
 
+export type ConversationMessage = UserMessage | AssistantMessage;
+
 export interface ToolDescription {
   name: string;
   description: string;
   parameters: JsonObject;
+}
+
+export interface ForcedFunctionToolChoice {
+  type: "function";
+  name: string;
 }
 
 export type ValidationResult<T> =
@@ -120,6 +127,7 @@ export interface ModelRequest {
   messages: readonly AgentMessage[];
   tools: readonly ToolDescription[];
   workingState: string;
+  toolChoice?: ForcedFunctionToolChoice;
 }
 
 export type ModelResponse =

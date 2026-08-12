@@ -190,3 +190,33 @@ test("用户拒绝确认时保持原文件，并产生错误终态", async () =>
     await fs.rm(workspace, { recursive: true, force: true });
   }
 });
+
+test("编辑约束会拒绝未先读取目标文件的补丁", async () => {
+  const workspace = await createWorkspace();
+  try {
+    let askedForApproval = false;
+    const agent = new AgentLoop(
+      scriptedPatchModel({ path: TARGET_PATH, oldText: "before-value", newText: "after-value" }),
+      new ToolRegistry([applyPatch]),
+      {
+        workspaceRoot: workspace,
+        executionMode: "apply",
+        requireReadBeforeEdit: true,
+        requestEditApproval: async () => {
+          askedForApproval = true;
+          return true;
+        },
+      },
+    );
+
+    const result = await agent.run("修改一个尚未读取的文件。");
+    const toolResult = result.messages.find((message) => message.role === "tool");
+    assert.equal(toolResult?.status, "error");
+    assert.match(toolResult?.content ?? "", /修改前必须先用 read_file 成功读取目标文件/);
+    assert.equal(askedForApproval, false);
+    assert.equal(await fs.readFile(path.join(workspace, TARGET_PATH), "utf8"), ORIGINAL_SOURCE);
+    assert.equal(result.events.some((event) => event.type === "tool_execution_started"), false);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});

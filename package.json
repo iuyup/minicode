@@ -4,16 +4,24 @@
   "private": true,
   "type": "module",
   "description": "A small, auditable coding-agent learning project.",
+  "bin": {
+    "mini": "src/mini.ts"
+  },
   "engines": {
     "node": ">=22.18.0"
   },
   "scripts": {
     "demo": "node src/cli.ts",
-    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/deepseek-model.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts",
+    "mini": "node src/mini.ts",
+    "prepare:edit-smoke": "node scripts/create-edit-smoke-workspace.mjs",
+    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/deepseek-model.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts tests/mini-tui.test.ts",
     "check": "tsc -p tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@mariozechner/pi-tui": "^0.73.0"
   }
 }

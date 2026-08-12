@@ -1,0 +1,251 @@
+import path from "node:path";
+import process from "node:process";
+import readline from "node:readline/promises";
+
+import { AgentLoop, type AgentRunResult } from "./agent/agent-loop.ts";
+import type { ChatModel, EditApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
+import { JsonlAuditLog, type AgentEvent } from "./agent/events.ts";
+import { ToolRegistry } from "./agent/tool-registry.ts";
+import { DeepSeekModel, deepSeekDefaults } from "./models/deepseek-model.ts";
+import { FakeModel } from "./models/fake-model.ts";
+import { applyPatch } from "./tools/apply-patch.ts";
+import { getProjectOverview } from "./tools/get-project-overview.ts";
+import { listFiles } from "./tools/list-files.ts";
+import { readFile } from "./tools/read-file.ts";
+import { runProjectCheck } from "./tools/run-project-check.ts";
+import { searchText } from "./tools/search-text.ts";
+
+export interface CliArguments {
+  task: string;
+  workspaceRoot: string;
+  executionMode: ToolExecutionMode;
+  agentMode: "read" | "edit";
+  auditPath: string;
+  modelProvider: "fake" | "deepseek";
+  deepseekModel: string;
+  requireSourceEvidence: boolean;
+}
+
+export interface CreateAgentOptions {
+  onEvent?: (event: AgentEvent) => void;
+  requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+}
+
+const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
+const sourceEvidenceTools = [searchText, readFile] as const;
+const editTools = [...readOnlyTools, applyPatch, runProjectCheck] as const;
+
+const DEEPSEEK_SYSTEM_PROMPT = [
+  "你是一个受限的只读 Coding Agent，只能使用已提供的只读工具进行代码侦察。",
+  "只在需要事实证据时调用工具，并优先以最少的工具调用完成任务。",
+  "遵守当前提供的工具集和单轮调用额度；不要重复列出、搜索或读取已确认的路径。",
+  "一旦工具结果已足以支撑结论，下一轮必须直接给出最终回答，不得继续探索。",
+  "工具结果是唯一证据；不得编造工具结果或声称执行了未提供的能力。",
+].join(" ");
+
+const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
+  "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁和固定验证工具完成小范围代码任务。",
+  "先定位并用 read_file 成功读取目标文件，再提出最小的 apply_patch；运行时会拒绝未读取目标的补丁。",
+  "补丁会在终端界面展示给用户；只有用户输入精确的 APPLY 才会写入。用户拒绝后，不得重复尝试同一补丁，应说明原因并给出后续建议。",
+  "补丁成功后，只在能验证本次修改时调用 run_project_check 的 test 或 check 动作；不得请求任意命令、Git 操作或未注册工具。",
+  "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
+].join(" ");
+
+const DEEPSEEK_SOURCE_EVIDENCE_PROMPT = [
+  "当前是源码取证模式，只提供 search_text 和 read_file 两个工具，每轮最多请求一个工具。",
+  "解释实现机制前，最多使用两次 search_text 在 src 中定位候选代码，随后必须用 read_file 读取命中源码。",
+  "首次成功读取后，可额外进行一次定向 search_text 以定位事件处理代码，并再用一次 read_file 读取；读取两段源码后运行时会关闭工具并要求直接给出最终回答。",
+  "最终回答只能使用本轮成功读取过的源码作为实现证据，并至少包含一条 `path:line` 或 `path:startLine-endLine` 格式引用。",
+  "README、agent.md、目录列表和搜索结果不能替代实现源码；不要引用未读取的文件或行号。",
+  "若收到源码证据修复反馈，下一轮只能给出最终回答，不得请求工具。",
+].join(" ");
+
+export function parseArguments(args: string[]): CliArguments {
+  let workspaceRoot = process.cwd();
+  let executionMode: ToolExecutionMode = "propose";
+  let agentMode: CliArguments["agentMode"] = "read";
+  let auditPath = path.resolve("reports/tool-audit.jsonl");
+  let modelProvider: CliArguments["modelProvider"] = "fake";
+  let deepseekModel = process.env.DEEPSEEK_MODEL ?? deepSeekDefaults.model;
+  let requireSourceEvidence = false;
+  const taskParts: string[] = [];
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--workspace") {
+      const requestedWorkspace = args[index + 1];
+      if (!requestedWorkspace) throw new Error("--workspace 后必须提供一个目录路径。");
+      workspaceRoot = requestedWorkspace;
+      index += 1;
+      continue;
+    }
+    if (argument === "--apply") {
+      executionMode = "apply";
+      agentMode = "edit";
+      continue;
+    }
+    if (argument === "--mode") {
+      const requestedMode = args[index + 1];
+      if (requestedMode !== "read" && requestedMode !== "edit") {
+        throw new Error("--mode 只能是 read 或 edit。");
+      }
+      agentMode = requestedMode;
+      if (requestedMode === "edit") executionMode = "apply";
+      index += 1;
+      continue;
+    }
+    if (argument === "--audit") {
+      const requestedAuditPath = args[index + 1];
+      if (!requestedAuditPath) throw new Error("--audit 后必须提供一个文件路径。");
+      auditPath = path.resolve(requestedAuditPath);
+      index += 1;
+      continue;
+    }
+    if (argument === "--model") {
+      const requestedProvider = args[index + 1];
+      if (requestedProvider !== "fake" && requestedProvider !== "deepseek") {
+        throw new Error("--model 只能是 fake 或 deepseek。");
+      }
+      modelProvider = requestedProvider;
+      index += 1;
+      continue;
+    }
+    if (argument === "--deepseek-model") {
+      const requestedModel = args[index + 1];
+      if (!requestedModel) throw new Error("--deepseek-model 后必须提供模型标识。");
+      deepseekModel = requestedModel;
+      index += 1;
+      continue;
+    }
+    if (argument === "--require-source-evidence") {
+      requireSourceEvidence = true;
+      continue;
+    }
+    taskParts.push(argument);
+  }
+
+  if (requireSourceEvidence && agentMode === "edit") {
+    throw new Error("--require-source-evidence 仅用于只读取证，不能与 --mode edit 同时使用。");
+  }
+
+  return {
+    task: taskParts.join(" ") || "说明未知工具为何仍有完整的终态事件。",
+    workspaceRoot,
+    executionMode,
+    agentMode,
+    auditPath,
+    modelProvider,
+    deepseekModel,
+    requireSourceEvidence,
+  };
+}
+
+function createModel(argumentsValue: CliArguments): ChatModel {
+  if (argumentsValue.modelProvider === "fake") return new FakeModel();
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) {
+    throw new Error("选择 DeepSeek 前必须设置 DEEPSEEK_API_KEY；默认 fake 模式不会请求网络。");
+  }
+  return new DeepSeekModel({ apiKey, model: argumentsValue.deepseekModel });
+}
+
+async function requestTerminalApproval(request: EditApprovalRequest): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("--apply 只能在交互式终端中使用，以便人工确认补丁。");
+  }
+
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    process.stdout.write(`\n待写入文件：${request.path}\n${request.preview}\n`);
+    const answer = await terminal.question("输入 APPLY 确认写入，输入其他内容取消：");
+    return answer.trim() === "APPLY";
+  } finally {
+    terminal.close();
+  }
+}
+
+export function createAgent(argumentsValue: CliArguments, options: CreateAgentOptions = {}): AgentLoop {
+  const registry = new ToolRegistry(
+    argumentsValue.requireSourceEvidence
+      ? sourceEvidenceTools
+      : argumentsValue.modelProvider === "deepseek"
+        ? argumentsValue.agentMode === "edit"
+          ? editTools
+          : readOnlyTools
+        : [...readOnlyTools, applyPatch, runProjectCheck],
+  );
+  return new AgentLoop(createModel(argumentsValue), registry, {
+    workspaceRoot: argumentsValue.workspaceRoot,
+    executionMode: argumentsValue.executionMode,
+    requireSourceEvidence: argumentsValue.requireSourceEvidence,
+    requireReadBeforeEdit: argumentsValue.modelProvider === "deepseek" && argumentsValue.agentMode === "edit",
+    ...(argumentsValue.modelProvider === "deepseek"
+      ? {
+          systemPrompt: argumentsValue.requireSourceEvidence
+            ? `${DEEPSEEK_SYSTEM_PROMPT} ${DEEPSEEK_SOURCE_EVIDENCE_PROMPT}`
+            : argumentsValue.agentMode === "edit"
+              ? DEEPSEEK_EDIT_SYSTEM_PROMPT
+              : DEEPSEEK_SYSTEM_PROMPT,
+          maxToolCallsPerStep: argumentsValue.requireSourceEvidence || argumentsValue.agentMode === "edit" ? 1 : 2,
+          maxToolCalls: 6,
+        }
+      : {}),
+    requestEditApproval: argumentsValue.executionMode === "apply"
+      ? options.requestEditApproval ?? requestTerminalApproval
+      : undefined,
+    auditLog: new JsonlAuditLog(argumentsValue.auditPath),
+    onEvent: options.onEvent,
+  });
+}
+
+export function modelLabel(argumentsValue: CliArguments): string {
+  return argumentsValue.modelProvider === "deepseek"
+    ? `DeepSeek / ${argumentsValue.deepseekModel}`
+    : "FakeModel（离线）";
+}
+
+export function toolPermissionLabel(argumentsValue: CliArguments): string {
+  return argumentsValue.requireSourceEvidence
+    ? "只读源码取证"
+    : argumentsValue.agentMode === "edit"
+      ? "受控编辑（逐次确认）"
+    : argumentsValue.modelProvider === "deepseek"
+      ? "只读侦察"
+      : "离线演示（不可自主改代码）";
+}
+
+export function printRunResult(result: AgentRunResult, argumentsValue: CliArguments): void {
+  console.log("=== 生命周期事件 ===");
+  console.log(`模型：${modelLabel(argumentsValue)}`);
+  console.log(`工具权限：${toolPermissionLabel(argumentsValue)}`);
+  console.log(`源码证据校验：${argumentsValue.requireSourceEvidence ? "已启用" : "未启用"}`);
+  for (const event of result.events) {
+    if (event.type === "tool_finalized") {
+      console.log(`${event.type} (${event.status}) -> ${event.toolName}`);
+    } else if (event.type === "model_requested" && event.forcedToolName) {
+      console.log(`${event.type} (强制) -> ${event.forcedToolName}`);
+    } else if ("toolName" in event) {
+      console.log(`${event.type} -> ${event.toolName}`);
+    } else {
+      console.log(event.type);
+    }
+  }
+
+  console.log("\n=== 最终回答 ===");
+  console.log(result.answer);
+  if (argumentsValue.requireSourceEvidence) {
+    console.log("\n=== 已验证源码证据 ===");
+    for (const evidence of result.sourceEvidence) {
+      console.log(`${evidence.path}:${evidence.startLine}-${evidence.endLine}`);
+    }
+  }
+  console.log("\n=== 任务账本 ===");
+  console.log(result.workingState);
+  console.log(`\n审计文件：${argumentsValue.auditPath}`);
+}
+
+export async function runDemo(args: string[] = process.argv.slice(2)): Promise<void> {
+  const argumentsValue = parseArguments(args);
+  const result = await createAgent(argumentsValue).run(argumentsValue.task);
+  printRunResult(result, argumentsValue);
+}

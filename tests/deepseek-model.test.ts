@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { AgentLoop } from "../src/agent/agent-loop.ts";
@@ -6,6 +9,7 @@ import type { AgentEvent, AgentEventAuditLog } from "../src/agent/events.ts";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { DeepSeekModel, deepSeekDefaults } from "../src/models/deepseek-model.ts";
+import { createAgent, parseArguments } from "../src/runtime.ts";
 import { getProjectOverview } from "../src/tools/get-project-overview.ts";
 
 function requestFixture(): ModelRequest {
@@ -95,6 +99,47 @@ test("DeepSeekModel 发送 OpenAI 兼容请求，并显式关闭思考模式", a
   assert.deepEqual(messages[3], { role: "tool", tool_call_id: "prior-1", content: "目录：src" });
 });
 
+test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", async () => {
+  const auditDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-deepseek-edit-"));
+  const auditPath = path.join(auditDirectory, "audit.jsonl");
+  const originalFetch = globalThis.fetch;
+  const originalApiKey = process.env.DEEPSEEK_API_KEY;
+  let capturedInit: RequestInit | undefined;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    globalThis.fetch = async (_input, init) => {
+      capturedInit = init;
+      return jsonResponse({ choices: [{ message: { role: "assistant", content: "已完成只读分析。" } }] });
+    };
+    const options = parseArguments([
+      "--model", "deepseek",
+      "--mode", "edit",
+      "--workspace", process.cwd(),
+      "--audit", auditPath,
+      "检查一个小问题。",
+    ]);
+
+    await createAgent(options).run(options.task);
+
+    const body = JSON.parse(capturedInit?.body as string) as {
+      tools: Array<{ function: { name: string } }>;
+    };
+    assert.equal(options.executionMode, "apply");
+    assert.deepEqual(
+      body.tools.map((tool) => tool.function.name),
+      ["get_project_overview", "list_files", "search_text", "read_file", "apply_patch", "run_project_check"],
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) {
+      delete process.env.DEEPSEEK_API_KEY;
+    } else {
+      process.env.DEEPSEEK_API_KEY = originalApiKey;
+    }
+    await fs.rm(auditDirectory, { recursive: true, force: true });
+  }
+});
+
 test("DeepSeekModel 在最终修复轮省略工具定义", async () => {
   let capturedInit: RequestInit | undefined;
   const model = new DeepSeekModel({
@@ -113,6 +158,42 @@ test("DeepSeekModel 在最终修复轮省略工具定义", async () => {
   assert.equal("tools" in body, false);
   assert.equal("tool_choice" in body, false);
   assert.deepEqual(body.thinking, { type: "disabled" });
+});
+
+test("DeepSeekModel 将受控阶段的强制工具转换为官方 tool_choice 格式", async () => {
+  let capturedInit: RequestInit | undefined;
+  const model = new DeepSeekModel({
+    apiKey: "test-key",
+    fetchImplementation: async (_input, init) => {
+      capturedInit = init;
+      return jsonResponse({ choices: [{ message: { role: "assistant", content: "读取完成。" } }] });
+    },
+  });
+  const request: ModelRequest = {
+    ...requestFixture(),
+    toolChoice: { type: "function", name: "list_files" },
+  };
+
+  await model.complete(request);
+
+  const body = JSON.parse(capturedInit?.body as string) as Record<string, unknown>;
+  assert.deepEqual(body.tool_choice, {
+    type: "function",
+    function: { name: "list_files" },
+  });
+});
+
+test("DeepSeekModel 拒绝强制未注册工具", async () => {
+  const model = new DeepSeekModel({
+    apiKey: "test-key",
+    fetchImplementation: async () => jsonResponse({ choices: [] }),
+  });
+  const request: ModelRequest = {
+    ...requestFixture(),
+    toolChoice: { type: "function", name: "read_file" },
+  };
+
+  await assert.rejects(model.complete(request), /强制工具未在本轮工具列表中注册：read_file/);
 });
 
 test("DeepSeekModel 将工具调用映射回内部 ToolCall，并保留无效 JSON 供本地校验", async () => {

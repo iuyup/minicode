@@ -66,6 +66,19 @@ function toApiMessage(message: AgentMessage): ApiMessage {
   }
 }
 
+function toApiToolChoice(request: ModelRequest): JsonValue {
+  if (!request.toolChoice) {
+    return "auto";
+  }
+  if (!request.tools.some((tool) => tool.name === request.toolChoice?.name)) {
+    throw new Error(`DeepSeek 强制工具未在本轮工具列表中注册：${request.toolChoice.name}。`);
+  }
+  return {
+    type: "function",
+    function: { name: request.toolChoice.name },
+  };
+}
+
 function parseToolCall(value: unknown): ToolCall {
   const rawToolCall = asObject(value);
   const rawFunction = asObject(rawToolCall?.function);
@@ -166,7 +179,7 @@ export class DeepSeekModel implements ChatModel {
                     parameters: tool.parameters,
                   },
                 })),
-                tool_choice: "auto",
+                tool_choice: toApiToolChoice(request),
               }
             : {}),
           thinking: { type: "disabled" },

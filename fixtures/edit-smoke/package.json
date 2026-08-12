@@ -1,0 +1,9 @@
+{
+  "name": "minicode-edit-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/greeting.test.mjs",
+    "check": "node --check src/greeting.js && node --check tests/greeting.test.mjs"
+  }
+}

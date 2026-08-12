@@ -18,7 +18,7 @@ function findUnknownToolLocation(searchContent: string): { path: string; startLi
  */
 export class FakeModel implements ChatModel {
   async complete(request: ModelRequest): Promise<ModelResponse> {
-    const task = request.messages.find((message) => message.role === "user")?.content ?? "";
+    const task = request.messages.findLast((message) => message.role === "user")?.content ?? "";
     const requestedCheck = /(?:运行|执行).*(?:测试|test)|npm\s+test/i.test(task)
       ? "test"
       : /(?:运行|执行).*(?:类型检查|检查|check)|npm\s+run\s+check/i.test(task)

@@ -66,6 +66,32 @@ test("the loop appends a tool result before the model gives its final answer", a
   );
 });
 
+test("the loop preserves supplied conversation turns before the current task", async () => {
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      assert.deepEqual(
+        request.messages.map((message) => message.role),
+        ["system", "user", "assistant", "user"],
+      );
+      assert.equal(request.messages[1]?.content, "之前的任务");
+      assert.equal(request.messages[2]?.content, "之前的结论");
+      assert.equal(request.messages[3]?.content, "继续追问");
+      return { kind: "final", content: "已结合上一轮上下文回答。" };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([]), {
+    workspaceRoot: process.cwd(),
+  }).run("继续追问", {
+    conversationHistory: [
+      { role: "user", content: "之前的任务" },
+      { role: "assistant", content: "之前的结论" },
+    ],
+  });
+
+  assert.equal(result.answer, "已结合上一轮上下文回答。");
+});
+
 test("an unknown tool still receives a terminal lifecycle event and a tool error message", async () => {
   let callCount = 0;
   const model: ChatModel = {

@@ -2,6 +2,7 @@ import { ToolExecutionError } from "./contracts.ts";
 import type {
   AgentMessage,
   ChatModel,
+  ConversationMessage,
   EditApprovalRequest,
   JsonValue,
   ModelResponse,
@@ -25,16 +26,26 @@ export interface AgentRunResult {
   sourceEvidence: readonly SourceEvidence[];
 }
 
+export interface AgentRunOptions {
+  conversationHistory?: readonly ConversationMessage[];
+}
+
 export interface AgentLoopOptions {
   workspaceRoot: string;
   maxSteps?: number;
   maxToolCallsPerStep?: number;
   maxToolCalls?: number;
   requireSourceEvidence?: boolean;
+  /** 编辑模式下，补丁目标必须已由本轮成功的 read_file 读取。 */
+  requireReadBeforeEdit?: boolean;
   systemPrompt?: string;
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   auditLog?: AgentEventAuditLog;
+  /**
+   * 只读观察者：用于终端界面等展示层实时刷新，不参与工具权限、执行或审计决策。
+   */
+  onEvent?: (event: AgentEvent) => void;
 }
 
 const DEFAULT_SYSTEM_PROMPT = [
@@ -139,6 +150,18 @@ function appendSourceEvidence(target: SourceEvidence[], sourceEvidence: readonly
   }
 }
 
+function normalizeWorkspacePath(value: string): string {
+  return path.posix.normalize(value.replaceAll("\\", "/")).replace(/^\.\//, "");
+}
+
+function patchTargetPath(toolCall: ToolCall): string | undefined {
+  if (!toolCall.input || typeof toolCall.input !== "object" || Array.isArray(toolCall.input)) {
+    return undefined;
+  }
+  const value = (toolCall.input as Record<string, JsonValue>).path;
+  return typeof value === "string" ? normalizeWorkspacePath(value) : undefined;
+}
+
 export class AgentLoop {
   private readonly model: ChatModel;
   private readonly tools: ToolRegistry;
@@ -147,10 +170,12 @@ export class AgentLoop {
   readonly #maxToolCallsPerStep: number;
   readonly #maxToolCalls: number;
   readonly #requireSourceEvidence: boolean;
+  readonly #requireReadBeforeEdit: boolean;
   readonly #systemPrompt: string;
   readonly #executionMode: ToolExecutionMode;
   readonly #requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   readonly #auditLog?: AgentEventAuditLog;
+  readonly #onEvent?: (event: AgentEvent) => void;
 
   constructor(
     model: ChatModel,
@@ -164,15 +189,18 @@ export class AgentLoop {
     this.#maxToolCallsPerStep = normalizePositiveLimit(options.maxToolCallsPerStep, "maxToolCallsPerStep");
     this.#maxToolCalls = normalizePositiveLimit(options.maxToolCalls, "maxToolCalls");
     this.#requireSourceEvidence = options.requireSourceEvidence ?? false;
+    this.#requireReadBeforeEdit = options.requireReadBeforeEdit ?? false;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#executionMode = options.executionMode ?? "propose";
     this.#requestEditApproval = options.requestEditApproval;
     this.#auditLog = options.auditLog;
+    this.#onEvent = options.onEvent;
   }
 
-  async run(task: string): Promise<AgentRunResult> {
+  async run(task: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
     const messages: AgentMessage[] = [
       { role: "system", content: this.#systemPrompt },
+      ...(options.conversationHistory ?? []),
       { role: "user", content: task },
     ];
     const events = new InMemoryEventLog();
@@ -187,6 +215,7 @@ export class AgentLoop {
     let supplementalSourceSearchUsed = false;
     let maximumStep = this.#maxSteps;
     const sourceEvidence: SourceEvidence[] = [];
+    const readPaths = new Set<string>();
 
     try {
       for (let step = 1; step <= maximumStep; step += 1) {
@@ -202,16 +231,24 @@ export class AgentLoop {
               sourceSearchCallsBeforeEvidence,
               supplementalSourceSearchUsed,
             );
+        const toolChoice = this.#requireSourceEvidence && availableTools.length === 1
+          ? { type: "function" as const, name: availableTools[0].name }
+          : undefined;
         const allowedToolNames = this.#requireSourceEvidence
           ? new Set(availableTools.map((tool) => tool.name))
           : undefined;
-        this.recordEvent(events, { type: "model_requested", step });
+        this.recordEvent(events, {
+          type: "model_requested",
+          step,
+          ...(toolChoice ? { forcedToolName: toolChoice.name } : {}),
+        });
         let response: ModelResponse;
         try {
           response = await this.model.complete({
             messages,
             tools: availableTools,
             workingState: ledger.render(),
+            ...(toolChoice ? { toolChoice } : {}),
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -290,6 +327,7 @@ export class AgentLoop {
             toolCallIndex,
             acceptedToolCalls,
             allowedToolNames,
+            readPaths,
           );
           const result = rejectionReason
             ? this.rejectToolCall(toolCall, step, events, rejectionReason)
@@ -300,6 +338,11 @@ export class AgentLoop {
           const hadSourceEvidence = sourceEvidence.length > 0;
           messages.push(result);
           appendSourceEvidence(sourceEvidence, result.sourceEvidence);
+          if (result.name === "read_file" && result.status === "success") {
+            for (const evidence of result.sourceEvidence ?? []) {
+              readPaths.add(normalizeWorkspacePath(evidence.path));
+            }
+          }
           if (this.#requireSourceEvidence && !rejectionReason && result.name === "search_text") {
             if (hadSourceEvidence) {
               supplementalSourceSearchUsed = true;
@@ -366,6 +409,7 @@ export class AgentLoop {
     toolCallIndex: number,
     acceptedToolCalls: number,
     allowedToolNames: ReadonlySet<string> | undefined,
+    readPaths: ReadonlySet<string>,
   ): string | undefined {
     if (allowedToolNames && !allowedToolNames.has(toolCall.name)) {
       return "源码取证状态不允许该工具；请按当前阶段继续定位、读取或给出最终回答。";
@@ -375,6 +419,12 @@ export class AgentLoop {
     }
     if (acceptedToolCalls >= this.#maxToolCalls) {
       return `本次任务已达到工具调用上限 maxToolCalls=${this.#maxToolCalls}；请基于已有结果给出最终回答。`;
+    }
+    if (this.#requireReadBeforeEdit && toolCall.name === "apply_patch") {
+      const targetPath = patchTargetPath(toolCall);
+      if (targetPath && !readPaths.has(targetPath)) {
+        return `修改前必须先用 read_file 成功读取目标文件：${targetPath}。`;
+      }
     }
     return undefined;
   }
@@ -500,5 +550,10 @@ export class AgentLoop {
   private recordEvent(events: InMemoryEventLog, event: AgentEvent): void {
     events.record(event);
     this.#auditLog?.record(event);
+    try {
+      this.#onEvent?.(event);
+    } catch {
+      // 展示层故障不能改变 Agent 的执行、事件或审计语义。
+    }
   }
 }

@@ -157,6 +157,7 @@ test("source-evidence mode allows one supplemental search-read pair then forces 
       }
       if (callCount === 4) {
         assert.deepEqual(request.tools.map((tool) => tool.name), ["read_file"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "read_file" });
         return {
           kind: "tool_calls",
           content: "Read the handler.",
@@ -180,6 +181,52 @@ test("source-evidence mode allows one supplemental search-read pair then forces 
     ["search_text", "read_file", "search_text", "read_file"],
   );
   assert.deepEqual(result.events.at(-1), { type: "agent_completed", step: 5 });
+});
+
+test("source-evidence mode forces read_file after two initial searches", async () => {
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount <= 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["search_text", "read_file"]);
+        assert.equal(request.toolChoice, undefined);
+        return {
+          kind: "tool_calls",
+          content: "Continue locating the implementation.",
+          toolCalls: [{ id: `search-${callCount}`, name: "search_text", input: {} }],
+        };
+      }
+      if (callCount === 3) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["read_file"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "read_file" });
+        return {
+          kind: "tool_calls",
+          content: "Read the selected implementation.",
+          toolCalls: [{ id: "read-3", name: "read_file", input: {} }],
+        };
+      }
+
+      assert.deepEqual(request.tools.map((tool) => tool.name), ["search_text", "read_file"]);
+      assert.equal(request.toolChoice, undefined);
+      return { kind: "final", content: "The lookup happens at src/agent/agent-loop.ts:10-20." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([sourceSearchTool, sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(callCount, 4);
+  assert.deepEqual(
+    result.events.find((event) => event.type === "model_requested" && event.step === 3),
+    { type: "model_requested", step: 3, forcedToolName: "read_file" },
+  );
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "tool_finalized").map((event) => event.status),
+    ["success", "success", "success"],
+  );
 });
 
 test("source-evidence mode rejects a second supplemental search request", async () => {
@@ -212,6 +259,7 @@ test("source-evidence mode rejects a second supplemental search request", async 
       }
       if (callCount === 3) {
         assert.deepEqual(request.tools.map((tool) => tool.name), ["read_file"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "read_file" });
         return {
           kind: "tool_calls",
           content: "Try a second supplemental search.",

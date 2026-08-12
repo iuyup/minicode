@@ -4,7 +4,7 @@ import path from "node:path";
 import type { ToolExecutionMetadata } from "./contracts.ts";
 
 export type AgentEvent =
-  | { type: "model_requested"; step: number }
+  | { type: "model_requested"; step: number; forcedToolName?: string }
   | { type: "tool_call"; step: number; toolCallId: string; toolName: string }
   | {
       type: "policy_decision";
@@ -65,6 +65,7 @@ interface SanitizedAuditEvent {
   outputTruncated?: boolean;
   timedOut?: boolean;
   sourceEvidenceCount?: number;
+  forcedToolName?: string;
 }
 
 function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExecutionMetadata | undefined {
@@ -113,6 +114,7 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
         sourceEvidenceCount: event.sourceEvidenceCount,
       };
     case "model_requested":
+      return event.forcedToolName ? { ...base, forcedToolName: event.forcedToolName } : base;
     case "agent_completed":
     case "agent_stopped":
       return base;
