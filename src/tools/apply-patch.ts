@@ -101,7 +101,7 @@ async function writeAtomically(targetPath: string, content: string): Promise<voi
 
 export const applyPatch: AgentTool<ApplyPatchInput> = {
   name: "apply_patch",
-  description: "按精确旧文本替换为新文本；默认只生成预览，写入前必须经过人工确认。",
+  description: "精确文本替换工具。准备好 path、oldText 和 newText 后必须直接调用；终端会展示预览、等待用户精确输入 APPLY，并在获批后写入。不要在普通回答中请求 APPLY 或用 Markdown 补丁替代工具调用。",
   parameters: {
     type: "object",
     properties: {

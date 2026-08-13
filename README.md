@@ -68,7 +68,7 @@ cmd.exe /d /c npm run mini -- --model deepseek --deepseek-model deepseek-v4-flas
 cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace .
 ```
 
-编辑模式只额外开放 `apply_patch` 和固定的 `run_project_check`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；任何其他输入都会取消，文件保持不变。模型只能选择 `test` 或 `check` 验证动作，不能执行任意命令、Git 操作或写入受保护路径。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次；`--require-source-evidence` 是只读取证模式，不能与 `--mode edit` 同时使用。
+编辑模式只额外开放 `apply_patch` 和固定的 `run_project_check`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；输入 `CANCEL` 才会取消，其他输入既不会写入，也会保留待确认补丁。模型只能选择 `test` 或 `check` 验证动作，不能执行任意命令、Git 操作或写入受保护路径。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次；`--require-source-evidence` 是只读取证模式，不能与 `--mode edit` 同时使用。
 
 ### 可复位编辑冒烟测试
 
@@ -79,7 +79,7 @@ cmd.exe /d /c npm run prepare:edit-smoke
 cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace playground\edit-smoke --audit reports\edit-smoke-reject.jsonl
 ```
 
-输入以下任务，待 diff 出现后输入任意非 `APPLY` 内容，验收“取消不写入”：
+输入以下任务，待 diff 出现后输入 `CANCEL`，验收“取消不写入”：
 
 ```text
 修复 src/greeting.js 中 formatGreeting 缺少结尾感叹号的问题。先读取目标文件，只做最小修改；在我确认补丁后运行 test 验证。

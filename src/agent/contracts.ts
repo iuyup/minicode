@@ -76,6 +76,10 @@ export interface EditApprovalRequest {
   preview: string;
 }
 
+export interface PlanApprovalRequest {
+  plan: string;
+}
+
 export interface ToolPolicyDecision {
   decision: "allowed" | "blocked";
   path: string;
@@ -127,6 +131,7 @@ export interface ModelRequest {
   messages: readonly AgentMessage[];
   tools: readonly ToolDescription[];
   workingState: string;
+  phase?: "planning" | "execution";
   toolChoice?: ForcedFunctionToolChoice;
 }
 

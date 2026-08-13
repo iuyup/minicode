@@ -3,7 +3,7 @@ import process from "node:process";
 import readline from "node:readline/promises";
 
 import { AgentLoop, type AgentRunResult } from "./agent/agent-loop.ts";
-import type { ChatModel, EditApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
+import type { ChatModel, EditApprovalRequest, PlanApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
 import { JsonlAuditLog, type AgentEvent } from "./agent/events.ts";
 import { ToolRegistry } from "./agent/tool-registry.ts";
 import { DeepSeekModel, deepSeekDefaults } from "./models/deepseek-model.ts";
@@ -24,11 +24,13 @@ export interface CliArguments {
   modelProvider: "fake" | "deepseek";
   deepseekModel: string;
   requireSourceEvidence: boolean;
+  guided: boolean;
 }
 
 export interface CreateAgentOptions {
   onEvent?: (event: AgentEvent) => void;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
 }
 
 const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
@@ -51,6 +53,18 @@ const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
 
+const DEEPSEEK_EDIT_TOOL_PROTOCOL = [
+  "对于需要修改文件的任务，read_file 成功后必须直接调用 apply_patch；不要在普通回答中展示补丁、请求用户回复 APPLY，或声称会再次提交补丁。",
+  "APPLY 是终端本地确认步骤，不能由模型等待、解释或处理。调用 apply_patch 后终端会展示预览并暂停；收到工具结果后，才能继续说明结果。",
+  "若尚不能安全形成 path、oldText 和 newText，应调用只读工具补充信息；不能用自然语言补丁代替 apply_patch 工具调用。",
+].join(" ");
+
+const GUIDED_PLAN_PROMPT = [
+  "当前处于用户确认的计划阶段，尚未开放任何工具。",
+  "请只用简短 Markdown 给出：目标理解、最多三步执行计划、每一步是否可能修改文件或运行命令。",
+  "不要调用工具，不要声称已经读取文件、修改文件或运行命令；等待用户确认后才会进入执行阶段。",
+].join(" ");
+
 const DEEPSEEK_SOURCE_EVIDENCE_PROMPT = [
   "当前是源码取证模式，只提供 search_text 和 read_file 两个工具，每轮最多请求一个工具。",
   "解释实现机制前，最多使用两次 search_text 在 src 中定位候选代码，随后必须用 read_file 读取命中源码。",
@@ -68,6 +82,7 @@ export function parseArguments(args: string[]): CliArguments {
   let modelProvider: CliArguments["modelProvider"] = "fake";
   let deepseekModel = process.env.DEEPSEEK_MODEL ?? deepSeekDefaults.model;
   let requireSourceEvidence = false;
+  let guided = false;
   const taskParts: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -121,11 +136,18 @@ export function parseArguments(args: string[]): CliArguments {
       requireSourceEvidence = true;
       continue;
     }
+    if (argument === "--guided") {
+      guided = true;
+      continue;
+    }
     taskParts.push(argument);
   }
 
   if (requireSourceEvidence && agentMode === "edit") {
     throw new Error("--require-source-evidence 仅用于只读取证，不能与 --mode edit 同时使用。");
+  }
+  if (guided && requireSourceEvidence) {
+    throw new Error("--guided 不能与 --require-source-evidence 同时使用；取证模式有专用的受控状态机。");
   }
 
   return {
@@ -137,6 +159,7 @@ export function parseArguments(args: string[]): CliArguments {
     modelProvider,
     deepseekModel,
     requireSourceEvidence,
+    guided,
   };
 }
 
@@ -164,6 +187,21 @@ async function requestTerminalApproval(request: EditApprovalRequest): Promise<bo
   }
 }
 
+async function requestTerminalPlanApproval(request: PlanApprovalRequest): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("--guided 只能在交互式终端中使用，以便人工确认计划。");
+  }
+
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    process.stdout.write(`\n待确认计划：\n${request.plan}\n`);
+    const answer = await terminal.question("输入 CONTINUE 开始执行，输入 CANCEL 取消：");
+    return answer.trim() === "CONTINUE";
+  } finally {
+    terminal.close();
+  }
+}
+
 export function createAgent(argumentsValue: CliArguments, options: CreateAgentOptions = {}): AgentLoop {
   const registry = new ToolRegistry(
     argumentsValue.requireSourceEvidence
@@ -178,20 +216,27 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
     workspaceRoot: argumentsValue.workspaceRoot,
     executionMode: argumentsValue.executionMode,
     requireSourceEvidence: argumentsValue.requireSourceEvidence,
+    requirePlanApproval: argumentsValue.guided,
     requireReadBeforeEdit: argumentsValue.modelProvider === "deepseek" && argumentsValue.agentMode === "edit",
     ...(argumentsValue.modelProvider === "deepseek"
       ? {
-          systemPrompt: argumentsValue.requireSourceEvidence
-            ? `${DEEPSEEK_SYSTEM_PROMPT} ${DEEPSEEK_SOURCE_EVIDENCE_PROMPT}`
-            : argumentsValue.agentMode === "edit"
-              ? DEEPSEEK_EDIT_SYSTEM_PROMPT
-              : DEEPSEEK_SYSTEM_PROMPT,
+          systemPrompt: [
+            argumentsValue.requireSourceEvidence
+              ? `${DEEPSEEK_SYSTEM_PROMPT} ${DEEPSEEK_SOURCE_EVIDENCE_PROMPT}`
+              : argumentsValue.agentMode === "edit"
+                ? `${DEEPSEEK_EDIT_SYSTEM_PROMPT} ${DEEPSEEK_EDIT_TOOL_PROTOCOL}`
+                : DEEPSEEK_SYSTEM_PROMPT,
+            ...(argumentsValue.guided ? [GUIDED_PLAN_PROMPT] : []),
+          ].join(" "),
           maxToolCallsPerStep: argumentsValue.requireSourceEvidence || argumentsValue.agentMode === "edit" ? 1 : 2,
           maxToolCalls: 6,
         }
       : {}),
     requestEditApproval: argumentsValue.executionMode === "apply"
       ? options.requestEditApproval ?? requestTerminalApproval
+      : undefined,
+    requestPlanApproval: argumentsValue.guided
+      ? options.requestPlanApproval ?? requestTerminalPlanApproval
       : undefined,
     auditLog: new JsonlAuditLog(argumentsValue.auditPath),
     onEvent: options.onEvent,
@@ -207,7 +252,11 @@ export function modelLabel(argumentsValue: CliArguments): string {
 export function toolPermissionLabel(argumentsValue: CliArguments): string {
   return argumentsValue.requireSourceEvidence
     ? "只读源码取证"
-    : argumentsValue.agentMode === "edit"
+    : argumentsValue.guided
+      ? argumentsValue.agentMode === "edit"
+        ? "引导式受控编辑"
+        : "引导式只读"
+      : argumentsValue.agentMode === "edit"
       ? "受控编辑（逐次确认）"
     : argumentsValue.modelProvider === "deepseek"
       ? "只读侦察"

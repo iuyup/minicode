@@ -97,14 +97,69 @@ test("mini TUI intercepts Ctrl+V and inserts plain clipboard text into the edito
     const app = createMiniTui(
       ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
       terminal,
-      { readClipboard: async () => "粘贴的任务文本" },
+      { readClipboard: async () => "粘贴的任务文本：修复 greeting" },
     );
     app.start();
     terminal.send("\u0016");
-    await waitFor(() => app.editorText === "粘贴的任务文本");
-    assert.equal(app.editorText, "粘贴的任务文本");
+    await waitFor(() => app.editorText === "粘贴的任务文本：修复 greeting");
+    assert.equal(app.editorText, "粘贴的任务文本：修复 greeting");
     app.stop();
   } finally {
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("mini TUI never sends APPLY to the model when no patch is awaiting confirmation", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-apply-guard-"));
+  const terminal = new FakeTerminal();
+  let app: MiniTuiApp | undefined;
+  try {
+    app = createMiniTui(
+      ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+      terminal,
+    );
+    app.start();
+
+    await app.submit("APPLY");
+
+    assert.equal(app.contextTurns, 0);
+    await waitFor(() => stripAnsi(terminal.output).includes("当前没有待确认补丁"));
+    assert.match(stripAnsi(terminal.output), /当前没有待确认补丁/);
+  } finally {
+    app?.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("guided TUI shows a plan and waits for CONTINUE before tools can run", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-guided-"));
+  const terminal = new FakeTerminal();
+  let app: MiniTuiApp | undefined;
+  try {
+    app = createMiniTui(
+      ["--guided", "--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+      terminal,
+    );
+    app.start();
+
+    const task = app.submit("解释未知工具为何仍有完整的终态事件");
+    await waitFor(() => app?.awaitingPlanApproval === true);
+    assert.equal(app.contextTurns, 0);
+    assert.match(stripAnsi(terminal.output), /待确认计划/);
+    assert.match(stripAnsi(terminal.output), /CONTINUE/);
+
+    await app.submit("continue");
+    assert.equal(app.awaitingPlanApproval, true);
+    await waitFor(() => stripAnsi(terminal.output).includes("计划仍在等待确认"));
+    assert.match(stripAnsi(terminal.output), /计划仍在等待确认/);
+
+    await app.submit("CONTINUE");
+    await task;
+    await waitFor(() => app?.contextTurns === 1);
+    await waitFor(() => stripAnsi(terminal.output).includes("只读代码侦察闭环已完成"));
+    assert.match(stripAnsi(terminal.output), /只读代码侦察闭环已完成/);
+  } finally {
+    app?.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
   }
 });
@@ -151,7 +206,14 @@ test("编辑模式在 TUI 展示补丁，并且只有 APPLY 会写入文件", as
     const task = app.submit("把 before 改成 after");
     await waitFor(() => stripAnsi(terminal.output).includes("待确认补丁"));
     assert.match(stripAnsi(terminal.output), /输入 APPLY/);
+    assert.match(stripAnsi(terminal.output), /等待确认：APPLY \/ CANCEL/);
     assert.doesNotMatch(stripAnsi(terminal.output), /```diff/);
+    assert.match(await fs.readFile(targetPath, "utf8"), /before/);
+
+    await app.submit("apply");
+    assert.equal(app.awaitingApproval, true);
+    await waitFor(() => stripAnsi(terminal.output).includes("补丁仍在等待确认"));
+    assert.match(stripAnsi(terminal.output), /补丁仍在等待确认/);
     assert.match(await fs.readFile(targetPath, "utf8"), /before/);
 
     await app.submit("APPLY");
@@ -159,8 +221,8 @@ test("编辑模式在 TUI 展示补丁，并且只有 APPLY 会写入文件", as
     await waitFor(() => stripAnsi(terminal.output).includes("补丁已确认并写入"));
     assert.match(await fs.readFile(targetPath, "utf8"), /after/);
     assert.equal(app.contextTurns, 1);
-    app.stop();
   } finally {
+    app?.stop();
     await fs.rm(workspace, { recursive: true, force: true });
   }
 });

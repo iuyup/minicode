@@ -92,6 +92,123 @@ test("the loop preserves supplied conversation turns before the current task", a
   assert.equal(result.answer, "已结合上一轮上下文回答。");
 });
 
+test("guided mode requires a plan approval before executing tools", async () => {
+  let modelCallCount = 0;
+  let toolExecutionCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        assert.equal(request.phase, "planning");
+        assert.deepEqual(request.tools, []);
+        return { kind: "final", content: "1. Read the target.\n2. Make the smallest safe change." };
+      }
+      if (modelCallCount === 2) {
+        assert.equal(request.phase, "execution");
+        assert.equal(request.messages.at(-1)?.role, "user");
+        return {
+          kind: "tool_calls",
+          content: "Read the target first.",
+          toolCalls: [{ id: "guided-read-1", name: "inspect", input: {} }],
+        };
+      }
+      assert.equal(request.messages.at(-1)?.role, "tool");
+      return { kind: "final", content: "Completed after verified inspection." };
+    },
+  };
+  const countingTool: AgentTool<JsonValue> = {
+    ...emptyTool,
+    async execute() {
+      toolExecutionCount += 1;
+      return "confirmed-fact";
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([countingTool]), {
+    workspaceRoot: process.cwd(),
+    requirePlanApproval: true,
+    requestPlanApproval: async (request) => {
+      assert.match(request.plan, /smallest safe change/);
+      return true;
+    },
+  }).run("Make a small change.");
+
+  assert.equal(result.answer, "Completed after verified inspection.");
+  assert.equal(toolExecutionCount, 1);
+  assert.deepEqual(
+    result.events.map((event) => event.type),
+    [
+      "model_requested",
+      "plan_proposed",
+      "plan_decision",
+      "model_requested",
+      "tool_call",
+      "tool_execution_started",
+      "tool_finalized",
+      "model_requested",
+      "agent_completed",
+    ],
+  );
+});
+
+test("guided mode cancellation returns without executing tools", async () => {
+  let modelCallCount = 0;
+  let toolExecutionCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      assert.equal(request.phase, "planning");
+      return { kind: "final", content: "1. Inspect.\n2. Edit." };
+    },
+  };
+  const countingTool: AgentTool<JsonValue> = {
+    ...emptyTool,
+    async execute() {
+      toolExecutionCount += 1;
+      return "should-not-run";
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([countingTool]), {
+    workspaceRoot: process.cwd(),
+    requirePlanApproval: true,
+    requestPlanApproval: async () => false,
+  }).run("Do not start this plan.");
+
+  assert.equal(modelCallCount, 1);
+  assert.equal(toolExecutionCount, 0);
+  assert.match(result.answer, /用户未确认计划/);
+  assert.deepEqual(
+    result.events.map((event) => event.type),
+    ["model_requested", "plan_proposed", "plan_decision", "agent_stopped"],
+  );
+});
+
+test("guided planning is a preparation phase and does not consume the execution step budget", async () => {
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        assert.equal(request.phase, "planning");
+        return { kind: "final", content: "1. Inspect the workspace." };
+      }
+      assert.equal(request.phase, "execution");
+      return { kind: "final", content: "Execution budget remains available." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 1,
+    requirePlanApproval: true,
+    requestPlanApproval: async () => true,
+  }).run("Confirm then answer.");
+
+  assert.equal(result.answer, "Execution budget remains available.");
+  assert.equal(modelCallCount, 2);
+});
+
 test("an unknown tool still receives a terminal lifecycle event and a tool error message", async () => {
   let callCount = 0;
   const model: ChatModel = {

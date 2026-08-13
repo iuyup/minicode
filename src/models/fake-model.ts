@@ -18,6 +18,18 @@ function findUnknownToolLocation(searchContent: string): { path: string; startLi
  */
 export class FakeModel implements ChatModel {
   async complete(request: ModelRequest): Promise<ModelResponse> {
+    if (request.phase === "planning") {
+      return {
+        kind: "final",
+        content: [
+          "## 执行计划",
+          "1. 先搜索并读取与任务相关的真实代码。",
+          "2. 基于读取结果给出最小修改或验证结论。",
+          "3. 若任务要求验证，调用已注册的受控验证工具。",
+        ].join("\n"),
+      };
+    }
+
     const task = request.messages.findLast((message) => message.role === "user")?.content ?? "";
     const requestedCheck = /(?:运行|执行).*(?:测试|test)|npm\s+test/i.test(task)
       ? "test"

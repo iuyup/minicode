@@ -4,6 +4,7 @@ import type {
   ChatModel,
   ConversationMessage,
   EditApprovalRequest,
+  PlanApprovalRequest,
   JsonValue,
   ModelResponse,
   ToolCall,
@@ -38,9 +39,12 @@ export interface AgentLoopOptions {
   requireSourceEvidence?: boolean;
   /** 编辑模式下，补丁目标必须已由本轮成功的 read_file 读取。 */
   requireReadBeforeEdit?: boolean;
+  /** 在工具执行前要求模型先给出计划，并等待本地人工确认。 */
+  requirePlanApproval?: boolean;
   systemPrompt?: string;
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
   auditLog?: AgentEventAuditLog;
   /**
    * 只读观察者：用于终端界面等展示层实时刷新，不参与工具权限、执行或审计决策。
@@ -171,9 +175,11 @@ export class AgentLoop {
   readonly #maxToolCalls: number;
   readonly #requireSourceEvidence: boolean;
   readonly #requireReadBeforeEdit: boolean;
+  readonly #requirePlanApproval: boolean;
   readonly #systemPrompt: string;
   readonly #executionMode: ToolExecutionMode;
   readonly #requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  readonly #requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
   readonly #auditLog?: AgentEventAuditLog;
   readonly #onEvent?: (event: AgentEvent) => void;
 
@@ -190,9 +196,11 @@ export class AgentLoop {
     this.#maxToolCalls = normalizePositiveLimit(options.maxToolCalls, "maxToolCalls");
     this.#requireSourceEvidence = options.requireSourceEvidence ?? false;
     this.#requireReadBeforeEdit = options.requireReadBeforeEdit ?? false;
+    this.#requirePlanApproval = options.requirePlanApproval ?? false;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#executionMode = options.executionMode ?? "propose";
     this.#requestEditApproval = options.requestEditApproval;
+    this.#requestPlanApproval = options.requestPlanApproval;
     this.#auditLog = options.auditLog;
     this.#onEvent = options.onEvent;
   }
@@ -213,6 +221,7 @@ export class AgentLoop {
     let successfulSourceReadCalls = 0;
     let sourceSearchCallsBeforeEvidence = 0;
     let supplementalSourceSearchUsed = false;
+    let planApprovalPending = this.#requirePlanApproval;
     let maximumStep = this.#maxSteps;
     const sourceEvidence: SourceEvidence[] = [];
     const readPaths = new Set<string>();
@@ -224,7 +233,8 @@ export class AgentLoop {
         sourceEvidenceRepairPending = false;
         sourceEvidenceCompletionPending = false;
         const isSourceEvidenceFinalTurn = isSourceEvidenceRepairTurn || isSourceEvidenceCompletionTurn;
-        const availableTools = isSourceEvidenceFinalTurn
+        const isPlanningTurn = planApprovalPending;
+        const availableTools = isPlanningTurn || isSourceEvidenceFinalTurn
           ? []
           : this.getAvailableToolDescriptions(
               sourceEvidence,
@@ -248,6 +258,7 @@ export class AgentLoop {
             messages,
             tools: availableTools,
             workingState: ledger.render(),
+            phase: isPlanningTurn ? "planning" : "execution",
             ...(toolChoice ? { toolChoice } : {}),
           });
         } catch (error) {
@@ -263,6 +274,44 @@ export class AgentLoop {
             : "源码取证已收集足够证据，本轮只能给出最终回答，不能请求工具。";
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
+        }
+
+        if (isPlanningTurn) {
+          if (response.kind !== "final") {
+            const reason = "计划阶段不允许调用工具；请先给出可供用户确认的简短计划。";
+            this.recordEvent(events, { type: "agent_stopped", step, reason });
+            throw new Error(reason);
+          }
+          if (!this.#requestPlanApproval) {
+            const reason = "已启用计划确认，但没有可用的本地确认回调。";
+            this.recordEvent(events, { type: "agent_stopped", step, reason });
+            throw new Error(reason);
+          }
+
+          this.recordEvent(events, { type: "plan_proposed", step, planLength: response.content.length });
+          const approved = await this.#requestPlanApproval({ plan: response.content });
+          this.recordEvent(events, {
+            type: "plan_decision",
+            step,
+            decision: approved ? "approved" : "rejected",
+          });
+          messages.push({ role: "assistant", content: response.content });
+          if (!approved) {
+            const reason = "用户未确认计划，未执行工具或修改文件。";
+            this.recordEvent(events, { type: "agent_stopped", step, reason });
+            return {
+              answer: reason,
+              messages,
+              events: events.events,
+              workingState: ledger.render(),
+              sourceEvidence,
+            };
+          }
+
+          messages.push({ role: "user", content: "计划已由用户确认。现在开始执行；仅在必要时调用已注册工具。" });
+          planApprovalPending = false;
+          maximumStep += 1;
+          continue;
         }
 
         if (response.kind === "final") {

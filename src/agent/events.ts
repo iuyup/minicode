@@ -5,6 +5,8 @@ import type { ToolExecutionMetadata } from "./contracts.ts";
 
 export type AgentEvent =
   | { type: "model_requested"; step: number; forcedToolName?: string }
+  | { type: "plan_proposed"; step: number; planLength: number }
+  | { type: "plan_decision"; step: number; decision: "approved" | "rejected" }
   | { type: "tool_call"; step: number; toolCallId: string; toolName: string }
   | {
       type: "policy_decision";
@@ -54,6 +56,7 @@ interface SanitizedAuditEvent {
   toolCallId?: string;
   toolName?: string;
   decision?: "allowed" | "blocked";
+  planDecision?: "approved" | "rejected";
   status?: "success" | "error";
   path?: string;
   reason?: string;
@@ -66,6 +69,7 @@ interface SanitizedAuditEvent {
   timedOut?: boolean;
   sourceEvidenceCount?: number;
   forcedToolName?: string;
+  planLength?: number;
 }
 
 function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExecutionMetadata | undefined {
@@ -115,6 +119,10 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
       };
     case "model_requested":
       return event.forcedToolName ? { ...base, forcedToolName: event.forcedToolName } : base;
+    case "plan_proposed":
+      return { ...base, planLength: event.planLength };
+    case "plan_decision":
+      return { ...base, planDecision: event.decision };
     case "agent_completed":
     case "agent_stopped":
       return base;

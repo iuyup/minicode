@@ -122,12 +122,18 @@ test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", as
     await createAgent(options).run(options.task);
 
     const body = JSON.parse(capturedInit?.body as string) as {
-      tools: Array<{ function: { name: string } }>;
+      messages: Array<{ role: string; content: string }>;
+      tools: Array<{ function: { name: string; description: string } }>;
     };
     assert.equal(options.executionMode, "apply");
     assert.deepEqual(
       body.tools.map((tool) => tool.function.name),
       ["get_project_overview", "list_files", "search_text", "read_file", "apply_patch", "run_project_check"],
+    );
+    assert.match(body.messages[0]?.content ?? "", /必须直接调用 apply_patch/);
+    assert.match(
+      body.tools.find((tool) => tool.function.name === "apply_patch")?.function.description ?? "",
+      /不要在普通回答中请求 APPLY/,
     );
   } finally {
     globalThis.fetch = originalFetch;
