@@ -109,6 +109,42 @@ test("mini TUI intercepts Ctrl+V and inserts plain clipboard text into the edito
   }
 });
 
+test("mini TUI lists configured Profiles and switches model without sending a request", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-profile-"));
+  const auditPath = path.join(reportDirectory, "audit.jsonl");
+  const terminal = new FakeTerminal();
+  const originalBaseUrl = process.env.MINICODE_OPENAI_BASE_URL;
+  const originalModel = process.env.MINICODE_OPENAI_MODEL;
+  const originalApiKey = process.env.MINICODE_OPENAI_API_KEY;
+  let app: MiniTuiApp | undefined;
+  try {
+    process.env.MINICODE_OPENAI_BASE_URL = "https://gateway.example/v1";
+    process.env.MINICODE_OPENAI_MODEL = "test-coder";
+    process.env.MINICODE_OPENAI_API_KEY = "test-key";
+    app = createMiniTui(["--workspace", process.cwd(), "--audit", auditPath], terminal);
+    app.start();
+
+    await app.submit("/model");
+    await waitFor(() => stripAnsi(terminal.output).includes("openai-compatible"));
+    assert.match(stripAnsi(terminal.output), /openai-compatible/);
+    assert.match(stripAnsi(terminal.output), /MINICODE_OPENAI_API_KEY/);
+
+    await app.submit("/model openai");
+    await waitFor(() => stripAnsi(terminal.output).includes("已切换到 OpenAI-compatible / test-coder"));
+    assert.equal(app.contextTurns, 0);
+    assert.match(stripAnsi(terminal.output), /后续发送给模型的会话已清空/);
+  } finally {
+    app?.stop();
+    if (originalBaseUrl === undefined) delete process.env.MINICODE_OPENAI_BASE_URL;
+    else process.env.MINICODE_OPENAI_BASE_URL = originalBaseUrl;
+    if (originalModel === undefined) delete process.env.MINICODE_OPENAI_MODEL;
+    else process.env.MINICODE_OPENAI_MODEL = originalModel;
+    if (originalApiKey === undefined) delete process.env.MINICODE_OPENAI_API_KEY;
+    else process.env.MINICODE_OPENAI_API_KEY = originalApiKey;
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
 test("mini TUI never sends APPLY to the model when no patch is awaiting confirmation", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-apply-guard-"));
   const terminal = new FakeTerminal();

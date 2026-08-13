@@ -9,6 +9,7 @@ import type { AgentEvent, AgentEventAuditLog } from "../src/agent/events.ts";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { DeepSeekModel, deepSeekDefaults } from "../src/models/deepseek-model.ts";
+import { OpenAiCompatibleModel } from "../src/models/openai-compatible-model.ts";
 import { createAgent, parseArguments } from "../src/runtime.ts";
 import { getProjectOverview } from "../src/tools/get-project-overview.ts";
 
@@ -97,6 +98,31 @@ test("DeepSeekModel 发送 OpenAI 兼容请求，并显式关闭思考模式", a
     },
   ]);
   assert.deepEqual(messages[3], { role: "tool", tool_call_id: "prior-1", content: "目录：src" });
+});
+
+test("OpenAiCompatibleModel 使用 Profile 提供的地址与模型，不附加 DeepSeek 参数", async () => {
+  let capturedUrl = "";
+  let capturedInit: RequestInit | undefined;
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1/",
+    model: "local-coder",
+    providerName: "Test provider",
+    fetchImplementation: async (input, init) => {
+      capturedUrl = String(input);
+      capturedInit = init;
+      return jsonResponse({ choices: [{ message: { role: "assistant", content: "已确认。" } }] });
+    },
+  });
+
+  const result = await model.complete(requestFixture());
+
+  assert.deepEqual(result, { kind: "final", content: "已确认。" });
+  assert.equal(capturedUrl, "https://example.test/v1/chat/completions");
+  const body = JSON.parse(capturedInit?.body as string) as Record<string, unknown>;
+  assert.equal(body.model, "local-coder");
+  assert.equal("thinking" in body, false);
+  assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer test-key");
 });
 
 test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", async () => {

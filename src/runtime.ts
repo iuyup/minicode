@@ -6,8 +6,17 @@ import { AgentLoop, type AgentRunResult } from "./agent/agent-loop.ts";
 import type { ChatModel, EditApprovalRequest, PlanApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
 import { JsonlAuditLog, type AgentEvent } from "./agent/events.ts";
 import { ToolRegistry } from "./agent/tool-registry.ts";
-import { DeepSeekModel, deepSeekDefaults } from "./models/deepseek-model.ts";
 import { FakeModel } from "./models/fake-model.ts";
+import {
+  getModelProfile,
+  getModelProfiles,
+  getModelProfileReadiness,
+  parseModelProfileId,
+  resolveOpenAiCompatibleProfile,
+  type ModelProfile,
+  type ModelProfileId,
+} from "./models/model-profiles.ts";
+import { OpenAiCompatibleModel } from "./models/openai-compatible-model.ts";
 import { applyPatch } from "./tools/apply-patch.ts";
 import { getProjectOverview } from "./tools/get-project-overview.ts";
 import { listFiles } from "./tools/list-files.ts";
@@ -21,7 +30,7 @@ export interface CliArguments {
   executionMode: ToolExecutionMode;
   agentMode: "read" | "edit";
   auditPath: string;
-  modelProvider: "fake" | "deepseek";
+  modelProfile: ModelProfileId;
   deepseekModel: string;
   requireSourceEvidence: boolean;
   guided: boolean;
@@ -79,8 +88,9 @@ export function parseArguments(args: string[]): CliArguments {
   let executionMode: ToolExecutionMode = "propose";
   let agentMode: CliArguments["agentMode"] = "read";
   let auditPath = path.resolve("reports/tool-audit.jsonl");
-  let modelProvider: CliArguments["modelProvider"] = "fake";
-  let deepseekModel = process.env.DEEPSEEK_MODEL ?? deepSeekDefaults.model;
+  let modelProfile: ModelProfileId = "fake";
+  const deepseekProfile = getModelProfile("deepseek");
+  let deepseekModel = deepseekProfile.kind === "openai-compatible" ? deepseekProfile.model : "";
   let requireSourceEvidence = false;
   let guided = false;
   const taskParts: string[] = [];
@@ -121,7 +131,17 @@ export function parseArguments(args: string[]): CliArguments {
       if (requestedProvider !== "fake" && requestedProvider !== "deepseek") {
         throw new Error("--model 只能是 fake 或 deepseek。");
       }
-      modelProvider = requestedProvider;
+      modelProfile = requestedProvider;
+      index += 1;
+      continue;
+    }
+    if (argument === "--profile") {
+      const requestedProfile = args[index + 1];
+      const parsedProfile = requestedProfile ? parseModelProfileId(requestedProfile) : undefined;
+      if (!parsedProfile) {
+        throw new Error("--profile 只支持 fake、deepseek 或 openai-compatible。");
+      }
+      modelProfile = parsedProfile;
       index += 1;
       continue;
     }
@@ -156,20 +176,59 @@ export function parseArguments(args: string[]): CliArguments {
     executionMode,
     agentMode,
     auditPath,
-    modelProvider,
+    modelProfile,
     deepseekModel,
     requireSourceEvidence,
     guided,
   };
 }
 
+function currentModelProfile(argumentsValue: CliArguments): ModelProfile {
+  const profile = getModelProfile(argumentsValue.modelProfile);
+  return profile.id === "deepseek"
+    ? { ...profile, model: argumentsValue.deepseekModel }
+    : profile;
+}
+
+function usesRemoteModel(argumentsValue: CliArguments): boolean {
+  return argumentsValue.modelProfile !== "fake";
+}
+
 function createModel(argumentsValue: CliArguments): ChatModel {
-  if (argumentsValue.modelProvider === "fake") return new FakeModel();
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
-    throw new Error("选择 DeepSeek 前必须设置 DEEPSEEK_API_KEY；默认 fake 模式不会请求网络。");
+  if (!usesRemoteModel(argumentsValue)) return new FakeModel();
+  const { profile, apiKey } = resolveOpenAiCompatibleProfile(argumentsValue.modelProfile);
+  const activeProfile = currentModelProfile(argumentsValue);
+  if (activeProfile.kind === "fake") return new FakeModel();
+  return new OpenAiCompatibleModel({
+    apiKey,
+    baseUrl: profile.baseUrl,
+    model: activeProfile.model,
+    providerName: profile.label,
+    apiKeyEnvironmentVariable: profile.apiKeyEnvironmentVariable,
+    disableThinking: profile.disableThinking,
+  });
+}
+
+export function listModelProfiles(): readonly ModelProfile[] {
+  return getModelProfiles();
+}
+
+/**
+ * 仅校验配置并更新内存中的会话选项。不会发送网络请求，也不会持久化 API Key。
+ */
+export function selectModelProfile(argumentsValue: CliArguments, requestedProfile: string): ModelProfile {
+  const profileId = parseModelProfileId(requestedProfile);
+  if (!profileId) {
+    throw new Error("可选 Profile：fake、deepseek、openai-compatible。");
   }
-  return new DeepSeekModel({ apiKey, model: argumentsValue.deepseekModel });
+  if (profileId !== "fake") resolveOpenAiCompatibleProfile(profileId);
+  argumentsValue.modelProfile = profileId;
+  return currentModelProfile(argumentsValue);
+}
+
+export function modelProfileReadiness(profile: ModelProfile): string {
+  const readiness = getModelProfileReadiness(profile);
+  return readiness.ready ? "就绪" : readiness.reason ?? "未就绪";
 }
 
 async function requestTerminalApproval(request: EditApprovalRequest): Promise<boolean> {
@@ -206,7 +265,7 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
   const registry = new ToolRegistry(
     argumentsValue.requireSourceEvidence
       ? sourceEvidenceTools
-      : argumentsValue.modelProvider === "deepseek"
+      : usesRemoteModel(argumentsValue)
         ? argumentsValue.agentMode === "edit"
           ? editTools
           : readOnlyTools
@@ -217,8 +276,8 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
     executionMode: argumentsValue.executionMode,
     requireSourceEvidence: argumentsValue.requireSourceEvidence,
     requirePlanApproval: argumentsValue.guided,
-    requireReadBeforeEdit: argumentsValue.modelProvider === "deepseek" && argumentsValue.agentMode === "edit",
-    ...(argumentsValue.modelProvider === "deepseek"
+    requireReadBeforeEdit: usesRemoteModel(argumentsValue) && argumentsValue.agentMode === "edit",
+    ...(usesRemoteModel(argumentsValue)
       ? {
           systemPrompt: [
             argumentsValue.requireSourceEvidence
@@ -244,9 +303,8 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
 }
 
 export function modelLabel(argumentsValue: CliArguments): string {
-  return argumentsValue.modelProvider === "deepseek"
-    ? `DeepSeek / ${argumentsValue.deepseekModel}`
-    : "FakeModel（离线）";
+  const profile = currentModelProfile(argumentsValue);
+  return profile.kind === "fake" ? profile.label : `${profile.label} / ${profile.model}`;
 }
 
 export function toolPermissionLabel(argumentsValue: CliArguments): string {
@@ -258,7 +316,7 @@ export function toolPermissionLabel(argumentsValue: CliArguments): string {
         : "引导式只读"
       : argumentsValue.agentMode === "edit"
       ? "受控编辑（逐次确认）"
-    : argumentsValue.modelProvider === "deepseek"
+    : usesRemoteModel(argumentsValue)
       ? "只读侦察"
       : "离线演示（不可自主改代码）";
 }

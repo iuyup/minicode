@@ -28,8 +28,11 @@ import type { ConversationMessage, EditApprovalRequest, PlanApprovalRequest } fr
 import type { AgentEvent } from "./agent/events.ts";
 import {
   createAgent,
+  listModelProfiles,
   modelLabel,
+  modelProfileReadiness,
   parseArguments,
+  selectModelProfile,
   toolPermissionLabel,
   type CliArguments,
 } from "./runtime.ts";
@@ -245,6 +248,7 @@ class Footer implements Component {
 export interface MiniTuiCallbacks {
   onExit?: () => void;
   readClipboard?: () => Promise<string>;
+  createAgent?: () => AgentLoop;
 }
 
 /**
@@ -253,9 +257,10 @@ export interface MiniTuiCallbacks {
 export class MiniTuiApp {
   readonly #options: CliArguments;
   readonly #terminal: Terminal;
-  readonly #agent: AgentLoop;
+  #agent: AgentLoop;
   readonly #onExit?: () => void;
   readonly #readClipboard: () => Promise<string>;
+  readonly #createAgent?: () => AgentLoop;
   readonly #tui: TUI;
   readonly #transcript = new Container();
   readonly #activity = new Container();
@@ -278,6 +283,7 @@ export class MiniTuiApp {
     this.#agent = agent;
     this.#onExit = callbacks.onExit;
     this.#readClipboard = callbacks.readClipboard ?? readWindowsClipboard;
+    this.#createAgent = callbacks.createAgent;
     this.#tui = new TUI(terminal, true);
     this.#loader = new Loader(this.#tui, accent, muted, "等待任务");
     this.#editor = new Editor(this.#tui, EDITOR_THEME, { paddingX: 1, autocompleteMaxVisible: 6 });
@@ -472,11 +478,11 @@ export class MiniTuiApp {
   private appendWelcome(): void {
     const mode = this.#options.guided
       ? "当前为引导式会话：先确认计划，再进入每个执行阶段。"
-      : this.#options.modelProvider === "fake"
-      ? "当前是离线演示；使用 --model deepseek 才会发起真实模型请求。"
+      : this.#options.modelProfile === "fake"
+      ? "当前是离线演示；输入 /model 查看并切换已配置的模型 Profile。"
       : this.#options.agentMode === "edit"
         ? "当前是受控编辑会话：补丁必须先读取目标文件，并逐次等待你的 APPLY 确认。"
-      : "当前会话会调用 DeepSeek，并仅开放已标明的工具权限。";
+      : `当前会话会调用 ${modelLabel(this.#options)}，并仅开放已标明的工具权限。`;
     this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))} ${muted(mode)}`, 1, 0));
     this.#transcript.addChild(new Text(muted("  支持 Ctrl+V 粘贴；工具细节默认折叠，审计仍写入 reports。"), 1, 1));
   }
@@ -537,9 +543,13 @@ export class MiniTuiApp {
   }
 
   private handleCommand(input: string): void {
+    if (input === "/model" || input.startsWith("/model ")) {
+      this.handleModelCommand(input);
+      return;
+    }
     switch (input) {
       case "/help":
-        this.appendNotice("Ctrl+V 粘贴文本；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；CANCEL 取消。", accent);
+        this.appendNotice("Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；CANCEL 取消。", accent);
         break;
       case "/status":
         this.appendNotice(
@@ -569,6 +579,47 @@ export class MiniTuiApp {
     }
   }
 
+  private handleModelCommand(input: string): void {
+    const requestedProfile = input.slice("/model".length).trim();
+    if (requestedProfile === "") {
+      const choices = listModelProfiles().map((profile) => {
+        const marker = profile.id === this.#options.modelProfile ? "当前" : "可选";
+        return `${marker} ${profile.id} · ${profile.label} · ${modelProfileReadiness(profile)}`;
+      });
+      this.appendNotice(
+        `模型 Profile：\n${choices.join("\n")}\nOpenAI-compatible 配置：MINICODE_OPENAI_BASE_URL、MINICODE_OPENAI_MODEL、MINICODE_OPENAI_API_KEY。\n输入 /model <profile> 切换；切换会清除后续发送给模型的会话上下文。`,
+        accent,
+      );
+      return;
+    }
+    if (!this.#createAgent) {
+      this.appendNotice("当前 TUI 实例未提供模型切换工厂，无法切换 Profile。", yellow);
+      return;
+    }
+
+    const previousOptions = { ...this.#options };
+    try {
+      const profile = selectModelProfile(this.#options, requestedProfile);
+      if (profile.id === previousOptions.modelProfile) {
+        this.appendNotice(`${modelLabel(this.#options)} 已是当前 Profile。`, muted);
+        return;
+      }
+      this.#agent = this.#createAgent();
+      this.#history.splice(0, this.#history.length);
+      this.#events.splice(0, this.#events.length);
+      this.#timeline.setEvents(this.#events);
+      this.appendNotice(
+        `已切换到 ${modelLabel(this.#options)}；为避免不同模型混用上下文，后续发送给模型的会话已清空。`,
+        green,
+      );
+      this.refreshActivity();
+    } catch (error) {
+      Object.assign(this.#options, previousOptions);
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendNotice(`模型切换失败：${message}`, yellow);
+    }
+  }
+
   private requestExit(): void {
     if (this.#pendingApproval) {
       this.resolvePendingApproval(false);
@@ -594,12 +645,13 @@ export function createMiniTui(
   }
 
   let app: MiniTuiApp | undefined;
-  const agent = createAgent(options, {
+  const createConfiguredAgent = (): AgentLoop => createAgent(options, {
     onEvent: (event) => app?.handleAgentEvent(event),
     requestEditApproval: (request) => app?.requestEditApproval(request) ?? Promise.resolve(false),
     requestPlanApproval: (request) => app?.requestPlanApproval(request) ?? Promise.resolve(false),
   });
-  app = new MiniTuiApp(options, terminal, agent, callbacks);
+  const agent = createConfiguredAgent();
+  app = new MiniTuiApp(options, terminal, agent, { ...callbacks, createAgent: createConfiguredAgent });
   return app;
 }
 

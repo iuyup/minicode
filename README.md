@@ -1,6 +1,6 @@
 # Mini Coding Agent
 
-一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码侦察、受控补丁、受限项目验证，以及 DeepSeek 模型适配；默认仍不联网，也不接受任意命令。
+一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码侦察、受控补丁、受限项目验证，以及 OpenAI-compatible 模型 Profile；默认仍不联网，也不接受任意命令。
 
 ## 已完成的闭环
 
@@ -21,7 +21,7 @@
 - `WorkingLedger`：只记录当前任务已验证的观察结果；
 - 生命周期事件：`tool_call`、`policy_decision`、`tool_execution_started`、`tool_finalized`、`final_answer_rejected`；
 - `FakeModel`：确定性模拟“先调用工具，再读取工具结果”的两轮模型行为；
-- `DeepSeekModel`：通过官方 OpenAI 兼容 Chat Completions 接口把模型回复转换为内部工具调用；
+- `OpenAiCompatibleModel`：通过 Chat Completions 兼容接口把模型回复转换为内部工具调用；`DeepSeekModel` 保留为带“关闭思考”参数的兼容预设；
 - 只读工具：`list_files`、`search_text`、`read_file`；
 - 受控写工具：`apply_patch`，仅允许唯一的精确文本替换；
 - 受限验证工具：`run_project_check`，只允许 `test` 和 `check` 两个固定动作；
@@ -54,9 +54,9 @@ cd C:\Users\CX10\Desktop\minicode
 cmd.exe /d /c npm run mini
 ```
 
-工具调用在主屏默认折叠为简短状态；按 `Ctrl+O` 或输入 `/details` 可展开最近的生命周期事件。`Ctrl+V` 会读取 Windows 系统剪贴板中的文本并插入输入框，输入内容不会写入审计；超过 32,000 字符时拒绝插入。可用命令：`/help`、`/status`、`/clear`、`/details`、`/exit`。`Ctrl+C` 在空闲时退出；执行中的任务不会被静默中断。
+工具调用在主屏默认折叠为简短状态；按 `Ctrl+O` 或输入 `/details` 可展开最近的生命周期事件。`Ctrl+V` 会读取 Windows 系统剪贴板中的文本并插入输入框，输入内容不会写入审计；超过 32,000 字符时拒绝插入。可用命令：`/help`、`/model [profile]`、`/status`、`/clear`、`/details`、`/exit`。`Ctrl+C` 在空闲时退出；执行中的任务不会被静默中断。
 
-默认启动的 `FakeModel` 只用于可重复的离线演示，不理解自由任务，也不会自主修改代码。要运行真实 Agent，须显式选择 DeepSeek。默认是只读模式：
+默认启动的 `FakeModel` 只用于可重复的离线演示，不理解自由任务，也不会自主修改代码。要运行真实 Agent，须显式选择一个已配置的网络 Profile。默认是只读模式：
 
 ```powershell
 cmd.exe /d /c npm run mini -- --model deepseek --deepseek-model deepseek-v4-flash --require-source-evidence
@@ -89,7 +89,22 @@ cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace playgroun
 
 若要在该机器上直接使用 `mini` 而非 `npm run mini`，可在确认本项目可信后执行一次 `cmd.exe /d /c npm link`；此操作会创建指向当前项目的本机全局命令。该仓库通过 `package.json` 的 `bin` 字段注册 `mini`，不会发布 npm 包。
 
-## DeepSeek 模型适配
+## 模型 Profile 与 DeepSeek 预设
+
+Profile 只保存显示名、`baseUrl`、`model` 和 API Key 的环境变量名；密钥不会写入 Profile、仓库、TUI 事件或 JSONL 审计。启动 `mini` 后输入 `/model` 查看可用项，输入 `/model <profile>` 切换。切换不会发送网络请求，但会清空后续发送给模型的会话上下文，避免不同模型混用上下文。
+
+- `fake`：离线演示；
+- `deepseek`：内置 DeepSeek 预设，使用 `DEEPSEEK_API_KEY`，可用 `DEEPSEEK_MODEL` 或旧参数 `--deepseek-model` 覆盖模型名；
+- `openai-compatible`：使用 `MINICODE_OPENAI_BASE_URL`、`MINICODE_OPENAI_MODEL` 和 `MINICODE_OPENAI_API_KEY`，可接入任意支持 Chat Completions 工具调用的兼容服务。
+
+```powershell
+$env:MINICODE_OPENAI_BASE_URL = "https://your-gateway.example/v1"
+$env:MINICODE_OPENAI_MODEL = "your-coding-model"
+$env:MINICODE_OPENAI_API_KEY = "在此设置你的密钥"
+cmd.exe /d /c npm run mini -- --profile openai-compatible --require-source-evidence
+```
+
+`--model fake|deepseek` 保留为 DeepSeek 迁移入口；通用入口是 `--profile fake|deepseek|openai-compatible`。
 
 默认模型是离线 `FakeModel`。只有显式传入 `--model deepseek` 且设置 `DEEPSEEK_API_KEY` 后，CLI 才会向 DeepSeek 发起网络请求。默认模型为 `deepseek-v4-flash`，可用 `--deepseek-model` 或 `DEEPSEEK_MODEL` 覆盖。
 
