@@ -1,4 +1,4 @@
-import { ToolExecutionError } from "./contracts.ts";
+import { ToolExecutionError, ToolPolicyError } from "./contracts.ts";
 import type {
   AgentMessage,
   ChatModel,
@@ -528,13 +528,23 @@ export class AgentLoop {
     if (tool.getCommandApprovalRequest) {
       let request: CommandApprovalRequest;
       try {
-        request = tool.getCommandApprovalRequest(validation.value, this.#workspaceRoot);
-      } catch {
+        request = await tool.getCommandApprovalRequest(validation.value, this.#workspaceRoot);
+      } catch (error) {
+        if (error instanceof ToolPolicyError) {
+          this.recordEvent(events, {
+            type: "policy_decision",
+            step,
+            toolCallId: toolCall.id,
+            toolName: toolCall.name,
+            ...error.decision,
+          });
+          return this.finalizeError(events, step, toolCall, error.message, error.metadata);
+        }
         return this.finalizeError(
           events,
           step,
           toolCall,
-          "无法生成本地命令确认，固定验证动作未执行。",
+          "无法生成本地命令确认，命令未执行。",
         );
       }
       const approvalAction = request.action;
@@ -544,17 +554,20 @@ export class AgentLoop {
         toolCallId: toolCall.id,
         toolName: toolCall.name,
         action: approvalAction,
+        commandKind: request.kind,
+        riskLevel: request.riskLevel,
       });
 
       let approved = false;
-      let rejectionReason = "用户已取消固定验证动作，未执行命令。";
+      const approvalTarget = request.kind === "verification" ? "固定验证动作" : "受控命令";
+      let rejectionReason = `用户已取消${approvalTarget}，未执行命令。`;
       if (!this.#requestCommandApproval) {
-        rejectionReason = "未配置本地命令确认，固定验证动作未执行。";
+        rejectionReason = `未配置本地命令确认，${approvalTarget}未执行。`;
       } else {
         try {
           approved = await this.#requestCommandApproval(request) === true;
         } catch {
-          rejectionReason = "本地命令确认不可用，固定验证动作未执行。";
+          rejectionReason = `本地命令确认不可用，${approvalTarget}未执行。`;
         }
       }
       this.recordEvent(events, {
@@ -563,10 +576,15 @@ export class AgentLoop {
         toolCallId: toolCall.id,
         toolName: toolCall.name,
         action: approvalAction,
+        commandKind: request.kind,
+        riskLevel: request.riskLevel,
         decision: approved ? "approved" : "rejected",
       });
       if (!approved) {
-        return this.finalizeError(events, step, toolCall, rejectionReason, { action: approvalAction });
+        return this.finalizeError(events, step, toolCall, rejectionReason, {
+          action: approvalAction,
+          riskLevel: request.riskLevel,
+        });
       }
     }
 
@@ -614,6 +632,15 @@ export class AgentLoop {
         ...(output.sourceEvidence ? { sourceEvidence: output.sourceEvidence } : {}),
       };
     } catch (error) {
+      if (error instanceof ToolPolicyError) {
+        this.recordEvent(events, {
+          type: "policy_decision",
+          step,
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          ...error.decision,
+        });
+      }
       const message = error instanceof Error ? error.message : String(error);
       const metadata = error instanceof ToolExecutionError ? error.metadata : undefined;
       return this.finalizeError(events, step, toolCall, `工具执行失败：${message}`, metadata);

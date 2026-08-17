@@ -1,7 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { ToolExecutionMetadata } from "./contracts.ts";
+import type {
+  CommandApprovalKind,
+  CommandRiskLevel,
+  ToolExecutionMetadata,
+} from "./contracts.ts";
 
 export type AgentEvent =
   | { type: "model_requested"; step: number; forcedToolName?: string }
@@ -14,6 +18,8 @@ export type AgentEvent =
       toolCallId: string;
       toolName: string;
       action: string;
+      commandKind: CommandApprovalKind;
+      riskLevel: CommandRiskLevel;
     }
   | {
       type: "command_approval_decision";
@@ -21,6 +27,8 @@ export type AgentEvent =
       toolCallId: string;
       toolName: string;
       action: string;
+      commandKind: CommandApprovalKind;
+      riskLevel: CommandRiskLevel;
       decision: "approved" | "rejected";
     }
   | {
@@ -73,6 +81,8 @@ interface SanitizedAuditEvent {
   decision?: "allowed" | "blocked";
   planDecision?: "approved" | "rejected";
   commandDecision?: "approved" | "rejected";
+  commandKind?: CommandApprovalKind;
+  riskLevel?: CommandRiskLevel;
   status?: "success" | "error";
   path?: string;
   reason?: string;
@@ -95,6 +105,7 @@ function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExec
 
   const sanitized: ToolExecutionMetadata = {};
   if (metadata.action !== undefined) sanitized.action = metadata.action;
+  if (metadata.riskLevel !== undefined) sanitized.riskLevel = metadata.riskLevel;
   if (metadata.exitCode !== undefined) sanitized.exitCode = metadata.exitCode;
   if (metadata.durationMs !== undefined) sanitized.durationMs = metadata.durationMs;
   if (metadata.outputLength !== undefined) sanitized.outputLength = metadata.outputLength;
@@ -115,6 +126,8 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
         toolCallId: event.toolCallId,
         toolName: event.toolName,
         action: event.action,
+        commandKind: event.commandKind,
+        riskLevel: event.riskLevel,
       };
     case "command_approval_decision":
       return {
@@ -122,6 +135,8 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
         toolCallId: event.toolCallId,
         toolName: event.toolName,
         action: event.action,
+        commandKind: event.commandKind,
+        riskLevel: event.riskLevel,
         commandDecision: event.decision,
       };
     case "policy_decision":

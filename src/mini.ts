@@ -41,6 +41,7 @@ import {
   toolPermissionLabel,
   type CliArguments,
 } from "./runtime.ts";
+import { escapeTerminalText } from "./terminal-safety.ts";
 
 const MAX_CONTEXT_TURNS = 6;
 const MAX_CLIPBOARD_CHARACTERS = 32_000;
@@ -59,7 +60,7 @@ const muted = color(90);
 const bold = (text: string): string => `\u001B[1m${text}${RESET}`;
 const underline = (text: string): string => `\u001B[4m${text}${RESET}`;
 
-type ApprovalKind = "plan" | "patch" | "command";
+type ApprovalKind = "plan" | "patch" | "verification" | "command";
 
 const APPROVAL_SPECS = {
   plan: {
@@ -76,12 +77,19 @@ const APPROVAL_SPECS = {
     approved: "已确认补丁，正在进行原子写入。",
     rejected: "已取消补丁，文件保持不变。",
   },
-  command: {
+  verification: {
     confirmWord: "RUN",
     prompt: "RUN / CANCEL",
     waiting: "验证仍在等待确认。精确输入 RUN 执行；输入 CANCEL 取消。",
     approved: "已确认验证，正在执行固定命令。",
     rejected: "已取消验证，固定命令未执行。",
+  },
+  command: {
+    confirmWord: "RUN",
+    prompt: "RUN / CANCEL",
+    waiting: "命令仍在等待确认。精确输入 RUN 执行；输入 CANCEL 取消。",
+    approved: "已确认命令，正在启动受控进程。",
+    rejected: "已取消命令，进程未启动。",
   },
 } as const satisfies Record<ApprovalKind, {
   confirmWord: string;
@@ -94,7 +102,7 @@ const APPROVAL_SPECS = {
 const CONTROL_WORD_NOTICES = {
   APPLY: "当前没有待确认补丁，APPLY 未发送给模型。只有出现黄色“待确认补丁”时，精确输入 APPLY 才会写入。",
   CONTINUE: "当前没有待确认计划，CONTINUE 未发送给模型。",
-  RUN: "当前没有待确认验证，RUN 未发送给模型。",
+  RUN: "当前没有待确认验证或命令，RUN 未发送给模型。",
   CANCEL: "当前没有待确认操作，CANCEL 未发送给模型。",
 } as const;
 
@@ -174,9 +182,14 @@ function eventLabel(event: AgentEvent): string {
     case "tool_call":
       return `准备调用 ${event.toolName}`;
     case "command_approval_requested":
-      return `等待确认固定验证：${event.action}`;
+      return event.commandKind === "verification"
+        ? `等待确认固定验证：${escapeTerminalText(event.action)}`
+        : `等待确认受控命令：${escapeTerminalText(event.action)}`;
     case "command_approval_decision":
-      return event.decision === "approved" ? "验证已确认，准备执行" : "验证已取消";
+      if (event.commandKind === "verification") {
+        return event.decision === "approved" ? "验证已确认，准备执行" : "验证已取消";
+      }
+      return event.decision === "approved" ? "命令已确认，准备执行" : "命令已取消";
     case "tool_execution_started":
       return `正在执行 ${event.toolName}`;
     case "tool_finalized":
@@ -374,7 +387,7 @@ export class MiniTuiApp {
   }
 
   get awaitingCommandApproval(): boolean {
-    return this.#pendingApproval?.kind === "command";
+    return this.#pendingApproval?.kind === "verification" || this.#pendingApproval?.kind === "command";
   }
 
   get approvalPrompt(): string | undefined {
@@ -515,24 +528,34 @@ export class MiniTuiApp {
   requestCommandApproval(request: CommandApprovalRequest): Promise<boolean> {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
 
-    this.#transcript.addChild(new Text(`${bold(yellow("待确认验证"))} ${request.action}`, 1, 0));
+    const isVerification = request.kind === "verification";
+    const title = isVerification ? "待确认验证" : "待确认命令";
+    const commandLabel = isVerification ? "固定命令" : "命令";
+    const riskLabel = { low: "低", medium: "中", high: "高" }[request.riskLevel];
+    this.#transcript.addChild(new Text(`${bold(yellow(title))} ${escapeTerminalText(request.action)}`, 1, 0));
     this.#transcript.addChild(new Text(
       [
-        `固定命令：${request.command}`,
-        `工作区：${request.workspaceRoot}`,
-        `风险：${request.risk}`,
+        `${commandLabel}：${escapeTerminalText(request.command)}`,
+        `工作目录：${escapeTerminalText(request.workingDirectory)}`,
+        `风险等级：${riskLabel}（${request.riskLevel}）`,
+        `风险：${escapeTerminalText(request.risk)}`,
       ].join("\n"),
       2,
       1,
     ));
-    this.appendNotice("命令尚未执行。请准确输入 RUN 并按 Enter 执行；输入 CANCEL 取消；其他输入会保留当前待确认验证。", yellow);
+    this.appendNotice(
+      isVerification
+        ? "命令尚未执行。请准确输入 RUN 并按 Enter 执行；输入 CANCEL 取消；其他输入会保留当前待确认验证。"
+        : "进程尚未启动。请准确输入 RUN 并按 Enter 执行；输入 CANCEL 取消；其他输入会保留当前待确认命令。",
+      yellow,
+    );
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
     this.#tui.setFocus(this.#editor);
     this.#tui.requestRender();
 
     return new Promise((resolve) => {
-      this.#pendingApproval = { kind: "command", resolve };
+      this.#pendingApproval = { kind: request.kind, resolve };
     });
   }
 
@@ -542,7 +565,7 @@ export class MiniTuiApp {
       : this.#options.modelProfile === "fake"
       ? "当前是离线演示；输入 /model 查看并切换已配置的模型 Profile。"
       : this.#options.agentMode === "edit"
-        ? "当前是受控编辑会话：补丁必须先读取目标文件，并逐次等待你的 APPLY 确认。"
+        ? "当前是受控编辑会话：补丁逐次等待 APPLY，验证与 Node/npm 命令逐次等待 RUN。"
       : `当前会话会调用 ${modelLabel(this.#options)}，并仅开放已标明的工具权限。`;
     this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))} ${muted(mode)}`, 1, 0));
     this.#transcript.addChild(new Text(muted("  支持 Ctrl+V 粘贴；工具细节默认折叠，审计仍写入 reports。"), 1, 1));
@@ -605,7 +628,7 @@ export class MiniTuiApp {
     }
     switch (input) {
       case "/help":
-        this.appendNotice("Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；验证确认输入 RUN；CANCEL 取消。", accent);
+        this.appendNotice("Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；验证或命令确认输入 RUN；CANCEL 取消。", accent);
         break;
       case "/status":
         this.appendNotice(

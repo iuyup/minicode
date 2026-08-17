@@ -80,10 +80,15 @@ export interface PlanApprovalRequest {
   plan: string;
 }
 
+export type CommandApprovalKind = "verification" | "command";
+export type CommandRiskLevel = "low" | "medium" | "high";
+
 export interface CommandApprovalRequest {
+  kind: CommandApprovalKind;
   action: string;
   command: string;
-  workspaceRoot: string;
+  workingDirectory: string;
+  riskLevel: CommandRiskLevel;
   risk: string;
 }
 
@@ -95,6 +100,7 @@ export interface ToolPolicyDecision {
 
 export interface ToolExecutionMetadata {
   action?: string;
+  riskLevel?: CommandRiskLevel;
   exitCode?: number | null;
   durationMs?: number;
   outputLength?: number;
@@ -126,12 +132,29 @@ export class ToolExecutionError extends Error {
   }
 }
 
+export class ToolPolicyError extends ToolExecutionError {
+  readonly decision: ToolPolicyDecision;
+
+  constructor(
+    message: string,
+    decision: ToolPolicyDecision,
+    metadata?: ToolExecutionMetadata,
+  ) {
+    super(message, metadata);
+    this.name = "ToolPolicyError";
+    this.decision = decision;
+  }
+}
+
 export interface AgentTool<TInput = JsonValue, TOutput extends ToolExecutionResult = string> {
   name: string;
   description: string;
   parameters: JsonObject;
   validate(input: JsonValue): ValidationResult<TInput>;
-  getCommandApprovalRequest?(input: TInput, workspaceRoot: string): CommandApprovalRequest;
+  getCommandApprovalRequest?(
+    input: TInput,
+    workspaceRoot: string,
+  ): CommandApprovalRequest | Promise<CommandApprovalRequest>;
   execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
 }
 

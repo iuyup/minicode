@@ -1,6 +1,3 @@
-import { spawn } from "node:child_process";
-import fs from "node:fs/promises";
-import path from "node:path";
 import process from "node:process";
 
 import type {
@@ -11,6 +8,12 @@ import type {
   ValidationResult,
 } from "../agent/contracts.ts";
 import { ToolExecutionError } from "../agent/contracts.ts";
+import {
+  createSanitizedChildEnvironment,
+  runBoundedProcess,
+  resolveNpmCli,
+  type BoundedProcessResult,
+} from "./child-process-safety.ts";
 import { validateObjectWithKeys } from "./input-validation.ts";
 
 export type ProjectCheckAction = "test" | "check";
@@ -19,14 +22,7 @@ interface RunProjectCheckInput {
   action: ProjectCheckAction;
 }
 
-export interface ProjectCheckRunResult {
-  exitCode: number | null;
-  durationMs: number;
-  output: string;
-  outputLength: number;
-  outputTruncated: boolean;
-  timedOut: boolean;
-}
+export interface ProjectCheckRunResult extends BoundedProcessResult {}
 
 export interface ProjectCheckRunner {
   run(action: ProjectCheckAction, workspaceRoot: string): Promise<ProjectCheckRunResult>;
@@ -40,7 +36,7 @@ const ACTION_LABELS: Record<ProjectCheckAction, string> = {
   test: "npm test",
   check: "npm run check",
 };
-const COMMAND_RISK = "npm scripts 会执行工作区 package.json 中定义的项目代码，也可能修改文件或访问网络；只在信任该工作区时确认。";
+const COMMAND_RISK = "npm scripts 会执行工作区 package.json 中定义的项目代码，也可能修改文件、访问网络或启动子进程；只在信任该工作区时确认。这不是操作系统沙箱。";
 const MAX_OUTPUT_CHARS = 12_000;
 const TIMEOUT_MS = 60_000;
 
@@ -55,80 +51,18 @@ function validate(input: JsonValue): ValidationResult<RunProjectCheckInput> {
   return { ok: true, value: { action: object.value.action } };
 }
 
-async function resolveNpmCli(): Promise<string> {
-  const candidates = [
-    process.env.npm_execpath,
-    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
-    path.resolve(path.dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
-  ].filter((candidate): candidate is string => Boolean(candidate));
-
-  for (const candidate of candidates) {
-    try {
-      await fs.access(candidate);
-      return candidate;
-    } catch {
-      // 尝试下一个受进程环境控制的 npm CLI 位置。
-    }
-  }
-  throw new ToolExecutionError("未找到 npm CLI，无法执行固定项目验证动作。");
-}
-
 class NpmProjectCheckRunner implements ProjectCheckRunner {
   async run(action: ProjectCheckAction, workspaceRoot: string): Promise<ProjectCheckRunResult> {
     const npmCli = await resolveNpmCli();
-    const startedAt = Date.now();
-    const child = spawn(process.execPath, [npmCli, ...ACTION_ARGUMENTS[action]], {
+    return runBoundedProcess({
+      executable: process.execPath,
+      args: [npmCli, ...ACTION_ARGUMENTS[action]],
       cwd: workspaceRoot,
-      shell: false,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let output = "";
-    let outputLength = 0;
-    let outputTruncated = false;
-    let timedOut = false;
-    const appendOutput = (chunk: Buffer): void => {
-      const text = chunk.toString("utf8");
-      outputLength += text.length;
-      const remaining = MAX_OUTPUT_CHARS - output.length;
-      if (remaining > 0) {
-        output += text.slice(0, remaining);
-      }
-      if (text.length > remaining) {
-        outputTruncated = true;
-      }
-    };
-
-    child.stdout.on("data", appendOutput);
-    child.stderr.on("data", appendOutput);
-
-    return new Promise<ProjectCheckRunResult>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        child.kill();
-      }, TIMEOUT_MS);
-
-      child.once("error", (error) => {
-        clearTimeout(timeout);
-        reject(
-          new ToolExecutionError(`无法启动 ${ACTION_LABELS[action]}：${error.message}`, {
-            action,
-            durationMs: Date.now() - startedAt,
-          }),
-        );
-      });
-      child.once("close", (exitCode) => {
-        clearTimeout(timeout);
-        resolve({
-          exitCode,
-          durationMs: Date.now() - startedAt,
-          output,
-          outputLength,
-          outputTruncated,
-          timedOut,
-        });
-      });
+      env: createSanitizedChildEnvironment(),
+      action,
+      startFailureLabel: ` ${ACTION_LABELS[action]}`,
+      timeoutMs: TIMEOUT_MS,
+      maxOutputChars: MAX_OUTPUT_CHARS,
     });
   }
 }
@@ -136,6 +70,7 @@ class NpmProjectCheckRunner implements ProjectCheckRunner {
 function metadata(action: ProjectCheckAction, result: ProjectCheckRunResult): ToolExecutionMetadata {
   return {
     action,
+    riskLevel: "medium",
     exitCode: result.exitCode,
     durationMs: result.durationMs,
     outputLength: result.outputLength,
@@ -174,9 +109,11 @@ export function createRunProjectCheckTool(
     validate,
     getCommandApprovalRequest(input, workspaceRoot) {
       return {
+        kind: "verification",
         action: input.action,
         command: ACTION_LABELS[input.action],
-        workspaceRoot,
+        workingDirectory: workspaceRoot,
+        riskLevel: "medium",
         risk: COMMAND_RISK,
       };
     },
@@ -191,10 +128,17 @@ export function createRunProjectCheckTool(
         result = await runner.run(input.action, context.workspaceRoot);
       } catch (error) {
         if (error instanceof ToolExecutionError) {
-          throw new ToolExecutionError(error.message, { ...error.metadata, action: input.action });
+          throw new ToolExecutionError(error.message, {
+            ...error.metadata,
+            action: input.action,
+            riskLevel: "medium",
+          });
         }
         const message = error instanceof Error ? error.message : String(error);
-        throw new ToolExecutionError(`固定验证动作无法启动：${message}`, { action: input.action });
+        throw new ToolExecutionError(`固定验证动作无法启动：${message}`, {
+          action: input.action,
+          riskLevel: "medium",
+        });
       }
       const resultMetadata = metadata(input.action, result);
       const content = renderOutput(input.action, result);

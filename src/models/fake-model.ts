@@ -25,12 +25,44 @@ export class FakeModel implements ChatModel {
           "## 执行计划",
           "1. 先搜索并读取与任务相关的真实代码。",
           "2. 基于读取结果给出最小修改或验证结论。",
-          "3. 若任务要求验证，调用已注册的受控验证工具。",
+          "3. 若任务要求验证，调用已注册的受控验证或命令工具。",
         ].join("\n"),
       };
     }
 
     const task = request.messages.findLast((message) => message.role === "user")?.content ?? "";
+    const requestedNpmVersion = /(?:查看|运行|执行).*(?:npm\s*(?:--version|-v)|npm\s*版本)|npm\s*(?:--version|-v)/i.test(task);
+    const commandResult = request.messages.find(
+      (message): message is ToolResultMessage => message.role === "tool" && message.name === "run_command",
+    );
+    if (requestedNpmVersion && request.tools.some((tool) => tool.name === "run_command")) {
+      if (!commandResult) {
+        return {
+          kind: "tool_calls",
+          content: "任务要求查看 npm 版本，我会调用结构化受控命令工具。",
+          toolCalls: [{
+            id: "call-run-command-1",
+            name: "run_command",
+            input: { program: "npm", args: ["--version"], cwd: "." },
+          }],
+        };
+      }
+      return {
+        kind: "final",
+        content: [
+          "受控命令闭环已完成。",
+          `工具终态：${commandResult.status}`,
+          `工具证据：${commandResult.content.split("\n").filter(Boolean).slice(0, 7).join(" | ")}`,
+          "程序、参数与工作目录由工具分离处理，并经过本地 RUN 确认。",
+        ].join("\n"),
+      };
+    }
+    if (requestedNpmVersion) {
+      return {
+        kind: "final",
+        content: "当前工具集未开放 run_command；请使用 --mode edit 启动离线命令面板演示。",
+      };
+    }
     const requestedCheck = /(?:运行|执行).*(?:测试|test)|npm\s+test/i.test(task)
       ? "test"
       : /(?:运行|执行).*(?:类型检查|检查|check)|npm\s+run\s+check/i.test(task)

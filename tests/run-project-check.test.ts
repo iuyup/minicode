@@ -120,6 +120,11 @@ test("固定 test 动作在工作区根目录运行，并把成功证据回填�
       attempt.audit.find((event) => event.type === "command_approval_decision")?.commandDecision,
       "approved",
     );
+    assert.equal(
+      attempt.audit.find((event) => event.type === "command_approval_decision")?.commandKind,
+      "verification",
+    );
+    assert.equal(finalizedAudit(attempt)?.riskLevel, "medium");
     assert.doesNotMatch(attempt.rawAudit, /npm test|package\.json/);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
@@ -184,12 +189,12 @@ test("用户取消固定验证时不启动 runner，并保留脱敏确认终态"
       createRunProjectCheckTool(runner),
       { action: "test" },
       async (request) => {
-        assert.deepEqual(request, {
-          action: "test",
-          command: "npm test",
-          workspaceRoot: path.resolve(workspace),
-          risk: "npm scripts 会执行工作区 package.json 中定义的项目代码，也可能修改文件或访问网络；只在信任该工作区时确认。",
-        });
+        assert.equal(request.kind, "verification");
+        assert.equal(request.action, "test");
+        assert.equal(request.command, "npm test");
+        assert.equal(request.workingDirectory, path.resolve(workspace));
+        assert.equal(request.riskLevel, "medium");
+        assert.match(request.risk, /不是操作系统沙箱/);
         return false;
       },
     );

@@ -125,7 +125,7 @@ test("OpenAiCompatibleModel 使用 Profile 提供的地址与模型，不附加 
   assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer test-key");
 });
 
-test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", async () => {
+test("DeepSeek 编辑模式向模型提供受控补丁、固定验证和结构化命令工具", async () => {
   const auditDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-deepseek-edit-"));
   const auditPath = path.join(auditDirectory, "audit.jsonl");
   const originalFetch = globalThis.fetch;
@@ -154,10 +154,11 @@ test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", as
     assert.equal(options.executionMode, "apply");
     assert.deepEqual(
       body.tools.map((tool) => tool.function.name),
-      ["get_project_overview", "list_files", "search_text", "read_file", "apply_patch", "run_project_check"],
+      ["get_project_overview", "list_files", "search_text", "read_file", "apply_patch", "run_project_check", "run_command"],
     );
     assert.match(body.messages[0]?.content ?? "", /必须直接调用 apply_patch/);
     assert.match(body.messages[0]?.content ?? "", /精确输入 RUN/);
+    assert.match(body.messages[0]?.content ?? "", /不接受直接 Shell、管道、重定向、Git/);
     assert.match(
       body.tools.find((tool) => tool.function.name === "apply_patch")?.function.description ?? "",
       /不要在普通回答中请求 APPLY/,
@@ -165,6 +166,10 @@ test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", as
     assert.match(
       body.tools.find((tool) => tool.function.name === "run_project_check")?.function.description ?? "",
       /本地 RUN 确认/,
+    );
+    assert.match(
+      body.tools.find((tool) => tool.function.name === "run_command")?.function.description ?? "",
+      /不用 Shell 拼接模型参数/,
     );
   } finally {
     globalThis.fetch = originalFetch;

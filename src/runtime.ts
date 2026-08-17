@@ -11,6 +11,7 @@ import type {
   ToolExecutionMode,
 } from "./agent/contracts.ts";
 import { JsonlAuditLog, type AgentEvent } from "./agent/events.ts";
+import { escapeTerminalText } from "./terminal-safety.ts";
 import { ToolRegistry } from "./agent/tool-registry.ts";
 import { FakeModel } from "./models/fake-model.ts";
 import {
@@ -27,6 +28,7 @@ import { applyPatch } from "./tools/apply-patch.ts";
 import { getProjectOverview } from "./tools/get-project-overview.ts";
 import { listFiles } from "./tools/list-files.ts";
 import { readFile } from "./tools/read-file.ts";
+import { runCommand } from "./tools/run-command.ts";
 import { runProjectCheck } from "./tools/run-project-check.ts";
 import { searchText } from "./tools/search-text.ts";
 
@@ -51,7 +53,7 @@ export interface CreateAgentOptions {
 
 const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
 const sourceEvidenceTools = [searchText, readFile] as const;
-const editTools = [...readOnlyTools, applyPatch, runProjectCheck] as const;
+const editTools = [...readOnlyTools, applyPatch, runProjectCheck, runCommand] as const;
 
 const DEEPSEEK_SYSTEM_PROMPT = [
   "你是一个受限的只读 Coding Agent，只能使用已提供的只读工具进行代码侦察。",
@@ -62,10 +64,12 @@ const DEEPSEEK_SYSTEM_PROMPT = [
 ].join(" ");
 
 const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
-  "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁和固定验证工具完成小范围代码任务。",
+  "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁、固定验证和结构化 Node/npm 工具完成小范围代码任务。",
   "先定位并用 read_file 成功读取目标文件，再提出最小的 apply_patch；运行时会拒绝未读取目标的补丁。",
   "补丁会在终端界面展示给用户；只有用户输入精确的 APPLY 才会写入。用户拒绝后，不得重复尝试同一补丁，应说明原因并给出后续建议。",
-  "补丁成功后，只在能验证本次修改时调用 run_project_check 的 test 或 check 动作；终端会展示固定命令和工作区，只有用户精确输入 RUN 才会执行。不得请求任意命令、Git 操作或未注册工具。",
+  "补丁成功后，只在能验证本次修改时运行命令；优先调用更窄的 run_project_check test/check，固定验证无法覆盖时才调用 run_command。",
+  "run_command 必须把程序、参数数组和工作区相对目录分开提供；第一版只支持 node/npm，不接受直接 Shell、管道、重定向、Git、提权、后台任务或环境变量注入。npm/工作区脚本自身仍可能启动 Shell 或子进程。",
+  "终端会完整展示命令、工作目录和风险等级；只有用户精确输入 RUN 才会执行。RUN 是本地确认词，不能作为用户消息处理或要求模型等待。",
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
 
@@ -270,13 +274,15 @@ async function requestTerminalPlanApproval(request: PlanApprovalRequest): Promis
 
 async function requestTerminalCommandApproval(request: CommandApprovalRequest): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error("固定验证动作只能在交互式终端中使用，以便人工确认命令。");
+    throw new Error("本地命令只能在交互式终端中使用，以便人工确认。");
   }
 
   const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
+    const title = request.kind === "verification" ? "待确认验证" : "待确认命令";
+    const commandLabel = request.kind === "verification" ? "固定命令" : "命令";
     process.stdout.write(
-      `\n待确认验证：${request.action}\n固定命令：${request.command}\n工作区：${request.workspaceRoot}\n风险：${request.risk}\n`,
+      `\n${title}：${escapeTerminalText(request.action)}\n${commandLabel}：${escapeTerminalText(request.command)}\n工作目录：${escapeTerminalText(request.workingDirectory)}\n风险等级：${request.riskLevel}\n风险：${escapeTerminalText(request.risk)}\n`,
     );
     const answer = await terminal.question("输入 RUN 确认执行，输入 CANCEL 取消：");
     return answer.trim() === "RUN";
@@ -293,7 +299,9 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
         ? argumentsValue.agentMode === "edit"
           ? editTools
           : readOnlyTools
-        : [...readOnlyTools, applyPatch, runProjectCheck],
+        : argumentsValue.agentMode === "edit"
+          ? editTools
+          : [...readOnlyTools, applyPatch, runProjectCheck],
   );
   return new AgentLoop(createModel(argumentsValue), registry, {
     workspaceRoot: argumentsValue.workspaceRoot,

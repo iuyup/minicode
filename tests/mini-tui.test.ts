@@ -17,6 +17,11 @@ import {
   type ProjectCheckRunResult,
   type ProjectCheckRunner,
 } from "../src/tools/run-project-check.ts";
+import {
+  createRunCommandTool,
+  type CommandRunResult,
+  type CommandRunner,
+} from "../src/tools/run-command.ts";
 
 class FakeTerminal implements Terminal {
   #onInput?: (data: string) => void;
@@ -230,7 +235,7 @@ test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", asyn
     assert.equal(runnerCalls, 0);
     assert.match(pendingOutput, /待确认验证.*test/);
     assert.match(pendingOutput, /固定命令：npm test/);
-    assert.match(pendingOutput, /工作区：/);
+    assert.match(pendingOutput, /工作目录：/);
     assert.match(pendingOutput, /package\.json/);
     assert.match(pendingOutput, /访问网络/);
     assert.match(pendingOutput, /等待确认：RUN \/ CANCEL/);
@@ -303,6 +308,101 @@ test("TUI 中取消验证不会启动 runner，也不会把 CANCEL 写入模型�
     await waitFor(() => stripAnsi(terminal.output).includes("验证已由用户取消"));
     assert.match(stripAnsi(terminal.output), /已取消验证，固定命令未执行/);
     assert.match(stripAnsi(terminal.output), /验证已由用户取消/);
+  } finally {
+    app?.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-run-command-"));
+  const terminal = new FakeTerminal();
+  let runnerCalls = 0;
+  let modelCalls = 0;
+  const runner: CommandRunner = {
+    async run(request): Promise<CommandRunResult> {
+      runnerCalls += 1;
+      assert.equal(request.program, "npm");
+      assert.deepEqual(request.args, ["run", "check", "--", "--pretty=false"]);
+      assert.equal(request.cwd, path.resolve(workspace));
+      return {
+        exitCode: 0,
+        durationMs: 4,
+        output: "COMMAND_OK",
+        outputLength: 10,
+        outputTruncated: false,
+        timedOut: false,
+      };
+    },
+  };
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        return {
+          kind: "tool_calls",
+          content: "请求运行受控项目命令。",
+          toolCalls: [{
+            id: "command-1",
+            name: "run_command",
+            input: {
+              program: "npm",
+              args: ["run", "check", "--", "--pretty=false"],
+              cwd: ".",
+            },
+          }],
+        };
+      }
+
+      const lastMessage = request.messages.at(-1);
+      assert.equal(lastMessage?.role, "tool");
+      if (lastMessage?.role !== "tool") throw new Error("缺少受控命令工具结果。");
+      assert.equal(lastMessage.status, "success");
+      assert.equal(
+        request.messages.some(
+          (message) => message.role === "user" && (message.content === "RUN" || message.content === "run"),
+        ),
+        false,
+      );
+      return { kind: "final", content: "受控命令已确认并完成。" };
+    },
+  };
+
+  const options = parseArguments(["--workspace", workspace, "--audit", path.join(workspace, "audit.jsonl")]);
+  let app: MiniTuiApp | undefined;
+  const agent = new AgentLoop(model, new ToolRegistry([createRunCommandTool(runner)]), {
+    workspaceRoot: workspace,
+    requestCommandApproval: (request) => app?.requestCommandApproval(request) ?? Promise.resolve(false),
+  });
+  app = new MiniTuiApp(options, terminal, agent);
+
+  try {
+    app.start();
+    const task = app.submit("运行项目 check 命令并汇报结果");
+    await waitFor(() => app?.awaitingCommandApproval === true);
+    await waitFor(() => stripAnsi(terminal.output).includes("待确认命令"));
+
+    const pendingOutput = stripAnsi(terminal.output);
+    assert.equal(runnerCalls, 0);
+    assert.match(pendingOutput, /待确认命令.*run_command/);
+    assert.match(pendingOutput, /命令：npm "run" "check" "--" "--pretty=false"/);
+    assert.ok(pendingOutput.includes(`工作目录：${path.resolve(workspace)}`));
+    assert.match(pendingOutput, /风险等级：中（medium）/);
+    assert.match(pendingOutput, /不是操作系统沙箱/);
+    assert.match(pendingOutput, /等待确认：RUN \/ CANCEL/);
+
+    await app.submit("run");
+    assert.equal(app.awaitingCommandApproval, true);
+    assert.equal(runnerCalls, 0);
+    await waitFor(() => stripAnsi(terminal.output).includes("命令仍在等待确认"));
+
+    await app.submit("RUN");
+    await task;
+    assert.equal(runnerCalls, 1);
+    assert.equal(modelCalls, 2);
+    assert.equal(app.contextTurns, 1);
+    await waitFor(() => stripAnsi(terminal.output).includes("受控命令已确认并完成"));
+    assert.match(stripAnsi(terminal.output), /受控命令已确认并完成/);
   } finally {
     app?.stop();
     await fs.rm(workspace, { recursive: true, force: true });
