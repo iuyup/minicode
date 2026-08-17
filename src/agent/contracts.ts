@@ -80,6 +80,13 @@ export interface PlanApprovalRequest {
   plan: string;
 }
 
+export interface CommandApprovalRequest {
+  action: string;
+  command: string;
+  workspaceRoot: string;
+  risk: string;
+}
+
 export interface ToolPolicyDecision {
   decision: "allowed" | "blocked";
   path: string;
@@ -124,6 +131,7 @@ export interface AgentTool<TInput = JsonValue, TOutput extends ToolExecutionResu
   description: string;
   parameters: JsonObject;
   validate(input: JsonValue): ValidationResult<TInput>;
+  getCommandApprovalRequest?(input: TInput, workspaceRoot: string): CommandApprovalRequest;
   execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
 }
 

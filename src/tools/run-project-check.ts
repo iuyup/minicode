@@ -40,6 +40,7 @@ const ACTION_LABELS: Record<ProjectCheckAction, string> = {
   test: "npm test",
   check: "npm run check",
 };
+const COMMAND_RISK = "npm scripts 会执行工作区 package.json 中定义的项目代码，也可能修改文件或访问网络；只在信任该工作区时确认。";
 const MAX_OUTPUT_CHARS = 12_000;
 const TIMEOUT_MS = 60_000;
 
@@ -161,7 +162,7 @@ export function createRunProjectCheckTool(
 ): AgentTool<RunProjectCheckInput, ToolExecutionOutput> {
   return {
     name: "run_project_check",
-    description: "在工作区根目录运行固定验证动作；只允许 test（npm test）或 check（npm run check）。",
+    description: "在工作区根目录运行固定验证动作；只允许 test（npm test）或 check（npm run check），并在执行前等待本地 RUN 确认。",
     parameters: {
       type: "object",
       properties: {
@@ -171,6 +172,14 @@ export function createRunProjectCheckTool(
       additionalProperties: false,
     },
     validate,
+    getCommandApprovalRequest(input, workspaceRoot) {
+      return {
+        action: input.action,
+        command: ACTION_LABELS[input.action],
+        workspaceRoot,
+        risk: COMMAND_RISK,
+      };
+    },
     async execute(input, context): Promise<ToolExecutionOutput> {
       context.recordPolicyDecision?.({
         decision: "allowed",

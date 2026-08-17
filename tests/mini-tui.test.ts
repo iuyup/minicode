@@ -12,6 +12,11 @@ import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { createMiniTui, MiniTuiApp } from "../src/mini.ts";
 import { parseArguments } from "../src/runtime.ts";
 import { applyPatch } from "../src/tools/apply-patch.ts";
+import {
+  createRunProjectCheckTool,
+  type ProjectCheckRunResult,
+  type ProjectCheckRunner,
+} from "../src/tools/run-project-check.ts";
 
 class FakeTerminal implements Terminal {
   #onInput?: (data: string) => void;
@@ -145,7 +150,7 @@ test("mini TUI lists configured Profiles and switches model without sending a re
   }
 });
 
-test("mini TUI never sends APPLY to the model when no patch is awaiting confirmation", async () => {
+test("mini TUI never sends reserved approval words to the model without a pending confirmation", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-apply-guard-"));
   const terminal = new FakeTerminal();
   let app: MiniTuiApp | undefined;
@@ -156,14 +161,151 @@ test("mini TUI never sends APPLY to the model when no patch is awaiting confirma
     );
     app.start();
 
-    await app.submit("APPLY");
+    for (const input of ["APPLY", "apply", "CONTINUE", "continue", "RUN", "run", "CANCEL", "cancel"]) {
+      await app.submit(input);
+    }
 
     assert.equal(app.contextTurns, 0);
     await waitFor(() => stripAnsi(terminal.output).includes("当前没有待确认补丁"));
     assert.match(stripAnsi(terminal.output), /当前没有待确认补丁/);
+    assert.match(stripAnsi(terminal.output), /当前没有待确认验证/);
+    assert.match(stripAnsi(terminal.output), /当前没有待确认操作/);
   } finally {
     app?.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-command-run-"));
+  const terminal = new FakeTerminal();
+  let runnerCalls = 0;
+  let modelCalls = 0;
+  const runner: ProjectCheckRunner = {
+    async run(): Promise<ProjectCheckRunResult> {
+      runnerCalls += 1;
+      return {
+        exitCode: 0,
+        durationMs: 3,
+        output: "CHECK_OK",
+        outputLength: 8,
+        outputTruncated: false,
+        timedOut: false,
+      };
+    },
+  };
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        return {
+          kind: "tool_calls",
+          content: "请求固定验证。",
+          toolCalls: [{ id: "check-1", name: "run_project_check", input: { action: "test" } }],
+        };
+      }
+      const lastMessage = request.messages.at(-1);
+      assert.equal(lastMessage?.role, "tool");
+      if (lastMessage?.role !== "tool") throw new Error("缺少验证工具结果。");
+      assert.equal(lastMessage.status, "success");
+      assert.equal(request.messages.some((message) => message.role === "user" && message.content === "RUN"), false);
+      return { kind: "final", content: "验证已确认并完成。" };
+    },
+  };
+
+  const options = parseArguments(["--workspace", workspace, "--audit", path.join(workspace, "audit.jsonl")]);
+  let app: MiniTuiApp | undefined;
+  const agent = new AgentLoop(model, new ToolRegistry([createRunProjectCheckTool(runner)]), {
+    workspaceRoot: workspace,
+    requestCommandApproval: (request) => app?.requestCommandApproval(request) ?? Promise.resolve(false),
+  });
+  app = new MiniTuiApp(options, terminal, agent);
+
+  try {
+    app.start();
+    const task = app.submit("运行测试验证修改");
+    await waitFor(() => app?.awaitingCommandApproval === true);
+
+    const pendingOutput = stripAnsi(terminal.output);
+    assert.equal(runnerCalls, 0);
+    assert.match(pendingOutput, /待确认验证.*test/);
+    assert.match(pendingOutput, /固定命令：npm test/);
+    assert.match(pendingOutput, /工作区：/);
+    assert.match(pendingOutput, /package\.json/);
+    assert.match(pendingOutput, /访问网络/);
+    assert.match(pendingOutput, /等待确认：RUN \/ CANCEL/);
+
+    await app.submit("run");
+    assert.equal(app.awaitingCommandApproval, true);
+    assert.equal(runnerCalls, 0);
+    await waitFor(() => stripAnsi(terminal.output).includes("验证仍在等待确认"));
+
+    await app.submit("RUN");
+    await task;
+    assert.equal(runnerCalls, 1);
+    assert.equal(modelCalls, 2);
+    assert.equal(app.contextTurns, 1);
+    await waitFor(() => stripAnsi(terminal.output).includes("验证已确认并完成"));
+    assert.match(stripAnsi(terminal.output), /验证已确认并完成/);
+  } finally {
+    app?.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("TUI 中取消验证不会启动 runner，也不会把 CANCEL 写入模型上下文", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-command-cancel-"));
+  const terminal = new FakeTerminal();
+  let runnerCalls = 0;
+  let modelCalls = 0;
+  const runner: ProjectCheckRunner = {
+    async run(): Promise<ProjectCheckRunResult> {
+      runnerCalls += 1;
+      throw new Error("runner must stay closed");
+    },
+  };
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        return {
+          kind: "tool_calls",
+          content: "请求固定验证。",
+          toolCalls: [{ id: "check-1", name: "run_project_check", input: { action: "check" } }],
+        };
+      }
+      const lastMessage = request.messages.at(-1);
+      assert.equal(lastMessage?.role, "tool");
+      assert.equal(lastMessage?.status, "error");
+      assert.equal(request.messages.some((message) => message.role === "user" && message.content === "CANCEL"), false);
+      return { kind: "final", content: "验证已由用户取消。" };
+    },
+  };
+
+  const options = parseArguments(["--workspace", workspace, "--audit", path.join(workspace, "audit.jsonl")]);
+  let app: MiniTuiApp | undefined;
+  const agent = new AgentLoop(model, new ToolRegistry([createRunProjectCheckTool(runner)]), {
+    workspaceRoot: workspace,
+    requestCommandApproval: (request) => app?.requestCommandApproval(request) ?? Promise.resolve(false),
+  });
+  app = new MiniTuiApp(options, terminal, agent);
+
+  try {
+    app.start();
+    const task = app.submit("运行类型检查");
+    await waitFor(() => app?.awaitingCommandApproval === true);
+    await app.submit("CANCEL");
+    await task;
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(modelCalls, 2);
+    assert.equal(app.contextTurns, 1);
+    await waitFor(() => stripAnsi(terminal.output).includes("验证已由用户取消"));
+    assert.match(stripAnsi(terminal.output), /已取消验证，固定命令未执行/);
+    assert.match(stripAnsi(terminal.output), /验证已由用户取消/);
+  } finally {
+    app?.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
   }
 });
 

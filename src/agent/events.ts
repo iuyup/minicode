@@ -9,6 +9,21 @@ export type AgentEvent =
   | { type: "plan_decision"; step: number; decision: "approved" | "rejected" }
   | { type: "tool_call"; step: number; toolCallId: string; toolName: string }
   | {
+      type: "command_approval_requested";
+      step: number;
+      toolCallId: string;
+      toolName: string;
+      action: string;
+    }
+  | {
+      type: "command_approval_decision";
+      step: number;
+      toolCallId: string;
+      toolName: string;
+      action: string;
+      decision: "approved" | "rejected";
+    }
+  | {
       type: "policy_decision";
       step: number;
       toolCallId: string;
@@ -57,6 +72,7 @@ interface SanitizedAuditEvent {
   toolName?: string;
   decision?: "allowed" | "blocked";
   planDecision?: "approved" | "rejected";
+  commandDecision?: "approved" | "rejected";
   status?: "success" | "error";
   path?: string;
   reason?: string;
@@ -93,6 +109,21 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
     case "tool_call":
     case "tool_execution_started":
       return { ...base, toolCallId: event.toolCallId, toolName: event.toolName };
+    case "command_approval_requested":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        action: event.action,
+      };
+    case "command_approval_decision":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        action: event.action,
+        commandDecision: event.decision,
+      };
     case "policy_decision":
       return {
         ...base,

@@ -3,7 +3,13 @@ import process from "node:process";
 import readline from "node:readline/promises";
 
 import { AgentLoop, type AgentRunResult } from "./agent/agent-loop.ts";
-import type { ChatModel, EditApprovalRequest, PlanApprovalRequest, ToolExecutionMode } from "./agent/contracts.ts";
+import type {
+  ChatModel,
+  CommandApprovalRequest,
+  EditApprovalRequest,
+  PlanApprovalRequest,
+  ToolExecutionMode,
+} from "./agent/contracts.ts";
 import { JsonlAuditLog, type AgentEvent } from "./agent/events.ts";
 import { ToolRegistry } from "./agent/tool-registry.ts";
 import { FakeModel } from "./models/fake-model.ts";
@@ -40,6 +46,7 @@ export interface CreateAgentOptions {
   onEvent?: (event: AgentEvent) => void;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
+  requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
 }
 
 const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
@@ -58,7 +65,7 @@ const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
   "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁和固定验证工具完成小范围代码任务。",
   "先定位并用 read_file 成功读取目标文件，再提出最小的 apply_patch；运行时会拒绝未读取目标的补丁。",
   "补丁会在终端界面展示给用户；只有用户输入精确的 APPLY 才会写入。用户拒绝后，不得重复尝试同一补丁，应说明原因并给出后续建议。",
-  "补丁成功后，只在能验证本次修改时调用 run_project_check 的 test 或 check 动作；不得请求任意命令、Git 操作或未注册工具。",
+  "补丁成功后，只在能验证本次修改时调用 run_project_check 的 test 或 check 动作；终端会展示固定命令和工作区，只有用户精确输入 RUN 才会执行。不得请求任意命令、Git 操作或未注册工具。",
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
 
@@ -261,6 +268,23 @@ async function requestTerminalPlanApproval(request: PlanApprovalRequest): Promis
   }
 }
 
+async function requestTerminalCommandApproval(request: CommandApprovalRequest): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("固定验证动作只能在交互式终端中使用，以便人工确认命令。");
+  }
+
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    process.stdout.write(
+      `\n待确认验证：${request.action}\n固定命令：${request.command}\n工作区：${request.workspaceRoot}\n风险：${request.risk}\n`,
+    );
+    const answer = await terminal.question("输入 RUN 确认执行，输入 CANCEL 取消：");
+    return answer.trim() === "RUN";
+  } finally {
+    terminal.close();
+  }
+}
+
 export function createAgent(argumentsValue: CliArguments, options: CreateAgentOptions = {}): AgentLoop {
   const registry = new ToolRegistry(
     argumentsValue.requireSourceEvidence
@@ -297,6 +321,7 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
     requestPlanApproval: argumentsValue.guided
       ? options.requestPlanApproval ?? requestTerminalPlanApproval
       : undefined,
+    requestCommandApproval: options.requestCommandApproval ?? requestTerminalCommandApproval,
     auditLog: new JsonlAuditLog(argumentsValue.auditPath),
     onEvent: options.onEvent,
   });

@@ -157,9 +157,14 @@ test("DeepSeek 编辑模式向模型提供受控补丁和固定验证工具", as
       ["get_project_overview", "list_files", "search_text", "read_file", "apply_patch", "run_project_check"],
     );
     assert.match(body.messages[0]?.content ?? "", /必须直接调用 apply_patch/);
+    assert.match(body.messages[0]?.content ?? "", /精确输入 RUN/);
     assert.match(
       body.tools.find((tool) => tool.function.name === "apply_patch")?.function.description ?? "",
       /不要在普通回答中请求 APPLY/,
+    );
+    assert.match(
+      body.tools.find((tool) => tool.function.name === "run_project_check")?.function.description ?? "",
+      /本地 RUN 确认/,
     );
   } finally {
     globalThis.fetch = originalFetch;

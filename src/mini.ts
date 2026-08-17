@@ -24,7 +24,12 @@ import {
 } from "@mariozechner/pi-tui";
 
 import { type AgentLoop } from "./agent/agent-loop.ts";
-import type { ConversationMessage, EditApprovalRequest, PlanApprovalRequest } from "./agent/contracts.ts";
+import type {
+  CommandApprovalRequest,
+  ConversationMessage,
+  EditApprovalRequest,
+  PlanApprovalRequest,
+} from "./agent/contracts.ts";
 import type { AgentEvent } from "./agent/events.ts";
 import {
   createAgent,
@@ -53,6 +58,45 @@ const red = color(31);
 const muted = color(90);
 const bold = (text: string): string => `\u001B[1m${text}${RESET}`;
 const underline = (text: string): string => `\u001B[4m${text}${RESET}`;
+
+type ApprovalKind = "plan" | "patch" | "command";
+
+const APPROVAL_SPECS = {
+  plan: {
+    confirmWord: "CONTINUE",
+    prompt: "CONTINUE / CANCEL",
+    waiting: "计划仍在等待确认。精确输入 CONTINUE 开始执行；输入 CANCEL 取消。",
+    approved: "计划已确认，正在开始执行。",
+    rejected: "已取消计划，未执行工具或修改文件。",
+  },
+  patch: {
+    confirmWord: "APPLY",
+    prompt: "APPLY / CANCEL",
+    waiting: "确认未通过，补丁仍在等待确认。精确输入 APPLY 写入；输入 CANCEL 取消。",
+    approved: "已确认补丁，正在进行原子写入。",
+    rejected: "已取消补丁，文件保持不变。",
+  },
+  command: {
+    confirmWord: "RUN",
+    prompt: "RUN / CANCEL",
+    waiting: "验证仍在等待确认。精确输入 RUN 执行；输入 CANCEL 取消。",
+    approved: "已确认验证，正在执行固定命令。",
+    rejected: "已取消验证，固定命令未执行。",
+  },
+} as const satisfies Record<ApprovalKind, {
+  confirmWord: string;
+  prompt: string;
+  waiting: string;
+  approved: string;
+  rejected: string;
+}>;
+
+const CONTROL_WORD_NOTICES = {
+  APPLY: "当前没有待确认补丁，APPLY 未发送给模型。只有出现黄色“待确认补丁”时，精确输入 APPLY 才会写入。",
+  CONTINUE: "当前没有待确认计划，CONTINUE 未发送给模型。",
+  RUN: "当前没有待确认验证，RUN 未发送给模型。",
+  CANCEL: "当前没有待确认操作，CANCEL 未发送给模型。",
+} as const;
 
 const SELECT_LIST_THEME: EditorTheme["selectList"] = {
   selectedPrefix: accent,
@@ -129,6 +173,10 @@ function eventLabel(event: AgentEvent): string {
       return event.decision === "approved" ? "计划已确认，开始执行" : "计划已取消";
     case "tool_call":
       return `准备调用 ${event.toolName}`;
+    case "command_approval_requested":
+      return `等待确认固定验证：${event.action}`;
+    case "command_approval_decision":
+      return event.decision === "approved" ? "验证已确认，准备执行" : "验证已取消";
     case "tool_execution_started":
       return `正在执行 ${event.toolName}`;
     case "tool_finalized":
@@ -270,7 +318,7 @@ export class MiniTuiApp {
   readonly #loader: Loader;
   readonly #editor: Editor;
   #pendingApproval?: {
-    kind: "plan" | "patch";
+    kind: ApprovalKind;
     resolve: (approved: boolean) => void;
   };
   #running = false;
@@ -325,10 +373,12 @@ export class MiniTuiApp {
     return this.#pendingApproval?.kind === "plan";
   }
 
+  get awaitingCommandApproval(): boolean {
+    return this.#pendingApproval?.kind === "command";
+  }
+
   get approvalPrompt(): string | undefined {
-    return this.#pendingApproval?.kind === "plan"
-      ? "CONTINUE / CANCEL"
-      : this.#pendingApproval ? "APPLY / CANCEL" : undefined;
+    return this.#pendingApproval ? APPROVAL_SPECS[this.#pendingApproval.kind].prompt : undefined;
   }
 
   get editorText(): string {
@@ -369,34 +419,21 @@ export class MiniTuiApp {
     const input = rawInput.trim();
     if (this.#stopped) return;
     if (this.#pendingApproval) {
-      const isPlanApproval = this.#pendingApproval.kind === "plan";
-      const confirmWord = isPlanApproval ? "CONTINUE" : "APPLY";
-      if (input === confirmWord) {
+      const spec = APPROVAL_SPECS[this.#pendingApproval.kind];
+      if (input === spec.confirmWord) {
         this.resolvePendingApproval(true);
       } else if (input === "CANCEL" || input === "/cancel") {
         this.resolvePendingApproval(false);
       } else {
         this.#editor.setText("");
-        this.appendNotice(
-          isPlanApproval
-            ? "计划仍在等待确认。精确输入 CONTINUE 开始执行；输入 CANCEL 取消。"
-            : "确认未通过，补丁仍在等待确认。精确输入 APPLY 写入；输入 CANCEL 取消。",
-          yellow,
-        );
+        this.appendNotice(spec.waiting, yellow);
       }
       return;
     }
-    if (input.toUpperCase() === "APPLY") {
+    const controlNotice = CONTROL_WORD_NOTICES[input.toUpperCase() as keyof typeof CONTROL_WORD_NOTICES];
+    if (controlNotice) {
       this.#editor.setText("");
-      this.appendNotice(
-        "当前没有待确认补丁，APPLY 未发送给模型。只有出现黄色“待确认补丁”时，精确输入 APPLY 才会写入。",
-        yellow,
-      );
-      return;
-    }
-    if (input.toUpperCase() === "CONTINUE") {
-      this.#editor.setText("");
-      this.appendNotice("当前没有待确认计划，CONTINUE 未发送给模型。", yellow);
+      this.appendNotice(controlNotice, yellow);
       return;
     }
     if (!input) return;
@@ -475,6 +512,30 @@ export class MiniTuiApp {
     });
   }
 
+  requestCommandApproval(request: CommandApprovalRequest): Promise<boolean> {
+    if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
+
+    this.#transcript.addChild(new Text(`${bold(yellow("待确认验证"))} ${request.action}`, 1, 0));
+    this.#transcript.addChild(new Text(
+      [
+        `固定命令：${request.command}`,
+        `工作区：${request.workspaceRoot}`,
+        `风险：${request.risk}`,
+      ].join("\n"),
+      2,
+      1,
+    ));
+    this.appendNotice("命令尚未执行。请准确输入 RUN 并按 Enter 执行；输入 CANCEL 取消；其他输入会保留当前待确认验证。", yellow);
+    this.#editor.setText("");
+    this.#editor.disableSubmit = false;
+    this.#tui.setFocus(this.#editor);
+    this.#tui.requestRender();
+
+    return new Promise((resolve) => {
+      this.#pendingApproval = { kind: "command", resolve };
+    });
+  }
+
   private appendWelcome(): void {
     const mode = this.#options.guided
       ? "当前为引导式会话：先确认计划，再进入每个执行阶段。"
@@ -532,13 +593,8 @@ export class MiniTuiApp {
     this.#pendingApproval = undefined;
     this.#editor.setText("");
     this.#editor.disableSubmit = true;
-    const isPlanApproval = pendingApproval.kind === "plan";
-    this.appendNotice(
-      approved
-        ? isPlanApproval ? "计划已确认，正在开始执行。" : "已确认补丁，正在进行原子写入。"
-        : isPlanApproval ? "已取消计划，未执行工具或修改文件。" : "已取消补丁，文件保持不变。",
-      approved ? green : yellow,
-    );
+    const spec = APPROVAL_SPECS[pendingApproval.kind];
+    this.appendNotice(approved ? spec.approved : spec.rejected, approved ? green : yellow);
     pendingApproval.resolve(approved);
   }
 
@@ -549,7 +605,7 @@ export class MiniTuiApp {
     }
     switch (input) {
       case "/help":
-        this.appendNotice("Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；CANCEL 取消。", accent);
+        this.appendNotice("Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；验证确认输入 RUN；CANCEL 取消。", accent);
         break;
       case "/status":
         this.appendNotice(
@@ -649,6 +705,7 @@ export function createMiniTui(
     onEvent: (event) => app?.handleAgentEvent(event),
     requestEditApproval: (request) => app?.requestEditApproval(request) ?? Promise.resolve(false),
     requestPlanApproval: (request) => app?.requestPlanApproval(request) ?? Promise.resolve(false),
+    requestCommandApproval: (request) => app?.requestCommandApproval(request) ?? Promise.resolve(false),
   });
   const agent = createConfiguredAgent();
   app = new MiniTuiApp(options, terminal, agent, { ...callbacks, createAgent: createConfiguredAgent });

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { AgentLoop } from "../src/agent/agent-loop.ts";
+import { AgentLoop, type AgentLoopOptions } from "../src/agent/agent-loop.ts";
 import { JsonlAuditLog } from "../src/agent/events.ts";
 import type {
   AgentTool,
@@ -66,11 +66,13 @@ async function runCheckAttempt(
   workspaceRoot: string,
   tool: AgentTool<unknown, ToolExecutionResult>,
   input: JsonObject,
+  requestCommandApproval: AgentLoopOptions["requestCommandApproval"] | null = async () => true,
 ): Promise<CheckAttempt> {
   const auditPath = path.join(workspaceRoot, "audit", "tool-audit.jsonl");
   const agent = new AgentLoop(scriptedCheckModel(input), new ToolRegistry([tool]), {
     workspaceRoot,
     auditLog: new JsonlAuditLog(auditPath),
+    ...(requestCommandApproval ? { requestCommandApproval } : {}),
   });
   const result = await agent.run("运行固定项目验证。");
   const rawAudit = await fs.readFile(auditPath, "utf8");
@@ -105,8 +107,20 @@ test("固定 test 动作在工作区根目录运行，并把成功证据回填�
     assert.doesNotMatch(attempt.rawAudit, /CHECK_TEST_OK/);
     assert.deepEqual(
       attempt.audit.filter((event) => event.toolCallId === "check-1").map((event) => event.type),
-      ["tool_call", "tool_execution_started", "policy_decision", "tool_finalized"],
+      [
+        "tool_call",
+        "command_approval_requested",
+        "command_approval_decision",
+        "tool_execution_started",
+        "policy_decision",
+        "tool_finalized",
+      ],
     );
+    assert.equal(
+      attempt.audit.find((event) => event.type === "command_approval_decision")?.commandDecision,
+      "approved",
+    );
+    assert.doesNotMatch(attempt.rawAudit, /npm test|package\.json/);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }
@@ -143,6 +157,119 @@ test("模型不能传入任意命令或额外参数", async () => {
       ["tool_call", "tool_finalized"],
     );
     assert.doesNotMatch(attempt.rawAudit, /Remove-Item|powershell/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("用户取消固定验证时不启动 runner，并保留脱敏确认终态", async () => {
+  const workspace = await createWorkspace({ test: "node -e \"console.log('SHOULD_NOT_RUN')\"" });
+  let runnerCalls = 0;
+  const runner: ProjectCheckRunner = {
+    async run(): Promise<ProjectCheckRunResult> {
+      runnerCalls += 1;
+      return {
+        exitCode: 0,
+        durationMs: 1,
+        output: "SHOULD_NOT_RUN",
+        outputLength: 14,
+        outputTruncated: false,
+        timedOut: false,
+      };
+    },
+  };
+  try {
+    const attempt = await runCheckAttempt(
+      workspace,
+      createRunProjectCheckTool(runner),
+      { action: "test" },
+      async (request) => {
+        assert.deepEqual(request, {
+          action: "test",
+          command: "npm test",
+          workspaceRoot: path.resolve(workspace),
+          risk: "npm scripts 会执行工作区 package.json 中定义的项目代码，也可能修改文件或访问网络；只在信任该工作区时确认。",
+        });
+        return false;
+      },
+    );
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /用户已取消固定验证动作/);
+    assert.deepEqual(
+      attempt.audit.filter((event) => event.toolCallId === "check-1").map((event) => event.type),
+      ["tool_call", "command_approval_requested", "command_approval_decision", "tool_finalized"],
+    );
+    assert.equal(
+      attempt.audit.find((event) => event.type === "command_approval_decision")?.commandDecision,
+      "rejected",
+    );
+    assert.equal(finalizedAudit(attempt)?.action, "test");
+    assert.doesNotMatch(attempt.rawAudit, /npm test|SHOULD_NOT_RUN|package\.json/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("缺少本地确认回调时固定验证默认闭锁", async () => {
+  const workspace = await createWorkspace({ check: "node -e \"console.log('SHOULD_NOT_RUN')\"" });
+  let runnerCalls = 0;
+  const runner: ProjectCheckRunner = {
+    async run(): Promise<ProjectCheckRunResult> {
+      runnerCalls += 1;
+      throw new Error("runner must stay closed");
+    },
+  };
+  try {
+    const attempt = await runCheckAttempt(
+      workspace,
+      createRunProjectCheckTool(runner),
+      { action: "check" },
+      null,
+    );
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /未配置本地命令确认/);
+    assert.deepEqual(
+      attempt.audit.filter((event) => event.toolCallId === "check-1").map((event) => event.type),
+      ["tool_call", "command_approval_requested", "command_approval_decision", "tool_finalized"],
+    );
+    assert.equal(finalizedAudit(attempt)?.action, "check");
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("本地确认回调异常时默认闭锁且不泄露异常正文", async () => {
+  const workspace = await createWorkspace({ test: "node -e \"console.log('SHOULD_NOT_RUN')\"" });
+  let runnerCalls = 0;
+  const runner: ProjectCheckRunner = {
+    async run(): Promise<ProjectCheckRunResult> {
+      runnerCalls += 1;
+      throw new Error("runner must stay closed");
+    },
+  };
+  try {
+    const attempt = await runCheckAttempt(
+      workspace,
+      createRunProjectCheckTool(runner),
+      { action: "test" },
+      async () => {
+        throw new Error("SENSITIVE_APPROVAL_ERROR");
+      },
+    );
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /本地命令确认不可用/);
+    assert.doesNotMatch(toolResult(attempt)?.content ?? "", /SENSITIVE_APPROVAL_ERROR/);
+    assert.doesNotMatch(attempt.rawAudit, /SENSITIVE_APPROVAL_ERROR/);
+    assert.deepEqual(
+      attempt.audit.filter((event) => event.toolCallId === "check-1").map((event) => event.type),
+      ["tool_call", "command_approval_requested", "command_approval_decision", "tool_finalized"],
+    );
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }
@@ -204,6 +331,7 @@ test("FakeModel 只能选择固定验证动作，并基于工具结果给出结�
   try {
     const result = await new AgentLoop(new FakeModel(), new ToolRegistry([runProjectCheck]), {
       workspaceRoot: workspace,
+      requestCommandApproval: async () => true,
     }).run("请运行测试并汇报结果。");
 
     assert.match(result.answer, /受限项目验证闭环已完成/);

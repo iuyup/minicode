@@ -2,6 +2,7 @@ import { ToolExecutionError } from "./contracts.ts";
 import type {
   AgentMessage,
   ChatModel,
+  CommandApprovalRequest,
   ConversationMessage,
   EditApprovalRequest,
   PlanApprovalRequest,
@@ -45,6 +46,7 @@ export interface AgentLoopOptions {
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
+  requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
   auditLog?: AgentEventAuditLog;
   /**
    * 只读观察者：用于终端界面等展示层实时刷新，不参与工具权限、执行或审计决策。
@@ -180,6 +182,7 @@ export class AgentLoop {
   readonly #executionMode: ToolExecutionMode;
   readonly #requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   readonly #requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
+  readonly #requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
   readonly #auditLog?: AgentEventAuditLog;
   readonly #onEvent?: (event: AgentEvent) => void;
 
@@ -201,6 +204,7 @@ export class AgentLoop {
     this.#executionMode = options.executionMode ?? "propose";
     this.#requestEditApproval = options.requestEditApproval;
     this.#requestPlanApproval = options.requestPlanApproval;
+    this.#requestCommandApproval = options.requestCommandApproval;
     this.#auditLog = options.auditLog;
     this.#onEvent = options.onEvent;
   }
@@ -519,6 +523,51 @@ export class AgentLoop {
     const validation = tool.validate(toolCall.input as JsonValue);
     if (!validation.ok) {
       return this.finalizeError(events, step, toolCall, validation.error);
+    }
+
+    if (tool.getCommandApprovalRequest) {
+      let request: CommandApprovalRequest;
+      try {
+        request = tool.getCommandApprovalRequest(validation.value, this.#workspaceRoot);
+      } catch {
+        return this.finalizeError(
+          events,
+          step,
+          toolCall,
+          "无法生成本地命令确认，固定验证动作未执行。",
+        );
+      }
+      const approvalAction = request.action;
+      this.recordEvent(events, {
+        type: "command_approval_requested",
+        step,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        action: approvalAction,
+      });
+
+      let approved = false;
+      let rejectionReason = "用户已取消固定验证动作，未执行命令。";
+      if (!this.#requestCommandApproval) {
+        rejectionReason = "未配置本地命令确认，固定验证动作未执行。";
+      } else {
+        try {
+          approved = await this.#requestCommandApproval(request) === true;
+        } catch {
+          rejectionReason = "本地命令确认不可用，固定验证动作未执行。";
+        }
+      }
+      this.recordEvent(events, {
+        type: "command_approval_decision",
+        step,
+        toolCallId: toolCall.id,
+        toolName: toolCall.name,
+        action: approvalAction,
+        decision: approved ? "approved" : "rejected",
+      });
+      if (!approved) {
+        return this.finalizeError(events, step, toolCall, rejectionReason, { action: approvalAction });
+      }
     }
 
     this.recordEvent(events, {

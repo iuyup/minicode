@@ -19,7 +19,7 @@
 - `AgentTool`：工具名、描述、参数校验和执行函数的契约；
 - `ToolRegistry`：工具按名字查找，禁止重复注册；
 - `WorkingLedger`：只记录当前任务已验证的观察结果；
-- 生命周期事件：`tool_call`、`policy_decision`、`tool_execution_started`、`tool_finalized`、`final_answer_rejected`；
+- 生命周期事件：`tool_call`、`command_approval_requested`、`command_approval_decision`、`policy_decision`、`tool_execution_started`、`tool_finalized`、`final_answer_rejected`；
 - `FakeModel`：确定性模拟“先调用工具，再读取工具结果”的两轮模型行为；
 - `OpenAiCompatibleModel`：通过 Chat Completions 兼容接口把模型回复转换为内部工具调用；`DeepSeekModel` 保留为带“关闭思考”参数的兼容预设；
 - 只读工具：`list_files`、`search_text`、`read_file`；
@@ -68,7 +68,7 @@ cmd.exe /d /c npm run mini -- --model deepseek --deepseek-model deepseek-v4-flas
 cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace .
 ```
 
-编辑模式只额外开放 `apply_patch` 和固定的 `run_project_check`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；输入 `CANCEL` 才会取消，其他输入既不会写入，也会保留待确认补丁。模型只能选择 `test` 或 `check` 验证动作，不能执行任意命令、Git 操作或写入受保护路径。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次；`--require-source-evidence` 是只读取证模式，不能与 `--mode edit` 同时使用。
+编辑模式只额外开放 `apply_patch` 和固定的 `run_project_check`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；输入 `CANCEL` 才会取消，其他输入既不会写入，也会保留待确认补丁。模型只能选择 `test` 或 `check` 验证动作；TUI 随后显示固定命令、绝对工作区和 npm script 风险，只有精确输入 `RUN` 才执行，`CANCEL` 会产生零执行的错误终态。`APPLY`、`CONTINUE`、`RUN`、`CANCEL` 都是本地控制词，在没有对应待确认操作时不会发给模型。当前仍不能执行任意命令、Git 操作或写入受保护路径。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次；`--require-source-evidence` 是只读取证模式，不能与 `--mode edit` 同时使用。
 
 ### 可复位编辑冒烟测试
 
@@ -85,7 +85,7 @@ cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace playgroun
 修复 src/greeting.js 中 formatGreeting 缺少结尾感叹号的问题。先读取目标文件，只做最小修改；在我确认补丁后运行 test 验证。
 ```
 
-随后再次运行 `npm run prepare:edit-smoke`，将审计文件改为 `reports\edit-smoke-apply.jsonl`，重复任务并输入 `APPLY`。验收标准是：读取 `src/greeting.js` 后才出现补丁、写入前显示 diff、`npm test` 成功、审计中有完整终态且不含补丁正文。
+随后再次运行 `npm run prepare:edit-smoke`，将审计文件改为 `reports\edit-smoke-apply.jsonl`，重复任务并输入 `APPLY`；待验证面板出现后检查命令和工作区，再输入 `RUN`。验收标准是：读取 `src/greeting.js` 后才出现补丁、写入前显示 diff、命令确认前没有进程启动、`npm test` 成功、审计中有完整确认与执行终态且不含补丁正文、完整命令、绝对工作区或命令输出。
 
 若要在该机器上直接使用 `mini` 而非 `npm run mini`，可在确认本项目可信后执行一次 `cmd.exe /d /c npm link`；此操作会创建指向当前项目的本机全局命令。该仓库通过 `package.json` 的 `bin` 字段注册 `mini`，不会发布 npm 包。
 
@@ -137,7 +137,7 @@ cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问
 
 当前 `FakeModel` 默认演示检索和读取源码；它不会自行发起补丁，受控写入由测试中的脚本化模型覆盖。每次 CLI 运行都会在 `reports/tool-audit.jsonl` 追加审计记录，也可用 `--audit <path>` 改写位置。审计通过共同的 `toolCallId` 关联 `tool_call`、`policy_decision` 与 `tool_finalized`，但不保存模型上下文、文件内容或补丁原文。
 
-当任务包含“运行测试”或“运行类型检查”时，`FakeModel` 会分别选择 `run_project_check` 的 `test` 或 `check` 动作。工具通过 Node 直接启动 npm CLI，不使用 `shell: true`、`cmd /c` 或模型提供的命令字符串；工作目录固定为工作区根目录，超时为 60 秒，输出最多保留 12,000 个字符。非零退出码或超时会成为 `ToolResultMessage(error)`。审计只保存动作、退出码、耗时、输出长度和截断/超时标记。
+当任务包含“运行测试”或“运行类型检查”时，`FakeModel` 会分别选择 `run_project_check` 的 `test` 或 `check` 动作。参数通过校验后，Agent Loop 先产生脱敏的命令确认事件；没有确认回调、用户输入 `CANCEL` 或确认界面异常时均默认闭锁，不会进入 `tool_execution_started`。只有精确输入 `RUN` 后，工具才通过 Node 直接启动 npm CLI；它不使用 `shell: true`、`cmd /c` 或模型提供的命令字符串，工作目录固定为工作区根目录，超时为 60 秒，输出最多保留 12,000 个字符。非零退出码或超时会成为 `ToolResultMessage(error)`。审计只保存动作、确认决定、退出码、耗时、输出长度和截断/超时标记。
 
 固定动作不代表可安全运行任意工作区：`npm test` 和 `npm run check` 仍会执行该工作区 `package.json` 中由项目维护者定义的脚本。因此该工具只适用于用户信任的工作区，不是操作系统沙箱，也不能替代依赖和脚本审查。
 
@@ -147,6 +147,6 @@ cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问
 - 默认不接真实模型：FakeModel 让循环、错误路径和测试完全可重复；DeepSeek 仅在显式选择后联网，真实调用会单独说明目的、风险和文件影响后再进行。
 - 不并发：先保证消息顺序、错误终态和可测试性，副作用工具的并发留到后续按资源设计。
 - 不开放任意文件写入：补丁只能对唯一旧文本做替换，默认预览，写入必须人工确认。
-- 不开放任意命令：模型只能选择固定的 `test` 或 `check` 动作，不能传入命令、参数、环境变量或工作目录。
+- 不开放任意命令：模型只能选择固定的 `test` 或 `check` 动作，不能传入命令、参数、环境变量或工作目录；固定动作也必须经本地 `RUN` 确认。
 - 不把 Working Ledger 当长期记忆：它只保存这一轮任务中由工具确认的事实。
 - 不读取受保护路径：`.git`、`node_modules`、`.env` 和 `.env.*` 不会出现在目录、搜索或读取结果中。
