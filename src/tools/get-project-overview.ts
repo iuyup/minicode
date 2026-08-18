@@ -22,7 +22,7 @@ export const getProjectOverview: AgentTool<EmptyInput> = {
   async execute(_input, context): Promise<string> {
     return [
       `收到的任务：${context.task}`,
-      "当前实现包含 Agent Loop、工具契约、任务级账本、生命周期事件、只读工作区工具、受控补丁、受限项目验证、CLI 演示和测试。",
+      "当前实现包含 Agent Loop、工具契约、任务级账本、生命周期事件、只读工作区与 Git 状态/diff 工具、受控补丁、受限项目验证、CLI 演示和测试。",
       "默认使用离线 FakeModel；只有明确选择 DeepSeek 模型并配置环境变量后才会发起网络请求。",
     ].join(" ");
   },

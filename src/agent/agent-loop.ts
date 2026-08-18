@@ -37,6 +37,8 @@ export interface AgentLoopOptions {
   maxSteps?: number;
   maxToolCallsPerStep?: number;
   maxToolCalls?: number;
+  /** 工具总预算耗尽后的下一轮只允许最终回答，不再暴露工具。 */
+  finalOnlyAfterToolBudget?: boolean;
   requireSourceEvidence?: boolean;
   /** 编辑模式下，补丁目标必须已由本轮成功的 read_file 读取。 */
   requireReadBeforeEdit?: boolean;
@@ -175,6 +177,7 @@ export class AgentLoop {
   readonly #maxSteps: number;
   readonly #maxToolCallsPerStep: number;
   readonly #maxToolCalls: number;
+  readonly #finalOnlyAfterToolBudget: boolean;
   readonly #requireSourceEvidence: boolean;
   readonly #requireReadBeforeEdit: boolean;
   readonly #requirePlanApproval: boolean;
@@ -197,6 +200,7 @@ export class AgentLoop {
     this.#maxSteps = options.maxSteps ?? 6;
     this.#maxToolCallsPerStep = normalizePositiveLimit(options.maxToolCallsPerStep, "maxToolCallsPerStep");
     this.#maxToolCalls = normalizePositiveLimit(options.maxToolCalls, "maxToolCalls");
+    this.#finalOnlyAfterToolBudget = options.finalOnlyAfterToolBudget ?? false;
     this.#requireSourceEvidence = options.requireSourceEvidence ?? false;
     this.#requireReadBeforeEdit = options.requireReadBeforeEdit ?? false;
     this.#requirePlanApproval = options.requirePlanApproval ?? false;
@@ -238,7 +242,8 @@ export class AgentLoop {
         sourceEvidenceCompletionPending = false;
         const isSourceEvidenceFinalTurn = isSourceEvidenceRepairTurn || isSourceEvidenceCompletionTurn;
         const isPlanningTurn = planApprovalPending;
-        const availableTools = isPlanningTurn || isSourceEvidenceFinalTurn
+        const isToolBudgetFinalTurn = this.#finalOnlyAfterToolBudget && acceptedToolCalls >= this.#maxToolCalls;
+        const availableTools = isPlanningTurn || isSourceEvidenceFinalTurn || isToolBudgetFinalTurn
           ? []
           : this.getAvailableToolDescriptions(
               sourceEvidence,
@@ -276,6 +281,12 @@ export class AgentLoop {
           const reason = isSourceEvidenceRepairTurn
             ? "源码证据修复轮只能给出最终回答，不能请求工具。"
             : "源码取证已收集足够证据，本轮只能给出最终回答，不能请求工具。";
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          throw new Error(reason);
+        }
+
+        if (isToolBudgetFinalTurn && response.kind === "tool_calls") {
+          const reason = "工具预算已耗尽，本轮只能给出最终回答，不能继续请求工具。";
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
         }

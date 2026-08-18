@@ -26,6 +26,7 @@ import {
 import { OpenAiCompatibleModel } from "./models/openai-compatible-model.ts";
 import { applyPatch } from "./tools/apply-patch.ts";
 import { getProjectOverview } from "./tools/get-project-overview.ts";
+import { inspectGit } from "./tools/inspect-git.ts";
 import { listFiles } from "./tools/list-files.ts";
 import { readFile } from "./tools/read-file.ts";
 import { runCommand } from "./tools/run-command.ts";
@@ -51,7 +52,7 @@ export interface CreateAgentOptions {
   requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
 }
 
-const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile] as const;
+const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile, inspectGit] as const;
 const sourceEvidenceTools = [searchText, readFile] as const;
 const editTools = [...readOnlyTools, applyPatch, runProjectCheck, runCommand] as const;
 
@@ -64,11 +65,12 @@ const DEEPSEEK_SYSTEM_PROMPT = [
 ].join(" ");
 
 const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
-  "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁、固定验证和结构化 Node/npm 工具完成小范围代码任务。",
+  "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁、固定验证、结构化 Node/npm 和固定 Git 只读工具完成小范围代码任务。",
   "先定位并用 read_file 成功读取目标文件，再提出最小的 apply_patch；运行时会拒绝未读取目标的补丁。",
   "补丁会在终端界面展示给用户；只有用户输入精确的 APPLY 才会写入。用户拒绝后，不得重复尝试同一补丁，应说明原因并给出后续建议。",
   "补丁成功后，只在能验证本次修改时运行命令；优先调用更窄的 run_project_check test/check，固定验证无法覆盖时才调用 run_command。",
   "run_command 必须把程序、参数数组和工作区相对目录分开提供；第一版只支持 node/npm，不接受直接 Shell、管道、重定向、Git、提权、后台任务或环境变量注入。npm/工作区脚本自身仍可能启动 Shell 或子进程。",
+  "Git 只能通过 inspect_git 的 status、diff、staged_diff 固定动作读取；不得要求暂存、提交、切换分支、重置或推送。完成修改和验证后，在工具预算允许时读取 Git 状态与相关差异，并明确提交仍由用户手动完成。",
   "终端会完整展示命令、工作目录和风险等级；只有用户精确输入 RUN 才会执行。RUN 是本地确认词，不能作为用户消息处理或要求模型等待。",
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
@@ -305,6 +307,7 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
   );
   return new AgentLoop(createModel(argumentsValue), registry, {
     workspaceRoot: argumentsValue.workspaceRoot,
+    maxSteps: argumentsValue.agentMode === "edit" ? 7 : undefined,
     executionMode: argumentsValue.executionMode,
     requireSourceEvidence: argumentsValue.requireSourceEvidence,
     requirePlanApproval: argumentsValue.guided,
@@ -321,6 +324,7 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
           ].join(" "),
           maxToolCallsPerStep: argumentsValue.requireSourceEvidence || argumentsValue.agentMode === "edit" ? 1 : 2,
           maxToolCalls: 6,
+          finalOnlyAfterToolBudget: argumentsValue.agentMode === "edit",
         }
       : {}),
     requestEditApproval: argumentsValue.executionMode === "apply"

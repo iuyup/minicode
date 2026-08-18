@@ -169,6 +169,19 @@ function appendConversation(history: ConversationMessage[], task: string, answer
   }
 }
 
+function toolDisplayName(toolName: string): string {
+  return {
+    get_project_overview: "项目概览",
+    list_files: "文件浏览",
+    search_text: "代码搜索",
+    read_file: "文件读取",
+    inspect_git: "Git 只读检查",
+    apply_patch: "受控补丁",
+    run_project_check: "项目验证",
+    run_command: "受控命令",
+  }[toolName] ?? toolName;
+}
+
 function eventLabel(event: AgentEvent): string {
   switch (event.type) {
     case "model_requested":
@@ -180,7 +193,7 @@ function eventLabel(event: AgentEvent): string {
     case "plan_decision":
       return event.decision === "approved" ? "计划已确认，开始执行" : "计划已取消";
     case "tool_call":
-      return `准备调用 ${event.toolName}`;
+      return `准备调用 ${toolDisplayName(event.toolName)}`;
     case "command_approval_requested":
       return event.commandKind === "verification"
         ? `等待确认固定验证：${escapeTerminalText(event.action)}`
@@ -191,11 +204,13 @@ function eventLabel(event: AgentEvent): string {
       }
       return event.decision === "approved" ? "命令已确认，准备执行" : "命令已取消";
     case "tool_execution_started":
-      return `正在执行 ${event.toolName}`;
+      return `正在执行 ${toolDisplayName(event.toolName)}`;
     case "tool_finalized":
-      return event.status === "success" ? `${event.toolName} 已完成` : `${event.toolName} 已被拒绝`;
+      return event.status === "success"
+        ? `${toolDisplayName(event.toolName)}已完成`
+        : `${toolDisplayName(event.toolName)}未完成`;
     case "policy_decision":
-      return `正在应用 ${event.toolName} 的策略`;
+      return `正在应用 ${toolDisplayName(event.toolName)}策略`;
     case "final_answer_rejected":
       return "正在校验并修复源码引用";
     case "agent_completed":
@@ -211,22 +226,19 @@ function renderLine(text: string, width: number): string {
 
 class Header implements Component {
   readonly #options: CliArguments;
-  readonly #isRunning: () => boolean;
 
-  constructor(options: CliArguments, isRunning: () => boolean) {
+  constructor(options: CliArguments) {
     this.#options = options;
-    this.#isRunning = isRunning;
   }
 
   invalidate(): void {}
 
   render(width: number): string[] {
-    const state = this.#isRunning() ? yellow("● 工作中") : green("● 就绪");
     const workspace = path.basename(this.#options.workspaceRoot) || this.#options.workspaceRoot;
     return [
       renderLine(`${bold(accent("◆ MiniCode"))}  ${muted("轻量 Coding Agent")}`, width),
-      renderLine(`  ${state}  ${modelLabel(this.#options)}  ${muted("·")}  ${toolPermissionLabel(this.#options)}`, width),
-      renderLine(`  ${muted("工作区")} ${workspace}  ${muted("·  Ctrl+O 展开工具细节")}`, width),
+      renderLine(`  ${modelLabel(this.#options)}  ${muted("·")}  ${toolPermissionLabel(this.#options)}`, width),
+      renderLine(`  ${muted("工作区")} ${workspace}  ${muted("·  滚轮浏览历史  ·  Ctrl+O 展开工具细节")}`, width),
       renderLine(muted("─".repeat(Math.max(width, 1))), width),
     ];
   }
@@ -299,7 +311,7 @@ class Footer implements Component {
     return [
       renderLine(muted("─".repeat(Math.max(width, 1))), width),
       renderLine(
-        ` ${activity}  ${muted(`上下文 ${this.#contextTurns()} / ${MAX_CONTEXT_TURNS}`)}  ${muted("Ctrl+V 粘贴 · /help · /clear · /details · /exit")}`,
+        ` ${activity}  ${muted(`上下文 ${this.#contextTurns()} / ${MAX_CONTEXT_TURNS}`)}  ${muted("滚轮历史 · Ctrl+V 粘贴 · /help · /clear · /details · /exit")}`,
         width,
       ),
     ];
@@ -402,7 +414,7 @@ export class MiniTuiApp {
     if (this.#started) return;
     this.#started = true;
     this.#terminal.setTitle("MiniCode");
-    this.#tui.addChild(new Header(this.#options, () => this.#running));
+    this.#tui.addChild(new Header(this.#options));
     this.#tui.addChild(new Text("", 0, 1));
     this.#tui.addChild(this.#transcript);
     this.#tui.addChild(this.#activity);
@@ -568,7 +580,7 @@ export class MiniTuiApp {
         ? "当前是受控编辑会话：补丁逐次等待 APPLY，验证与 Node/npm 命令逐次等待 RUN。"
       : `当前会话会调用 ${modelLabel(this.#options)}，并仅开放已标明的工具权限。`;
     this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))} ${muted(mode)}`, 1, 0));
-    this.#transcript.addChild(new Text(muted("  支持 Ctrl+V 粘贴；工具细节默认折叠，审计仍写入 reports。"), 1, 1));
+    this.#transcript.addChild(new Text(muted("  鼠标滚轮或终端滚动条可查看历史；支持 Ctrl+V 粘贴，工具细节默认折叠。"), 1, 1));
   }
 
   private appendUser(input: string): void {
@@ -628,7 +640,7 @@ export class MiniTuiApp {
     }
     switch (input) {
       case "/help":
-        this.appendNotice("Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话上下文；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；验证或命令确认输入 RUN；CANCEL 取消。", accent);
+        this.appendNotice("鼠标滚轮或终端滚动条查看历史；Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话与当前终端历史；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；验证或命令确认输入 RUN；CANCEL 取消。", accent);
         break;
       case "/status":
         this.appendNotice(
@@ -648,6 +660,7 @@ export class MiniTuiApp {
         this.appendWelcome();
         this.appendNotice("已清空会话上下文；审计文件不会被删除。", green);
         this.refreshActivity();
+        this.#tui.requestRender(true);
         break;
       case "/exit":
       case "/quit":
@@ -746,13 +759,11 @@ export async function runMini(args: string[] = process.argv.slice(2)): Promise<v
   });
   const app = createMiniTui(args, new ProcessTerminal(), { onExit: () => resolveExit?.() });
 
-  process.stdout.write("\u001B[?1049h");
   try {
     app.start();
     await exited;
   } finally {
     app.stop();
-    process.stdout.write("\u001B[?1049l");
   }
 }
 

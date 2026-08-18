@@ -1,5 +1,76 @@
 import type { ChatModel, ModelRequest, ModelResponse, ToolResultMessage } from "../agent/contracts.ts";
 
+const PLAN_CONFIRMATION_PREFIX = "计划已由用户确认。现在开始执行";
+const MAX_STATUS_SUMMARY_ITEMS = 8;
+const MAX_DIFF_SUMMARY_FILES = 6;
+
+type ToolResultWithMetadata = ToolResultMessage & {
+  metadata?: {
+    outputTruncated?: boolean;
+  };
+};
+
+function originalUserTask(request: ModelRequest): string {
+  return request.messages.findLast(
+    (message) => message.role === "user" && !message.content.startsWith(PLAN_CONFIRMATION_PREFIX),
+  )?.content ?? "";
+}
+
+function gitResultFor(
+  request: ModelRequest,
+  action: "status" | "diff" | "staged_diff",
+): ToolResultMessage | undefined {
+  return request.messages.findLast(
+    (message): message is ToolResultMessage =>
+      message.role === "tool" &&
+      message.name === "inspect_git" &&
+      (message.content.includes(`Git 只读动作：${action}`) || message.toolCallId.includes(`git-${action}`)),
+  );
+}
+
+function summarizeGitResult(result: ToolResultMessage): string {
+  if (result.status === "error") return `工具终态：error；${result.content}`;
+  const lines = result.content.split("\n");
+  const resultStart = lines.findIndex((line) => line.trim() === "结果：");
+  const resultLines = lines
+    .slice(resultStart >= 0 ? resultStart + 1 : 0)
+    .filter((line) => line.trim() !== "" && line.trim() !== "[Git 输出已截断]");
+  const outputTruncated = result.content.includes("[Git 输出已截断]") ||
+    (result as ToolResultWithMetadata).metadata?.outputTruncated === true;
+  const truncationNotice = outputTruncated ? "；Git 原始输出已截断，摘要不完整" : "";
+  const action = result.content.match(/^Git 只读动作：(status|diff|staged_diff)$/mu)?.[1];
+
+  if (action === "status") {
+    const branch = resultLines.find((line) => line.startsWith("## "));
+    const statusItems = resultLines.filter((line) => !line.startsWith("## "));
+    const visibleItems = statusItems.slice(0, MAX_STATUS_SUMMARY_ITEMS);
+    const omittedCount = statusItems.length - visibleItems.length;
+    const summaryParts = [
+      "工具终态：success",
+      ...(branch ? [`分支：${branch.slice(3)}`] : []),
+      visibleItems.length > 0 ? `变更项：${visibleItems.join(" | ")}` : "工作区无可见变更",
+      ...(omittedCount > 0
+        ? [`仅展示前 ${visibleItems.length} 项、另有 ${omittedCount} 项`]
+        : []),
+    ];
+    return `${summaryParts.join("；")}${truncationNotice}`;
+  }
+
+  const diffFiles = resultLines
+    .filter((line) => line.startsWith("diff --git "))
+    .map((line) => line.match(/ b\/(.+)$/u)?.[1])
+    .filter((file): file is string => Boolean(file));
+  if (diffFiles.length > 0) {
+    const visibleFiles = diffFiles.slice(0, MAX_DIFF_SUMMARY_FILES);
+    const omittedCount = diffFiles.length - visibleFiles.length;
+    const omittedNotice = omittedCount > 0
+      ? `；仅展示前 ${visibleFiles.length} 个文件、另有 ${omittedCount} 个文件`
+      : "";
+    return `工具终态：success；涉及文件：${visibleFiles.join("、")}${omittedNotice}${truncationNotice}`;
+  }
+  return `工具终态：success；工具已返回差异结果，未复述补丁正文${truncationNotice}`;
+}
+
 function findUnknownToolLocation(searchContent: string): { path: string; startLine: number; endLine: number } {
   const match = searchContent.match(/^(src\/agent\/agent-loop\.ts):(\d+):.*未知工具/m);
   if (!match) {
@@ -30,7 +101,55 @@ export class FakeModel implements ChatModel {
       };
     }
 
-    const task = request.messages.findLast((message) => message.role === "user")?.content ?? "";
+    const task = originalUserTask(request);
+    const requestedGit = /git[\s\S]*(?:status|diff|状态|差异|变更)|(?:status|diff|状态|差异|变更)[\s\S]*git/iu.test(task);
+    const requestedStagedDiff = requestedGit && /staged[_\s-]?diff|已暂存(?:差异|diff)/iu.test(task);
+    const requestedDiff = requestedGit && !requestedStagedDiff && /diff|差异|变更/iu.test(task);
+    const requestedStatus = requestedGit && (/status|状态|变更/iu.test(task) || !requestedDiff && !requestedStagedDiff);
+    if (requestedGit) {
+      if (!request.tools.some((tool) => tool.name === "inspect_git")) {
+        return {
+          kind: "final",
+          content: "当前工具集未开放 inspect_git；源码取证模式不会读取 Git，普通 read/edit 模式才提供固定只读 Git 动作。",
+        };
+      }
+      const statusResult = gitResultFor(request, "status");
+      const diffAction = requestedStagedDiff ? "staged_diff" as const : "diff" as const;
+      const diffResult = gitResultFor(request, diffAction);
+      if (requestedStatus && !statusResult) {
+        return {
+          kind: "tool_calls",
+          content: "我会先读取固定的 Git 状态；该动作不会暂存或提交。",
+          toolCalls: [{ id: "call-inspect-git-status-1", name: "inspect_git", input: { action: "status" } }],
+        };
+      }
+      if (statusResult?.status === "error") {
+        return {
+          kind: "final",
+          content: [
+            "Git 状态读取失败，未继续请求差异。",
+            summarizeGitResult(statusResult),
+            "本次没有执行任何 Git 写操作。",
+          ].join("\n"),
+        };
+      }
+      if ((requestedDiff || requestedStagedDiff) && !diffResult) {
+        return {
+          kind: "tool_calls",
+          content: requestedStagedDiff ? "我会读取已暂存差异。" : "我会读取未暂存差异。",
+          toolCalls: [{ id: `call-inspect-git-${diffAction}-1`, name: "inspect_git", input: { action: diffAction } }],
+        };
+      }
+      return {
+        kind: "final",
+        content: [
+          "Git 只读检查闭环已完成。",
+          ...(statusResult ? [`状态证据：${summarizeGitResult(statusResult)}`] : []),
+          ...(diffResult ? [`差异证据：${summarizeGitResult(diffResult)}`] : []),
+          "本次没有执行暂存、提交、切换分支、重置或推送；请由用户检查后手动 commit。",
+        ].join("\n"),
+      };
+    }
     const requestedNpmVersion = /(?:查看|运行|执行).*(?:npm\s*(?:--version|-v)|npm\s*版本)|npm\s*(?:--version|-v)/i.test(task);
     const commandResult = request.messages.find(
       (message): message is ToolResultMessage => message.role === "tool" && message.name === "run_command",

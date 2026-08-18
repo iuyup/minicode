@@ -125,7 +125,7 @@ test("OpenAiCompatibleModel 使用 Profile 提供的地址与模型，不附加 
   assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer test-key");
 });
 
-test("DeepSeek 编辑模式向模型提供受控补丁、固定验证和结构化命令工具", async () => {
+test("DeepSeek 编辑模式向模型提供受控补丁、验证、命令和只读 Git 工具", async () => {
   const auditDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-deepseek-edit-"));
   const auditPath = path.join(auditDirectory, "audit.jsonl");
   const originalFetch = globalThis.fetch;
@@ -154,11 +154,12 @@ test("DeepSeek 编辑模式向模型提供受控补丁、固定验证和结构�
     assert.equal(options.executionMode, "apply");
     assert.deepEqual(
       body.tools.map((tool) => tool.function.name),
-      ["get_project_overview", "list_files", "search_text", "read_file", "apply_patch", "run_project_check", "run_command"],
+      ["get_project_overview", "list_files", "search_text", "read_file", "inspect_git", "apply_patch", "run_project_check", "run_command"],
     );
     assert.match(body.messages[0]?.content ?? "", /必须直接调用 apply_patch/);
     assert.match(body.messages[0]?.content ?? "", /精确输入 RUN/);
     assert.match(body.messages[0]?.content ?? "", /不接受直接 Shell、管道、重定向、Git/);
+    assert.match(body.messages[0]?.content ?? "", /Git 只能通过 inspect_git/);
     assert.match(
       body.tools.find((tool) => tool.function.name === "apply_patch")?.function.description ?? "",
       /不要在普通回答中请求 APPLY/,
@@ -171,6 +172,10 @@ test("DeepSeek 编辑模式向模型提供受控补丁、固定验证和结构�
       body.tools.find((tool) => tool.function.name === "run_command")?.function.description ?? "",
       /不用 Shell 拼接模型参数/,
     );
+    assert.match(
+      body.tools.find((tool) => tool.function.name === "inspect_git")?.function.description ?? "",
+      /不开放路径、任意 Git 参数或写操作/,
+    );
   } finally {
     globalThis.fetch = originalFetch;
     if (originalApiKey === undefined) {
@@ -178,6 +183,67 @@ test("DeepSeek 编辑模式向模型提供受控补丁、固定验证和结构�
     } else {
       process.env.DEEPSEEK_API_KEY = originalApiKey;
     }
+    await fs.rm(auditDirectory, { recursive: true, force: true });
+  }
+});
+
+test("DeepSeek 编辑模式保留第七轮，在六次工具后仍可给出最终总结", async () => {
+  const auditDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-deepseek-seven-steps-"));
+  const auditPath = path.join(auditDirectory, "audit.jsonl");
+  const originalFetch = globalThis.fetch;
+  const originalApiKey = process.env.DEEPSEEK_API_KEY;
+  const toolCalls = [
+    { name: "get_project_overview", input: {} },
+    { name: "list_files", input: {} },
+    { name: "search_text", input: { query: "class FakeModel", path: "src" } },
+    { name: "read_file", input: { path: "src/models/fake-model.ts", startLine: 1, endLine: 5 } },
+    { name: "inspect_git", input: { action: "status" } },
+    { name: "inspect_git", input: { action: "diff" } },
+  ] as const;
+  let fetchCalls = 0;
+  const requestBodies: Array<Record<string, unknown>> = [];
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    globalThis.fetch = async (_input, init) => {
+      assert.equal(typeof init?.body, "string");
+      requestBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>);
+      const toolCall = toolCalls[fetchCalls];
+      fetchCalls += 1;
+      if (!toolCall) {
+        return jsonResponse({ choices: [{ message: { role: "assistant", content: "六次工具后完成最终总结。" } }] });
+      }
+      return jsonResponse({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: `调用 ${toolCall.name}`,
+            tool_calls: [{
+              id: `seven-step-${fetchCalls}`,
+              type: "function",
+              function: { name: toolCall.name, arguments: JSON.stringify(toolCall.input) },
+            }],
+          },
+        }],
+      });
+    };
+    const options = parseArguments([
+      "--model", "deepseek",
+      "--mode", "edit",
+      "--workspace", process.cwd(),
+      "--audit", auditPath,
+      "完成一次六工具编辑闭环。",
+    ]);
+    const result = await createAgent(options).run(options.task);
+    assert.equal(fetchCalls, 7);
+    assert.equal(result.answer, "六次工具后完成最终总结。");
+    assert.equal(result.events.filter((event) => event.type === "tool_call").length, 6);
+    assert.equal(result.events.at(-1)?.type, "agent_completed");
+    assert.equal("tools" in requestBodies[6], false);
+    assert.equal("tool_choice" in requestBodies[6], false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = originalApiKey;
     await fs.rm(auditDirectory, { recursive: true, force: true });
   }
 });

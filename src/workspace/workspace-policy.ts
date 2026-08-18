@@ -16,7 +16,12 @@ export class WorkspaceAccessError extends Error {
 }
 
 export function shouldSkipWorkspaceEntry(name: string): boolean {
-  return PROTECTED_DIRECTORY_NAMES.has(name) || name === ".env" || name.startsWith(".env.");
+  const normalizedName = name.toLowerCase();
+  return (
+    PROTECTED_DIRECTORY_NAMES.has(normalizedName) ||
+    normalizedName === ".env" ||
+    normalizedName.startsWith(".env.")
+  );
 }
 
 function isInside(parentPath: string, candidatePath: string): boolean {

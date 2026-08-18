@@ -1,6 +1,6 @@
 # Mini Coding Agent
 
-一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码侦察、受控补丁、受限项目验证、结构化 Node/npm 进程，以及 OpenAI-compatible 模型 Profile；默认仍不联网，也不开放任意 Shell。
+一个用于学习 Coding Agent Runtime 的轻量 TypeScript CLI。当前已完成离线 Agent Loop、只读代码与 Git 侦察、受控补丁、受限项目验证、结构化 Node/npm 进程，以及 OpenAI-compatible 模型 Profile；默认仍不联网，也不开放任意 Shell 或 Git 写操作。
 
 ## 已完成的闭环
 
@@ -20,15 +20,15 @@
 - `ToolRegistry`：工具按名字查找，禁止重复注册；
 - `WorkingLedger`：只记录当前任务已验证的观察结果；
 - 生命周期事件：`tool_call`、`command_approval_requested`、`command_approval_decision`、`policy_decision`、`tool_execution_started`、`tool_finalized`、`final_answer_rejected`；
-- `FakeModel`：确定性模拟“先调用工具，再读取工具结果”的两轮模型行为；
+- `FakeModel`：确定性模拟“按任务调用一个或多个工具，再读取工具结果”的多轮模型行为；
 - `OpenAiCompatibleModel`：通过 Chat Completions 兼容接口把模型回复转换为内部工具调用；`DeepSeekModel` 保留为带“关闭思考”参数的兼容预设；
-- 只读工具：`list_files`、`search_text`、`read_file`；
+- 只读工具：`list_files`、`search_text`、`read_file`，以及固定动作的 `inspect_git`；
 - 受控写工具：`apply_patch`，仅允许唯一的精确文本替换；
 - 受限验证工具：`run_project_check`，只允许 `test` 和 `check` 两个固定动作；
 - 受控进程工具：`run_command`，只接收分离的程序、参数数组和工作区相对目录，第一版仅允许 Node/npm；
 - `WorkspacePolicy`：只允许工作区相对路径，拒绝越界、受保护路径和扫描中的符号链接；
 - `JsonlAuditLog`：将脱敏的生命周期元数据追加写入 JSONL；
-- Node 内置测试：验证成功、未知工具、受保护路径、输出截断、补丁确认、固定验证、命令策略和审计终态。
+- Node 内置测试：验证成功、未知工具、受保护路径、输出截断、补丁确认、固定验证、命令策略、Git 只读边界和审计终态。
 
 路径策略是 Agent 层防护，不是操作系统沙箱。`apply_patch` 只允许修改已存在的小型 UTF-8 文本文件，禁止受保护路径；确认前后会比对文件字节，以避免覆盖确认期间发生的修改。
 
@@ -48,14 +48,14 @@ cmd.exe /d /c npm run check
 
 ## 交互入口：mini
 
-`demo` 用于单次复现与自动化验证；`mini` 是轻量交互入口。它使用 Pi 的 `@mariozechner/pi-tui` 进行差量渲染和多行输入编辑，启动后进入备用终端屏幕：顶部显示模型、权限和工作区，中部保留对话，底部固定编辑器与状态栏。它保留最近 6 轮的“用户任务 + 最终回答”上下文，不会把工具原文跨轮塞回模型；每个新任务仍独立执行工具、生成审计终态并重新校验源码证据。
+`demo` 用于单次复现与自动化验证；`mini` 是轻量交互入口。它使用 Pi 的 `@mariozechner/pi-tui` 进行差量渲染和多行输入编辑，并直接使用当前终端缓冲区：顶部显示模型、权限和工作区，中部保留对话，底部显示编辑器与状态栏；鼠标滚轮或终端滚动条可以回看历史。它保留最近 6 轮的“用户任务 + 最终回答”模型上下文，不会把工具原文跨轮塞回模型；每个新任务仍独立执行工具、生成审计终态并重新校验源码证据。
 
 ```powershell
 cd C:\Users\CX10\Desktop\minicode
 cmd.exe /d /c npm run mini
 ```
 
-工具调用在主屏默认折叠为简短状态；按 `Ctrl+O` 或输入 `/details` 可展开最近的生命周期事件。`Ctrl+V` 会读取 Windows 系统剪贴板中的文本并插入输入框，输入内容不会写入审计；超过 32,000 字符时拒绝插入。可用命令：`/help`、`/model [profile]`、`/status`、`/clear`、`/details`、`/exit`。`Ctrl+C` 在空闲时退出；执行中的任务不会被静默中断。
+工具调用在主屏默认折叠为简短状态；按 `Ctrl+O` 或输入 `/details` 可展开最近的生命周期事件。滚轮浏览由 VS Code Terminal、Windows Terminal 等宿主终端的原生历史提供，不会占用编辑器的 `PageUp`、`PageDown`、`Home` 或 `End`。`Ctrl+V` 会读取 Windows 系统剪贴板中的文本并插入输入框，输入内容不会写入审计；超过 32,000 字符时拒绝插入。可用命令：`/help`、`/model [profile]`、`/status`、`/clear`、`/details`、`/exit`。`/clear` 会清空会话上下文和当前终端历史，但不会删除审计；`Ctrl+C` 在空闲时退出，执行中的任务不会被静默中断。
 
 默认启动的 `FakeModel` 只用于可重复的离线演示，不理解自由任务，也不会自主修改代码。要运行真实 Agent，须显式选择一个已配置的网络 Profile。默认是只读模式：
 
@@ -71,7 +71,9 @@ cmd.exe /d /c npm run mini -- --model deepseek --mode edit --workspace .
 
 若只想离线验收这一阶段的通用命令面板，可运行 `cmd.exe /d /c npm run mini -- --mode edit --workspace .`，输入“请查看 npm --version 并汇报”。`FakeModel` 只会为这条确定性演示选择 `run_command`；确认前不会启动进程。
 
-编辑模式额外开放 `apply_patch`、固定的 `run_project_check` 和结构化的 `run_command`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；输入 `CANCEL` 才会取消，其他输入既不会写入，也会保留待确认补丁。验证优先使用只接受 `test`/`check` 的固定工具；固定动作无法覆盖时，模型才可提供 Node/npm 程序名、分离的参数数组和工作区相对目录。TUI 会完整展示命令、绝对工作目录和风险等级，只有精确输入 `RUN` 才启动进程，`CANCEL` 会产生零执行的错误终态。`APPLY`、`CONTINUE`、`RUN`、`CANCEL` 都是本地控制词，在没有对应待确认操作时不会发给模型。当前不开放 Shell、管道、重定向、Git、提权、后台任务或环境变量注入。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次；`--require-source-evidence` 是只读取证模式，不能与 `--mode edit` 同时使用。
+若要离线验收 Git 只读闭环，可在普通模式输入“请查看 Git status 和未暂存 diff 并汇报”。`FakeModel` 会依次选择 `inspect_git` 的固定动作；该工具不需要 `RUN`，也不会暂存、提交或切换分支。
+
+编辑模式额外开放 `apply_patch`、固定的 `run_project_check` 和结构化的 `run_command`；普通 read/edit 模式都开放 `inspect_git`，严格源码取证模式仍只注册 `search_text` 与 `read_file`。模型必须先通过 `read_file` 成功读取补丁目标；之后才能提出一次精确文本替换。TUI 会显示 diff 并暂停，只有用户在输入框中准确输入 `APPLY` 后才原子写入；输入 `CANCEL` 才会取消，其他输入既不会写入，也会保留待确认补丁。验证优先使用只接受 `test`/`check` 的固定工具；固定动作无法覆盖时，模型才可提供 Node/npm 程序名、分离的参数数组和工作区相对目录。TUI 会完整展示命令、绝对工作目录和风险等级，只有精确输入 `RUN` 才启动进程，`CANCEL` 会产生零执行的错误终态。`APPLY`、`CONTINUE`、`RUN`、`CANCEL` 都是本地控制词，在没有对应待确认操作时不会发给模型。`run_command` 不开放 Shell、管道、重定向、Git、提权、后台任务或环境变量注入；Git 只能通过专用工具读取固定状态与差异。编辑模式每轮只受理一个工具调用、每个任务最多受理 6 次，并保留第 7 个模型执行轮用于六次工具后的最终总结；`--require-source-evidence` 不能与 `--mode edit` 同时使用。
 
 ### 可复位编辑冒烟测试
 
@@ -116,11 +118,11 @@ $env:DEEPSEEK_API_KEY = "在此设置你的密钥"
 cmd.exe /d /c npm run demo -- --model deepseek --workspace . "解释当前 AgentLoop 的工具错误终态"
 ```
 
-适配器使用官方 `https://api.deepseek.com/chat/completions` 接口、非流式调用和非思考模式；单次请求最多生成 2,048 tokens，并在 30 秒后超时。模型得到系统提示、用户任务、已注册工具的 JSON Schema，以及当前会话中的工具结果。默认只读模式能够外发的是项目概览、目录列表、搜索结果和源码片段；显式启用编辑模式后，补丁参数和获准进程的输出也会进入当前模型会话。不要在不信任工作区或含敏感内容的任务中启用该模式。API Key 只从环境变量读取，绝不写入审计、报告或仓库。
+适配器使用官方 `https://api.deepseek.com/chat/completions` 接口、非流式调用和非思考模式；单次请求最多生成 2,048 tokens，并在 30 秒后超时。模型得到系统提示、用户任务、已注册工具的 JSON Schema，以及当前会话中的工具结果。普通只读模式能够外发项目概览、目录列表、搜索结果、源码片段，以及被请求的 Git 分支、文件路径、status 和 diff 正文；严格源码取证模式不开放 Git。显式启用编辑模式后，补丁参数和获准进程的输出也会进入当前模型会话。不要在不信任工作区或含敏感内容的任务中启用网络 Profile。API Key 只从环境变量读取，绝不写入审计、报告或仓库。
 
-DeepSeek 模式默认只暴露 `get_project_overview`、`list_files`、`search_text` 和 `read_file`；只有显式传入 `--mode edit` 才增加 `apply_patch`、`run_project_check` 和 `run_command`。每个工具调用会先在本地注册表按名称查找：未知工具直接成为标准错误终态；仅已找到的工具才会进入 JSON 与 Schema 的 `validate`。DeepSeek 官方文档说明该 API 使用 OpenAI 兼容格式，工具调用结果需要由客户端执行后回传。[官方快速开始](https://api-docs.deepseek.com/) [官方工具调用文档](https://api-docs.deepseek.com/guides/tool_calls)
+DeepSeek 普通只读模式默认暴露 `get_project_overview`、`list_files`、`search_text`、`read_file` 和 `inspect_git`；只有显式传入 `--mode edit` 才增加 `apply_patch`、`run_project_check` 和 `run_command`，严格 `--require-source-evidence` 模式则仍只注册 `search_text` 与 `read_file`。每个工具调用会先在本地注册表按名称查找：未知工具直接成为标准错误终态；仅已找到的工具才会进入 JSON 与 Schema 的 `validate`。DeepSeek 官方文档说明该 API 使用 OpenAI 兼容格式，工具调用结果需要由客户端执行后回传。[官方快速开始](https://api-docs.deepseek.com/) [官方工具调用文档](https://api-docs.deepseek.com/guides/tool_calls)
 
-真实模型可能持续请求更多证据而不自行结束。为控制这一类不收敛行为，DeepSeek 模式有专用提示词，并限制每个模型轮次最多受理 2 个工具调用、每个任务最多受理 6 个。超出的调用不会执行，但仍会得到 `tool_call -> tool_finalized(error)` 的完整终态和标准错误结果，模型可据此收敛；`maxSteps=6` 保留为最后一道循环保护。这些限制约束成本和执行范围，不能保证任何模型一定给出正确答案。
+真实模型可能持续请求更多证据而不自行结束。为控制这一类不收敛行为，DeepSeek 模式有专用提示词，并限制每个模型轮次最多受理 2 个工具调用、每个任务最多受理 6 个。超出的调用不会执行，但仍会得到 `tool_call -> tool_finalized(error)` 的完整终态和标准错误结果，模型可据此收敛；普通只读模式保留 `maxSteps=6`。编辑模式允许第 7 个执行轮；六次工具预算用尽后，该轮不再向模型提供工具，只接受最终总结，继续请求工具会明确停止。这些限制约束成本和执行范围，不能保证任何模型一定给出正确答案。
 
 2026-08-10 的第一次真实 DeepSeek 冒烟测试复现了这个问题：模型在 6 个轮次中成功完成 15 次只读侦察，但没有返回最终答案，运行时因 `maxSteps=6` 主动停止。随后加入上述收敛提示词与工具预算，并通过本地 24 项自动化测试；本次修复尚未进行第二次真实 API 验证，因此不能据此声称真实模型已经稳定收敛。
 
@@ -146,6 +148,10 @@ cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问
 
 `run_command` 使用相同的 `RUN` / `CANCEL` 闭锁链，但策略在确认面板出现前执行。未知程序、Git/直接 Shell/提权入口、Node 的 eval/print/预加载与其他运行时选项，以及 npm 的全局、发布、版本、账号、配置和动态执行动作会直接拒绝。Node 只允许版本/帮助查询，或把工作目录中已存在且真实路径仍位于工作区内的脚本作为第一个参数；npm 只允许查询、工作区脚本和明确的依赖动作。`cwd` 必须是工作区内已存在的相对目录，并经过真实路径校验；MiniCode 始终把程序和参数分离传给 `spawn(..., shell: false)`，但 npm/工作区脚本自身仍可能启动 Shell。Windows 下 Node 固定解析为当前 `process.execPath`，npm 固定解析为本机 `npm-cli.js`，不会退回 `npm.cmd` 或 `cmd /c`。子进程只继承基础系统环境，不继承 API Key、token、secret 等任意项目凭据变量；审计只保存 action、风险等级、确认决定与结果统计，不保存命令、参数、绝对目录、输出或环境变量。
 
+`inspect_git` 与 `run_command` 分离，只接受 `status`、`diff`、`staged_diff` 三个枚举动作，不接收路径、参数或命令字符串。它固定检查工作区根目录中的普通 `.git` 目录，第一版拒绝父级仓库、bare repo 与 linked worktree；Git 必须为 2.45 或更高版本，并解析为工作区外的绝对普通可执行文件。执行使用 `shell: false`，同时关闭 pager、颜色、可选锁、fsmonitor、外部 diff、textconv、submodule 递归和 partial-clone lazy fetch。系统与用户级 Git 配置不会原样传入；工具只投影经过枚举校验的 `core.autocrlf`、`core.eol`、`core.safecrlf`，以避免 Windows 换行策略制造假修改。仓库 include/includeIf、外部 object alternates，以及可能启动进程的 filter/diff driver 会在主检查前闭锁；外部 attributes/excludes 文件被固定禁用。所有层级的 `.env`、`.env.*`、`node_modules` 和 `.git` 都通过大小写不敏感的固定 pathspec 从 status/diff 结果中排除。
+
+这项能力是“可信仓库中的收窄只读检查”，不是 Git 沙箱。它不会调用 `add`、`commit`、`checkout`、`reset`、`push` 等写操作，`GIT_OPTIONAL_LOCKS=0` 和 `--no-optional-locks` 也会阻止 status 顺带刷新索引；但 Git 仍需读取仓库自身的对象和配置。输出最多保留 12,000 个字符，审计只保存动作、退出码、耗时、输出长度、截断与超时标记，不保存分支名、文件名、diff、绝对目录或底层错误正文。自动化回归会比较检查前后的 HEAD、分支和 index，提交仍完全由用户手动完成。
+
 这仍不是安全沙箱：获准的 Node/npm 脚本可以修改工作区或其他可访问路径、访问网络、执行 Git 或启动子进程；工作目录策略不能限制子进程的全部文件访问。超时后会在 Windows 调用固定的 `taskkill /T /F`，在 POSIX 尝试终止独立进程组，并保留直接子进程回退与最终返回上限；宿主权限或脱离进程树的后代仍可能让清理不完整。因此它的产品边界是“可信工作区 + 完整展示 + 逐次确认 + 防止直接误用”，而不是运行不可信代码。
 
 ## 当前取舍
@@ -156,4 +162,4 @@ cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问
 - 不开放任意文件写入：补丁只能对唯一旧文本做替换，默认预览，写入必须人工确认。
 - 不开放通用 Shell：编辑模式只允许结构化的 Node/npm 子集，不解析命令字符串、管道或重定向；每次执行仍必须经本地 `RUN` 确认。
 - 不把 Working Ledger 当长期记忆：它只保存这一轮任务中由工具确认的事实。
-- 不读取受保护路径：`.git`、`node_modules`、`.env` 和 `.env.*` 不会出现在目录、搜索或读取结果中。
+- 不读取受保护内容：`.git`、`node_modules`、`.env` 和 `.env.*` 不会出现在目录、搜索、文件读取或 Git status/diff 的实际结果中；Git 面板中的策略说明只列出这些通用规则名称。

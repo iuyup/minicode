@@ -375,3 +375,48 @@ test("a total tool-call budget rejects calls after the budget is consumed", asyn
     },
   );
 });
+
+test("a final-only budget turn exposes no tools and rejects another tool request", async () => {
+  let modelCallCount = 0;
+  let executionCount = 0;
+  const countingTool: AgentTool<JsonValue> = {
+    ...emptyTool,
+    async execute() {
+      executionCount += 1;
+      return "confirmed-final-budget";
+    },
+  };
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        assert.equal(request.tools.length, 1);
+        return {
+          kind: "tool_calls",
+          content: "Inspect the final fact.",
+          toolCalls: [{ id: "final-budget-1", name: "inspect", input: {} }],
+        };
+      }
+
+      assert.deepEqual(request.tools, []);
+      return {
+        kind: "tool_calls",
+        content: "Try one more tool even though only a summary is allowed.",
+        toolCalls: [{ id: "final-budget-2", name: "inspect", input: {} }],
+      };
+    },
+  };
+
+  await assert.rejects(
+    new AgentLoop(model, new ToolRegistry([countingTool]), {
+      workspaceRoot: process.cwd(),
+      maxSteps: 2,
+      maxToolCalls: 1,
+      finalOnlyAfterToolBudget: true,
+    }).run("Inspect and then summarize."),
+    /工具预算已耗尽，本轮只能给出最终回答/,
+  );
+
+  assert.equal(modelCallCount, 2);
+  assert.equal(executionCount, 1);
+});

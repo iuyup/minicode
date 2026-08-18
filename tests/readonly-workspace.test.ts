@@ -24,6 +24,7 @@ async function createWorkspace(): Promise<string> {
   );
   await fs.writeFile(path.join(workspace, "README.md"), "公开说明\n");
   await fs.writeFile(path.join(workspace, ".env"), "SECRET=must-not-be-read\n");
+  await fs.writeFile(path.join(workspace, "src", ".Env.Local"), "NESTED_SECRET=must-not-be-searched\n");
   await fs.writeFile(path.join(workspace, "long.txt"), Array.from({ length: 100 }, (_, index) => `line-${index + 1}`).join("\n"));
   return workspace;
 }
@@ -38,10 +39,13 @@ test("只读工具只返回工作区中的可见文本证据，并限制输出�
     const listed = await listFiles.execute({}, context(workspace));
     assert.match(listed, /目录 src/);
     assert.match(listed, /文件 README.md/);
-    assert.doesNotMatch(listed, /node_modules|\.git|\.env/);
+    assert.doesNotMatch(listed, /node_modules|\.git|\.env/i);
 
     const searched = await searchText.execute({ query: "needle", path: "src" }, context(workspace));
     assert.match(searched, /src\/example.ts:2: export const needle/);
+    const protectedSearch = await searchText.execute({ query: "must-not-be-searched", path: "src" }, context(workspace));
+    assert.match(protectedSearch, /未找到匹配/);
+    assert.doesNotMatch(protectedSearch, /NESTED_SECRET|\.Env\.Local/);
 
     const read = await readFile.execute({ path: "src/example.ts", startLine: 2, endLine: 2 }, context(workspace));
     assert.match(read.content, /src\/example.ts:2 \| export const needle = 'confirmed';/);
@@ -64,6 +68,8 @@ test("越界和受保护文件会变成标准化错误终态，而不是被读�
       /路径越出了工作区/,
     );
     await assert.rejects(readFile.execute({ path: ".env" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: ".ENV" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: "src/.Env.Local" }, context(workspace)), /目标路径受保护/);
 
     let callCount = 0;
     const model: ChatModel = {

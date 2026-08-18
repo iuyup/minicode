@@ -12,6 +12,7 @@ import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { createMiniTui, MiniTuiApp } from "../src/mini.ts";
 import { parseArguments } from "../src/runtime.ts";
 import { applyPatch } from "../src/tools/apply-patch.ts";
+import { createInspectGitTool, type GitRunner } from "../src/tools/inspect-git.ts";
 import {
   createRunProjectCheckTool,
   type ProjectCheckRunResult,
@@ -25,13 +26,15 @@ import {
 
 class FakeTerminal implements Terminal {
   #onInput?: (data: string) => void;
+  #onResize?: () => void;
   output = "";
   columns = 100;
   rows = 32;
   kittyProtocolActive = false;
 
-  start(onInput: (data: string) => void): void {
+  start(onInput: (data: string) => void, onResize: () => void): void {
     this.#onInput = onInput;
+    this.#onResize = onResize;
   }
 
   stop(): void {}
@@ -49,6 +52,12 @@ class FakeTerminal implements Terminal {
   send(data: string): void {
     this.#onInput?.(data);
   }
+
+  resize(columns: number, rows: number): void {
+    this.columns = columns;
+    this.rows = rows;
+    this.#onResize?.();
+  }
 }
 
 function stripAnsi(value: string): string {
@@ -65,6 +74,60 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+test("mini 使用普通终端历史，不进入备用屏幕或开启鼠标捕获", async () => {
+  const source = await fs.readFile(new URL("../src/mini.ts", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /\?1049[hl]/u);
+  assert.doesNotMatch(source, /\?100[0236]h/u);
+});
+
+test("长会话保持原生 scrollback，clear 才显式清除当前终端历史", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-scrollback-"));
+  const terminal = new FakeTerminal();
+  terminal.rows = 12;
+  let modelCalls = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCalls += 1;
+      return {
+        kind: "final",
+        content: Array.from({ length: 24 }, (_, index) => `历史回答 ${modelCalls}-${index + 1}`).join("\n"),
+      };
+    },
+  };
+  const options = parseArguments(["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")]);
+  const app = new MiniTuiApp(
+    options,
+    terminal,
+    new AgentLoop(model, new ToolRegistry([]), { workspaceRoot: process.cwd() }),
+  );
+  try {
+    app.start();
+    await app.submit("第一轮长回答");
+    await waitFor(() => stripAnsi(terminal.output).includes("历史回答 1-24"));
+
+    terminal.output = "";
+    await app.submit("第二轮长回答");
+    await waitFor(() => stripAnsi(terminal.output).includes("历史回答 2-24"));
+    assert.doesNotMatch(terminal.output, /\u001B\[3J/u);
+
+    terminal.resize(88, 20);
+    await waitFor(() => terminal.output.includes("\u001B[3J"));
+    assert.equal(app.contextTurns, 2);
+
+    terminal.output = "";
+    await app.submit("/clear");
+    await waitFor(() => terminal.output.includes("\u001B[3J"));
+    const clearedOutput = stripAnsi(terminal.output);
+    assert.match(clearedOutput, /已清空会话上下文/);
+    assert.doesNotMatch(clearedOutput, /历史回答 1-|历史回答 2-/);
+    assert.equal(app.contextTurns, 0);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
 
 test("mini TUI renders compact lifecycle feedback and keeps tool details collapsed by default", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-tui-"));
@@ -405,6 +468,71 @@ test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () =>
     assert.match(stripAnsi(terminal.output), /受控命令已确认并完成/);
   } finally {
     app?.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("只读 Git 检查在 TUI 中直接执行，不进入 RUN 确认状态", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-git-"));
+  await fs.mkdir(path.join(workspace, ".git"));
+  const terminal = new FakeTerminal();
+  let modelCalls = 0;
+  let mainCalls = 0;
+  let approvalCalls = 0;
+  const runner: GitRunner = {
+    async run(request) {
+      const result = (output: string, exitCode: number | null = 0) => ({
+        exitCode,
+        durationMs: 3,
+        output,
+        outputLength: output.length,
+        outputTruncated: false,
+        timedOut: false,
+      });
+      if (request.args.length === 1 && request.args[0] === "--version") return result("git version 2.55.0\n");
+      if (request.args.includes("rev-parse")) return result(`${workspace}\n`);
+      if (request.args.includes("config")) return result("", 1);
+      mainCalls += 1;
+      return result("## main\n M src/example.ts\n");
+    },
+  };
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        return {
+          kind: "tool_calls",
+          content: "读取固定 Git 状态。",
+          toolCalls: [{ id: "git-status-1", name: "inspect_git", input: { action: "status" } }],
+        };
+      }
+      const lastMessage = request.messages.at(-1);
+      assert.equal(lastMessage?.role, "tool");
+      assert.equal(lastMessage?.role === "tool" ? lastMessage.status : undefined, "success");
+      return { kind: "final", content: "Git 状态已读取；没有执行暂存或提交。" };
+    },
+  };
+  const options = parseArguments(["--workspace", workspace, "--audit", path.join(workspace, "audit.jsonl")]);
+  const agent = new AgentLoop(model, new ToolRegistry([createInspectGitTool(runner)]), {
+    workspaceRoot: workspace,
+    requestCommandApproval: async () => {
+      approvalCalls += 1;
+      return true;
+    },
+  });
+  const app = new MiniTuiApp(options, terminal, agent);
+  try {
+    app.start();
+    await app.submit("查看 Git 状态");
+    await waitFor(() => stripAnsi(terminal.output).includes("Git 状态已读取"));
+    assert.equal(mainCalls, 1);
+    assert.equal(approvalCalls, 0);
+    assert.equal(app.awaitingCommandApproval, false);
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /Git 状态已读取；没有执行暂存或提交/);
+    assert.doesNotMatch(output, /待确认命令|等待确认：RUN \/ CANCEL/);
+  } finally {
+    app.stop();
     await fs.rm(workspace, { recursive: true, force: true });
   }
 });
