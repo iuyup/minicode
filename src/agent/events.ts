@@ -11,7 +11,25 @@ export type AgentEvent =
   | { type: "model_requested"; step: number; forcedToolName?: string }
   | { type: "plan_proposed"; step: number; planLength: number }
   | { type: "plan_decision"; step: number; decision: "approved" | "rejected" }
+  | { type: "repair_proposed"; step: number; directionLength: number }
+  | { type: "repair_decision"; step: number; decision: "approved" | "rejected" }
   | { type: "tool_call"; step: number; toolCallId: string; toolName: string }
+  | {
+      type: "edit_approval_requested";
+      step: number;
+      toolCallId: string;
+      toolName: string;
+      path: string;
+      previewLength: number;
+    }
+  | {
+      type: "edit_approval_decision";
+      step: number;
+      toolCallId: string;
+      toolName: string;
+      path: string;
+      decision: "approved" | "rejected";
+    }
   | {
       type: "command_approval_requested";
       step: number;
@@ -80,6 +98,8 @@ interface SanitizedAuditEvent {
   toolName?: string;
   decision?: "allowed" | "blocked";
   planDecision?: "approved" | "rejected";
+  repairDecision?: "approved" | "rejected";
+  editDecision?: "approved" | "rejected";
   commandDecision?: "approved" | "rejected";
   commandKind?: CommandApprovalKind;
   riskLevel?: CommandRiskLevel;
@@ -96,6 +116,9 @@ interface SanitizedAuditEvent {
   sourceEvidenceCount?: number;
   forcedToolName?: string;
   planLength?: number;
+  directionLength?: number;
+  previewLength?: number;
+  cancelled?: boolean;
 }
 
 function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExecutionMetadata | undefined {
@@ -111,6 +134,7 @@ function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExec
   if (metadata.outputLength !== undefined) sanitized.outputLength = metadata.outputLength;
   if (metadata.outputTruncated !== undefined) sanitized.outputTruncated = metadata.outputTruncated;
   if (metadata.timedOut !== undefined) sanitized.timedOut = metadata.timedOut;
+  if (metadata.cancelled !== undefined) sanitized.cancelled = metadata.cancelled;
   return sanitized;
 }
 
@@ -120,6 +144,22 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
     case "tool_call":
     case "tool_execution_started":
       return { ...base, toolCallId: event.toolCallId, toolName: event.toolName };
+    case "edit_approval_requested":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        path: event.path,
+        previewLength: event.previewLength,
+      };
+    case "edit_approval_decision":
+      return {
+        ...base,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        path: event.path,
+        editDecision: event.decision,
+      };
     case "command_approval_requested":
       return {
         ...base,
@@ -169,6 +209,10 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
       return { ...base, planLength: event.planLength };
     case "plan_decision":
       return { ...base, planDecision: event.decision };
+    case "repair_proposed":
+      return { ...base, directionLength: event.directionLength };
+    case "repair_decision":
+      return { ...base, repairDecision: event.decision };
     case "agent_completed":
     case "agent_stopped":
       return base;
@@ -180,6 +224,7 @@ function sanitize(event: AgentEvent): SanitizedAuditEvent {
  */
 export class JsonlAuditLog implements AgentEventAuditLog {
   readonly #pending: AgentEvent[] = [];
+  #flushChain: Promise<void> = Promise.resolve();
   readonly filePath: string;
 
   constructor(filePath: string) {
@@ -190,15 +235,21 @@ export class JsonlAuditLog implements AgentEventAuditLog {
     this.#pending.push(event);
   }
 
-  async flush(): Promise<void> {
-    if (this.#pending.length === 0) {
-      return;
-    }
+  flush(): Promise<void> {
+    const operation = this.#flushChain.then(async () => {
+      if (this.#pending.length === 0) return;
 
-    const events = [...this.#pending];
-    const output = `${events.map((event) => JSON.stringify(sanitize(event))).join("\n")}\n`;
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    await fs.appendFile(this.filePath, output, "utf8");
-    this.#pending.splice(0, events.length);
+      const events = this.#pending.splice(0, this.#pending.length);
+      const output = `${events.map((event) => JSON.stringify(sanitize(event))).join("\n")}\n`;
+      try {
+        await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+        await fs.appendFile(this.filePath, output, "utf8");
+      } catch (error) {
+        this.#pending.unshift(...events);
+        throw error;
+      }
+    });
+    this.#flushChain = operation.catch(() => {});
+    return operation;
   }
 }

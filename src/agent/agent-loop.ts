@@ -6,6 +6,7 @@ import type {
   ConversationMessage,
   EditApprovalRequest,
   PlanApprovalRequest,
+  RepairApprovalRequest,
   JsonValue,
   ModelResponse,
   ToolCall,
@@ -30,6 +31,7 @@ export interface AgentRunResult {
 
 export interface AgentRunOptions {
   conversationHistory?: readonly ConversationMessage[];
+  signal?: AbortSignal;
 }
 
 export interface AgentLoopOptions {
@@ -44,10 +46,15 @@ export interface AgentLoopOptions {
   requireReadBeforeEdit?: boolean;
   /** 在工具执行前要求模型先给出计划，并等待本地人工确认。 */
   requirePlanApproval?: boolean;
+  /** 仅在 planning 模型请求中附加，不写入后续消息历史。 */
+  planningPrompt?: string;
+  /** 固定验证真实失败后，最多允许一次经人工确认的修复循环。 */
+  enableFailureRepair?: boolean;
   systemPrompt?: string;
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
+  requestRepairApproval?: (request: RepairApprovalRequest) => Promise<boolean>;
   requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
   auditLog?: AgentEventAuditLog;
   /**
@@ -65,6 +72,31 @@ const DEFAULT_SYSTEM_PROMPT = [
 const MAX_FINAL_ANSWER_REPAIRS = 1;
 const MAX_SOURCE_EVIDENCE_READS = 2;
 const MAX_SOURCE_EVIDENCE_SEARCHES_BEFORE_READ = 2;
+const MAX_FAILURE_REPAIR_TOOL_CALLS = 3;
+const MAX_POST_REPAIR_GIT_TOOL_CALLS = 2;
+
+type FailureRepairState = "idle" | "planning" | "executing" | "post_repair" | "completed" | "final_only";
+
+const FAILURE_REPAIR_DIRECTION_PROMPT = [
+  "固定验证已真实执行并失败。下一轮是无工具的修复方向阶段。",
+  "请基于最近的验证结果，只给出一份简短修复方向：失败原因判断、拟修改文件和复验动作。",
+  "不要调用工具，不要声称已经修复；用户确认后才会恢复工具。",
+].join(" ");
+
+const FAILURE_REPAIR_EXHAUSTED_PROMPT = [
+  "一次修复后的固定验证仍然失败，修复额度已用尽。",
+  "下一轮不得调用工具；请基于已有证据总结当前未完成状态、最近验证结果和建议用户检查的事项。",
+].join(" ");
+
+const FAILURE_REPAIR_INCOMPLETE_PROMPT = [
+  "一次修复的工具额度已用尽，或复验未成功执行；不得继续修改或再次运行验证。",
+  "下一轮不得调用工具；请基于已有证据总结当前未完成状态和建议用户检查的事项。",
+].join(" ");
+
+const FAILURE_REPAIR_MISSING_PATCH_PROMPT = [
+  "固定验证重跑已经通过，但本次修复阶段没有成功应用补丁，不能据此声称修复完成。",
+  "下一轮不得继续修改或运行验证；请如实总结当前未完成状态，并提示用户检查是否存在偶发测试或外部状态变化。",
+].join(" ");
 
 type SourceEvidenceRejectionReason =
   | "missing_read_file_evidence"
@@ -74,8 +106,6 @@ type SourceEvidenceRejectionReason =
 type SourceEvidenceValidation =
   | { ok: true }
   | { ok: false; reason: SourceEvidenceRejectionReason };
-
-const SOURCE_CITATION_PATTERN = /((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:[cm]?[jt]sx?|json|md)):(\d+)(?:-(\d+))?(?=$|[\s`)\]，,.;:!?；。])/gm;
 
 function normalizePositiveLimit(value: number | undefined, optionName: string): number {
   if (value === undefined) {
@@ -87,21 +117,79 @@ function normalizePositiveLimit(value: number | undefined, optionName: string): 
   return value;
 }
 
+function addToLimit(value: number, increment: number): number {
+  if (value === Number.MAX_SAFE_INTEGER) return value;
+  return Math.min(Number.MAX_SAFE_INTEGER, value + increment);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+interface SourceCitation {
+  path: string;
+  startLine: number;
+  endLine: number;
+}
+
+function citationsForEvidence(answer: string, evidence: SourceEvidence): SourceCitation[] {
+  const citationPattern = new RegExp(
+    `(?<![\\p{L}\\p{N}_.\\-/\\\\])${escapeRegExp(evidence.path)}:(\\d+)(?:-(\\d+))?(?=$|[\\s\`)\\]，,.;:!?；。])`,
+    "gu",
+  );
+  return Array.from(answer.matchAll(citationPattern), (match) => ({
+    path: evidence.path,
+    startLine: Number(match[1]),
+    endLine: Number(match[2] ?? match[1]),
+  }));
+}
+
+function citationLikeCandidates(answer: string, sourceEvidence: readonly SourceEvidence[]): SourceCitation[] {
+  const candidates: SourceCitation[] = [];
+  const inlineCodeRanges: Array<{ start: number; end: number }> = [];
+  const inlineCodeCitationPattern = /`([^`\r\n]+):(\d+)(?:-(\d+))?`/gu;
+  const compactCitationPattern = /(?<![\p{L}\p{N}_.\-/\\])([\p{L}\p{N}_./\\-]+\.[\p{L}\p{N}_-]+):(\d+)(?:-(\d+))?(?=$|[\s`)\]，,.;:!?；。])/gu;
+  for (const match of answer.matchAll(inlineCodeCitationPattern)) {
+    inlineCodeRanges.push({ start: match.index, end: match.index + match[0].length });
+    if (!/[./\\]/u.test(match[1])) continue;
+    candidates.push({
+      path: match[1],
+      startLine: Number(match[2]),
+      endLine: Number(match[3] ?? match[2]),
+    });
+  }
+  for (const match of answer.matchAll(compactCitationPattern)) {
+    const matchStart = match.index;
+    const matchEnd = matchStart + match[0].length;
+    if (inlineCodeRanges.some((range) => matchStart >= range.start && matchEnd <= range.end)) continue;
+    const lineSuffix = `${match[2]}${match[3] ? `-${match[3]}` : ""}`;
+    const isSuffixOfKnownSpacedPath = sourceEvidence.some((evidence) => {
+      if (!evidence.path.endsWith(match[1])) return false;
+      const fullCitation = `${evidence.path}:${lineSuffix}`;
+      return answer.slice(matchEnd - fullCitation.length, matchEnd) === fullCitation;
+    });
+    if (isSuffixOfKnownSpacedPath) continue;
+    candidates.push({
+      path: match[1],
+      startLine: Number(match[2]),
+      endLine: Number(match[3] ?? match[2]),
+    });
+  }
+  return candidates;
+}
+
 function validateSourceEvidence(answer: string, sourceEvidence: readonly SourceEvidence[]): SourceEvidenceValidation {
   if (sourceEvidence.length === 0) {
     return { ok: false, reason: "missing_read_file_evidence" };
   }
 
-  const citations = Array.from(answer.matchAll(SOURCE_CITATION_PATTERN), (match) => ({
-    path: match[1],
-    startLine: Number(match[2]),
-    endLine: Number(match[3] ?? match[2]),
-  }));
+  const citations = sourceEvidence.flatMap((evidence) => citationsForEvidence(answer, evidence));
   if (citations.length === 0) {
     return { ok: false, reason: "missing_source_citation" };
   }
 
-  const areAllCitationsVerified = citations.every((citation) => sourceEvidence.some(
+  const allCitationCandidates = [...citations, ...citationLikeCandidates(answer, sourceEvidence)];
+  const areAllCitationsVerified = allCitationCandidates.every((citation) => sourceEvidence.some(
     (evidence) =>
       evidence.path === citation.path &&
       citation.startLine <= citation.endLine &&
@@ -111,6 +199,29 @@ function validateSourceEvidence(answer: string, sourceEvidence: readonly SourceE
   return areAllCitationsVerified
     ? { ok: true }
     : { ok: false, reason: "unverified_source_citation" };
+}
+
+function cancellationReason(): string {
+  return "任务已取消，未继续调用模型、执行工具或修改文件。";
+}
+
+function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) return Promise.reject(new Error(cancellationReason()));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error(cancellationReason()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function formatSourceEvidence(sourceEvidence: readonly SourceEvidence[]): string {
@@ -170,6 +281,19 @@ function patchTargetPath(toolCall: ToolCall): string | undefined {
   return typeof value === "string" ? normalizeWorkspacePath(value) : undefined;
 }
 
+function isExecutedProjectCheckFailure(result: ToolResultMessage): boolean {
+  if (result.name !== "run_project_check" || result.status !== "error") return false;
+  return result.metadata?.timedOut === true ||
+    (typeof result.metadata?.exitCode === "number" && result.metadata.exitCode !== 0);
+}
+
+function isExecutedProjectCheckSuccess(result: ToolResultMessage): boolean {
+  return result.name === "run_project_check" &&
+    result.status === "success" &&
+    result.metadata?.timedOut === false &&
+    result.metadata.exitCode === 0;
+}
+
 export class AgentLoop {
   private readonly model: ChatModel;
   private readonly tools: ToolRegistry;
@@ -181,10 +305,13 @@ export class AgentLoop {
   readonly #requireSourceEvidence: boolean;
   readonly #requireReadBeforeEdit: boolean;
   readonly #requirePlanApproval: boolean;
+  readonly #planningPrompt?: string;
+  readonly #enableFailureRepair: boolean;
   readonly #systemPrompt: string;
   readonly #executionMode: ToolExecutionMode;
   readonly #requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   readonly #requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
+  readonly #requestRepairApproval?: (request: RepairApprovalRequest) => Promise<boolean>;
   readonly #requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
   readonly #auditLog?: AgentEventAuditLog;
   readonly #onEvent?: (event: AgentEvent) => void;
@@ -197,17 +324,20 @@ export class AgentLoop {
     this.model = model;
     this.tools = tools;
     this.#workspaceRoot = path.resolve(options.workspaceRoot);
-    this.#maxSteps = options.maxSteps ?? 6;
+    this.#maxSteps = normalizePositiveLimit(options.maxSteps ?? 6, "maxSteps");
     this.#maxToolCallsPerStep = normalizePositiveLimit(options.maxToolCallsPerStep, "maxToolCallsPerStep");
     this.#maxToolCalls = normalizePositiveLimit(options.maxToolCalls, "maxToolCalls");
     this.#finalOnlyAfterToolBudget = options.finalOnlyAfterToolBudget ?? false;
     this.#requireSourceEvidence = options.requireSourceEvidence ?? false;
     this.#requireReadBeforeEdit = options.requireReadBeforeEdit ?? false;
     this.#requirePlanApproval = options.requirePlanApproval ?? false;
+    this.#planningPrompt = options.planningPrompt;
+    this.#enableFailureRepair = options.enableFailureRepair ?? false;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#executionMode = options.executionMode ?? "propose";
     this.#requestEditApproval = options.requestEditApproval;
     this.#requestPlanApproval = options.requestPlanApproval;
+    this.#requestRepairApproval = options.requestRepairApproval;
     this.#requestCommandApproval = options.requestCommandApproval;
     this.#auditLog = options.auditLog;
     this.#onEvent = options.onEvent;
@@ -230,30 +360,56 @@ export class AgentLoop {
     let sourceSearchCallsBeforeEvidence = 0;
     let supplementalSourceSearchUsed = false;
     let planApprovalPending = this.#requirePlanApproval;
+    let repairState: FailureRepairState = "idle";
+    let repairToolCalls = 0;
+    let repairPatchUsed = false;
+    let repairPatchSucceeded = false;
+    let postRepairGitToolCalls = 0;
+    let failedRepairAction = "test";
     let maximumStep = this.#maxSteps;
+    let maximumToolCalls = this.#maxToolCalls;
     const sourceEvidence: SourceEvidence[] = [];
     const readPaths = new Set<string>();
 
     try {
       for (let step = 1; step <= maximumStep; step += 1) {
+        if (options.signal?.aborted) {
+          const reason = cancellationReason();
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          throw new Error(reason);
+        }
         const isSourceEvidenceRepairTurn = sourceEvidenceRepairPending;
         const isSourceEvidenceCompletionTurn = sourceEvidenceCompletionPending;
         sourceEvidenceRepairPending = false;
         sourceEvidenceCompletionPending = false;
         const isSourceEvidenceFinalTurn = isSourceEvidenceRepairTurn || isSourceEvidenceCompletionTurn;
         const isPlanningTurn = planApprovalPending;
-        const isToolBudgetFinalTurn = this.#finalOnlyAfterToolBudget && acceptedToolCalls >= this.#maxToolCalls;
-        const availableTools = isPlanningTurn || isSourceEvidenceFinalTurn || isToolBudgetFinalTurn
+        const isRepairPlanningTurn = repairState === "planning";
+        const isRepairFinalTurn = repairState === "final_only";
+        const isRepairCompletedTurn = repairState === "completed";
+        const isToolBudgetFinalTurn = this.#finalOnlyAfterToolBudget && acceptedToolCalls >= maximumToolCalls;
+        const baseAvailableTools = isPlanningTurn || isRepairPlanningTurn || isRepairFinalTurn || isRepairCompletedTurn ||
+          isSourceEvidenceFinalTurn || isToolBudgetFinalTurn
           ? []
           : this.getAvailableToolDescriptions(
               sourceEvidence,
               sourceSearchCallsBeforeEvidence,
               supplementalSourceSearchUsed,
             );
+        const availableTools = repairState === "executing"
+          ? baseAvailableTools.filter((tool) =>
+              tool.name === "read_file" ||
+              (tool.name === "apply_patch" && !repairPatchUsed) ||
+              tool.name === "run_project_check"
+            )
+          : repairState === "post_repair"
+            ? baseAvailableTools.filter((tool) => tool.name === "inspect_git")
+            : baseAvailableTools;
         const toolChoice = this.#requireSourceEvidence && availableTools.length === 1
           ? { type: "function" as const, name: availableTools[0].name }
           : undefined;
-        const allowedToolNames = this.#requireSourceEvidence
+        const allowedToolNames = this.#requireSourceEvidence ||
+            repairState === "executing" || repairState === "post_repair"
           ? new Set(availableTools.map((tool) => tool.name))
           : undefined;
         this.recordEvent(events, {
@@ -263,16 +419,119 @@ export class AgentLoop {
         });
         let response: ModelResponse;
         try {
-          response = await this.model.complete({
-            messages,
+          const requestMessages: AgentMessage[] = this.#planningPrompt && isPlanningTurn
+            ? [...messages, { role: "user", content: this.#planningPrompt }]
+            : [...messages];
+          response = await awaitWithAbort(this.model.complete({
+            messages: requestMessages,
             tools: availableTools,
             workingState: ledger.render(),
-            phase: isPlanningTurn ? "planning" : "execution",
+            phase: isPlanningTurn ? "planning" : isRepairPlanningTurn ? "repair_planning" : "execution",
             ...(toolChoice ? { toolChoice } : {}),
-          });
+          }, options.signal), options.signal);
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const reason = `模型请求失败：${message}`;
+          const reason = options.signal?.aborted
+            ? cancellationReason()
+            : `模型请求失败：${error instanceof Error ? error.message : String(error)}`;
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          throw new Error(reason);
+        }
+
+        const rejectToolResponse = (reason: string): void => {
+          if (response.kind !== "tool_calls") return;
+          messages.push({
+            role: "assistant",
+            content: response.content,
+            toolCalls: response.toolCalls,
+          });
+          for (const toolCall of response.toolCalls) {
+            messages.push(this.rejectToolCall(toolCall, step, events, reason));
+          }
+        };
+
+        if (isRepairPlanningTurn) {
+          if (response.kind !== "final") {
+            const reason = "修复方向阶段不允许调用工具；请先给出可供用户确认的简短修复方向。";
+            rejectToolResponse(reason);
+            this.recordEvent(events, { type: "agent_stopped", step, reason });
+            throw new Error(reason);
+          }
+
+          this.recordEvent(events, {
+            type: "repair_proposed",
+            step,
+            directionLength: response.content.length,
+          });
+          let approved = false;
+          let rejectionReason = "用户未确认修复方向，未继续修改文件或运行验证。";
+          if (options.signal?.aborted) {
+            rejectionReason = cancellationReason();
+          } else if (!this.#requestRepairApproval) {
+            rejectionReason = "未配置本地修复方向确认，未继续修改文件或运行验证。";
+          } else {
+            try {
+              approved = await this.#requestRepairApproval({
+                failedAction: failedRepairAction,
+                direction: response.content,
+                attempt: 1,
+                maximumAttempts: 1,
+              }) === true;
+            } catch {
+              rejectionReason = "本地修复方向确认不可用，未继续修改文件或运行验证。";
+            }
+          }
+          if (options.signal?.aborted) {
+            approved = false;
+            rejectionReason = cancellationReason();
+          }
+          this.recordEvent(events, {
+            type: "repair_decision",
+            step,
+            decision: approved ? "approved" : "rejected",
+          });
+          await this.#auditLog?.flush();
+          messages.push({ role: "assistant", content: response.content });
+          if (!approved) {
+            this.recordEvent(events, { type: "agent_stopped", step, reason: rejectionReason });
+            return {
+              answer: rejectionReason,
+              messages,
+              events: events.events,
+              workingState: ledger.render(),
+              sourceEvidence,
+            };
+          }
+          messages.push({
+            role: "user",
+            content: "修复方向已由用户确认。现在执行一次最小修复并复验；不得开启第二次修复循环。",
+          });
+          repairState = "executing";
+          continue;
+        }
+
+        if (isRepairFinalTurn) {
+          if (response.kind === "tool_calls") {
+            const reason = "一次修复复验仍失败，本轮只能总结未完成状态，不能继续请求工具。";
+            rejectToolResponse(reason);
+            this.recordEvent(events, { type: "agent_stopped", step, reason });
+            throw new Error(reason);
+          }
+
+          const reason = "一次有界修复未成功完成，任务以未完成状态停止。";
+          messages.push({ role: "assistant", content: response.content });
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          return {
+            answer: `${reason}\n\n${response.content}`,
+            messages,
+            events: events.events,
+            workingState: ledger.render(),
+            sourceEvidence,
+          };
+        }
+
+        if (isRepairCompletedTurn && response.kind === "tool_calls") {
+          const reason = "修复复验与 Git 收尾额度已经完成，本轮只能给出最终回答。";
+          rejectToolResponse(reason);
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
         }
@@ -281,12 +540,14 @@ export class AgentLoop {
           const reason = isSourceEvidenceRepairTurn
             ? "源码证据修复轮只能给出最终回答，不能请求工具。"
             : "源码取证已收集足够证据，本轮只能给出最终回答，不能请求工具。";
+          rejectToolResponse(reason);
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
         }
 
         if (isToolBudgetFinalTurn && response.kind === "tool_calls") {
           const reason = "工具预算已耗尽，本轮只能给出最终回答，不能继续请求工具。";
+          rejectToolResponse(reason);
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
         }
@@ -294,28 +555,39 @@ export class AgentLoop {
         if (isPlanningTurn) {
           if (response.kind !== "final") {
             const reason = "计划阶段不允许调用工具；请先给出可供用户确认的简短计划。";
+            rejectToolResponse(reason);
             this.recordEvent(events, { type: "agent_stopped", step, reason });
             throw new Error(reason);
           }
-          if (!this.#requestPlanApproval) {
-            const reason = "已启用计划确认，但没有可用的本地确认回调。";
-            this.recordEvent(events, { type: "agent_stopped", step, reason });
-            throw new Error(reason);
-          }
-
           this.recordEvent(events, { type: "plan_proposed", step, planLength: response.content.length });
-          const approved = await this.#requestPlanApproval({ plan: response.content });
+          let approved = false;
+          let rejectionReason = "用户未确认计划，未执行工具或修改文件。";
+          if (options.signal?.aborted) {
+            rejectionReason = cancellationReason();
+          } else if (!this.#requestPlanApproval) {
+            rejectionReason = "已启用计划确认，但没有可用的本地确认回调，未执行工具或修改文件。";
+          } else {
+            try {
+              approved = await this.#requestPlanApproval({ plan: response.content }) === true;
+              if (options.signal?.aborted) {
+                approved = false;
+                rejectionReason = cancellationReason();
+              }
+            } catch {
+              rejectionReason = "本地计划确认不可用，未执行工具或修改文件。";
+            }
+          }
           this.recordEvent(events, {
             type: "plan_decision",
             step,
             decision: approved ? "approved" : "rejected",
           });
+          await this.#auditLog?.flush();
           messages.push({ role: "assistant", content: response.content });
           if (!approved) {
-            const reason = "用户未确认计划，未执行工具或修改文件。";
-            this.recordEvent(events, { type: "agent_stopped", step, reason });
+            this.recordEvent(events, { type: "agent_stopped", step, reason: rejectionReason });
             return {
-              answer: reason,
+              answer: rejectionReason,
               messages,
               events: events.events,
               workingState: ledger.render(),
@@ -325,8 +597,21 @@ export class AgentLoop {
 
           messages.push({ role: "user", content: "计划已由用户确认。现在开始执行；仅在必要时调用已注册工具。" });
           planApprovalPending = false;
-          maximumStep += 1;
+          maximumStep = addToLimit(maximumStep, 1);
           continue;
+        }
+
+        if (repairState === "executing" && response.kind === "final") {
+          const reason = "修复尚未完成成功复验，任务以未完成状态停止。";
+          messages.push({ role: "assistant", content: response.content });
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          return {
+            answer: reason,
+            messages,
+            events: events.events,
+            workingState: ledger.render(),
+            sourceEvidence,
+          };
         }
 
         if (response.kind === "final") {
@@ -360,7 +645,7 @@ export class AgentLoop {
             sourceEvidenceRepairPending = true;
             if (step === maximumStep) {
               extraFinalOnlyTurnUsed = true;
-              maximumStep += 1;
+              maximumStep = addToLimit(maximumStep, 1);
             }
             messages.push({
               role: "user",
@@ -385,19 +670,42 @@ export class AgentLoop {
           toolCalls: response.toolCalls,
         });
 
+        let remainingToolCallBlockReason: string | undefined;
+        const deferredRuntimeMessages: string[] = [];
         for (const [toolCallIndex, toolCall] of response.toolCalls.entries()) {
-          const rejectionReason = this.getToolCallRejectionReason(
-            toolCall,
-            toolCallIndex,
-            acceptedToolCalls,
-            allowedToolNames,
-            readPaths,
+          const rejectedForCancellation = options.signal?.aborted === true;
+          const rejectionReason = remainingToolCallBlockReason ?? (
+            rejectedForCancellation
+              ? cancellationReason()
+              : this.getToolCallRejectionReason(
+                  toolCall,
+                  toolCallIndex,
+                  acceptedToolCalls,
+                  maximumToolCalls,
+                  allowedToolNames,
+                  readPaths,
+                )
           );
           const result = rejectionReason
-            ? this.rejectToolCall(toolCall, step, events, rejectionReason)
-            : await this.executeToolCall(toolCall, task, step, events);
+            ? this.rejectToolCall(
+                toolCall,
+                step,
+                events,
+                rejectionReason,
+                rejectedForCancellation ? { cancelled: true } : undefined,
+              )
+            : await this.executeToolCall(toolCall, task, step, events, options.signal);
           if (!rejectionReason) {
             acceptedToolCalls += 1;
+            if (repairState === "executing") {
+              repairToolCalls += 1;
+              if (result.name === "apply_patch") {
+                repairPatchUsed = true;
+                if (result.status === "success") repairPatchSucceeded = true;
+              }
+            } else if (repairState === "post_repair") {
+              postRepairGitToolCalls += 1;
+            }
           }
           const hadSourceEvidence = sourceEvidence.length > 0;
           messages.push(result);
@@ -425,7 +733,7 @@ export class AgentLoop {
               sourceEvidenceCompletionPending = true;
               if (step === maximumStep && !extraFinalOnlyTurnUsed) {
                 extraFinalOnlyTurnUsed = true;
-                maximumStep += 1;
+                maximumStep = addToLimit(maximumStep, 1);
               }
             }
           }
@@ -434,6 +742,65 @@ export class AgentLoop {
             status: result.status,
             summary: result.content,
           });
+          if (this.#enableFailureRepair && !rejectionReason) {
+            if (repairState === "idle" && isExecutedProjectCheckFailure(result)) {
+              failedRepairAction = result.metadata?.action ?? "test";
+              repairState = "planning";
+              maximumToolCalls = addToLimit(
+                maximumToolCalls,
+                MAX_FAILURE_REPAIR_TOOL_CALLS + MAX_POST_REPAIR_GIT_TOOL_CALLS,
+              );
+              maximumStep = Math.max(
+                addToLimit(maximumStep, 1),
+                addToLimit(
+                  step,
+                  MAX_FAILURE_REPAIR_TOOL_CALLS + MAX_POST_REPAIR_GIT_TOOL_CALLS + 2,
+                ),
+              );
+              deferredRuntimeMessages.push(FAILURE_REPAIR_DIRECTION_PROMPT);
+              remainingToolCallBlockReason = "验证失败后必须先确认修复方向；本轮其余工具调用不会执行。";
+            } else if (repairState === "executing" && result.name === "run_project_check") {
+              if (isExecutedProjectCheckSuccess(result)) {
+                if (repairPatchSucceeded) {
+                  repairState = "post_repair";
+                  remainingToolCallBlockReason = "修复补丁已成功复验；本轮其余工具调用不会执行。";
+                } else {
+                  repairState = "final_only";
+                  deferredRuntimeMessages.push(FAILURE_REPAIR_MISSING_PATCH_PROMPT);
+                  remainingToolCallBlockReason = "没有成功应用修复补丁，不能把重跑通过视为修复完成。";
+                }
+              } else {
+                repairState = "final_only";
+                deferredRuntimeMessages.push(
+                  isExecutedProjectCheckFailure(result)
+                    ? FAILURE_REPAIR_EXHAUSTED_PROMPT
+                    : FAILURE_REPAIR_INCOMPLETE_PROMPT,
+                );
+                remainingToolCallBlockReason = "一次修复的复验未成功；本轮其余工具调用不会执行。";
+              }
+              if (step === maximumStep) maximumStep = addToLimit(maximumStep, 1);
+            } else if (repairState === "executing" && repairToolCalls >= MAX_FAILURE_REPAIR_TOOL_CALLS) {
+              repairState = "final_only";
+              if (step === maximumStep) maximumStep = addToLimit(maximumStep, 1);
+              deferredRuntimeMessages.push(FAILURE_REPAIR_INCOMPLETE_PROMPT);
+              remainingToolCallBlockReason = "一次修复的工具上限已用尽；本轮其余工具调用不会执行。";
+            }
+          }
+          if (repairState === "post_repair" && postRepairGitToolCalls >= MAX_POST_REPAIR_GIT_TOOL_CALLS) {
+            repairState = "completed";
+            remainingToolCallBlockReason = "Git 收尾工具额度已用尽；本轮其余工具调用不会执行。";
+          }
+          if (options.signal?.aborted) {
+            remainingToolCallBlockReason = cancellationReason();
+          }
+        }
+        for (const content of deferredRuntimeMessages) {
+          messages.push({ role: "user", content });
+        }
+        if (options.signal?.aborted) {
+          const reason = cancellationReason();
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          throw new Error(reason);
         }
       }
 
@@ -472,17 +839,20 @@ export class AgentLoop {
     toolCall: ToolCall,
     toolCallIndex: number,
     acceptedToolCalls: number,
+    maximumToolCalls: number,
     allowedToolNames: ReadonlySet<string> | undefined,
     readPaths: ReadonlySet<string>,
   ): string | undefined {
     if (allowedToolNames && !allowedToolNames.has(toolCall.name)) {
-      return "源码取证状态不允许该工具；请按当前阶段继续定位、读取或给出最终回答。";
+      return this.#requireSourceEvidence
+        ? "源码取证状态不允许该工具；请按当前阶段继续定位、读取或给出最终回答。"
+        : "当前有界失败修复阶段不允许该工具；请完成一次最小修复、复验、Git 收尾或给出最终回答。";
     }
     if (toolCallIndex >= this.#maxToolCallsPerStep) {
       return `本轮工具调用超过上限 maxToolCallsPerStep=${this.#maxToolCallsPerStep}；请基于本轮其余工具结果给出最终回答。`;
     }
-    if (acceptedToolCalls >= this.#maxToolCalls) {
-      return `本次任务已达到工具调用上限 maxToolCalls=${this.#maxToolCalls}；请基于已有结果给出最终回答。`;
+    if (acceptedToolCalls >= maximumToolCalls) {
+      return `本次任务已达到工具调用上限 maxToolCalls=${maximumToolCalls}；请基于已有结果给出最终回答。`;
     }
     if (this.#requireReadBeforeEdit && toolCall.name === "apply_patch") {
       const targetPath = patchTargetPath(toolCall);
@@ -498,6 +868,7 @@ export class AgentLoop {
     step: number,
     events: InMemoryEventLog,
     reason: string,
+    metadata?: ToolExecutionMetadata,
   ): ToolResultMessage {
     this.recordEvent(events, {
       type: "tool_call",
@@ -505,7 +876,7 @@ export class AgentLoop {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
     });
-    return this.finalizeError(events, step, toolCall, reason);
+    return this.finalizeError(events, step, toolCall, reason, metadata);
   }
 
   private async executeToolCall(
@@ -513,6 +884,7 @@ export class AgentLoop {
     task: string,
     step: number,
     events: InMemoryEventLog,
+    signal?: AbortSignal,
   ): Promise<ToolResultMessage> {
     this.recordEvent(events, {
       type: "tool_call",
@@ -531,7 +903,13 @@ export class AgentLoop {
       );
     }
 
-    const validation = tool.validate(toolCall.input as JsonValue);
+    let validation;
+    try {
+      validation = tool.validate(toolCall.input as JsonValue);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.finalizeError(events, step, toolCall, `工具参数校验失败：${message}`);
+    }
     if (!validation.ok) {
       return this.finalizeError(events, step, toolCall, validation.error);
     }
@@ -568,11 +946,14 @@ export class AgentLoop {
         commandKind: request.kind,
         riskLevel: request.riskLevel,
       });
+      await this.#auditLog?.flush();
 
       let approved = false;
       const approvalTarget = request.kind === "verification" ? "固定验证动作" : "受控命令";
       let rejectionReason = `用户已取消${approvalTarget}，未执行命令。`;
-      if (!this.#requestCommandApproval) {
+      if (signal?.aborted) {
+        rejectionReason = cancellationReason();
+      } else if (!this.#requestCommandApproval) {
         rejectionReason = `未配置本地命令确认，${approvalTarget}未执行。`;
       } else {
         try {
@@ -580,6 +961,10 @@ export class AgentLoop {
         } catch {
           rejectionReason = `本地命令确认不可用，${approvalTarget}未执行。`;
         }
+      }
+      if (signal?.aborted) {
+        approved = false;
+        rejectionReason = cancellationReason();
       }
       this.recordEvent(events, {
         type: "command_approval_decision",
@@ -591,12 +976,18 @@ export class AgentLoop {
         riskLevel: request.riskLevel,
         decision: approved ? "approved" : "rejected",
       });
+      await this.#auditLog?.flush();
       if (!approved) {
         return this.finalizeError(events, step, toolCall, rejectionReason, {
           action: approvalAction,
           riskLevel: request.riskLevel,
+          ...(signal?.aborted ? { cancelled: true } : {}),
         });
       }
+    }
+
+    if (signal?.aborted) {
+      return this.finalizeError(events, step, toolCall, cancellationReason(), { cancelled: true });
     }
 
     this.recordEvent(events, {
@@ -605,15 +996,48 @@ export class AgentLoop {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
     });
+    await this.#auditLog?.flush();
 
     try {
       const execution = await tool.execute(validation.value, {
         task,
         step,
         workspaceRoot: this.#workspaceRoot,
+        signal,
         requireSourceEvidence: this.#requireSourceEvidence,
         executionMode: this.#executionMode,
-        requestEditApproval: this.#requestEditApproval,
+        requestEditApproval: this.#requestEditApproval
+          ? async (request) => {
+              this.recordEvent(events, {
+                type: "edit_approval_requested",
+                step,
+                toolCallId: toolCall.id,
+                toolName: toolCall.name,
+                path: request.path,
+                previewLength: request.preview.length,
+              });
+              await this.#auditLog?.flush();
+              let approved = false;
+              if (!signal?.aborted) {
+                try {
+                  approved = await this.#requestEditApproval!(request) === true;
+                } catch {
+                  approved = false;
+                }
+              }
+              if (signal?.aborted) approved = false;
+              this.recordEvent(events, {
+                type: "edit_approval_decision",
+                step,
+                toolCallId: toolCall.id,
+                toolName: toolCall.name,
+                path: request.path,
+                decision: approved ? "approved" : "rejected",
+              });
+              await this.#auditLog?.flush();
+              return approved;
+            }
+          : undefined,
         recordPolicyDecision: (decision) => {
           this.recordEvent(events, {
             type: "policy_decision",
@@ -640,6 +1064,7 @@ export class AgentLoop {
         name: toolCall.name,
         status: "success",
         content: output.content,
+        ...(output.metadata ? { metadata: output.metadata } : {}),
         ...(output.sourceEvidence ? { sourceEvidence: output.sourceEvidence } : {}),
       };
     } catch (error) {
@@ -653,7 +1078,8 @@ export class AgentLoop {
         });
       }
       const message = error instanceof Error ? error.message : String(error);
-      const metadata = error instanceof ToolExecutionError ? error.metadata : undefined;
+      const baseMetadata = error instanceof ToolExecutionError ? error.metadata : undefined;
+      const metadata = signal?.aborted ? { ...baseMetadata, cancelled: true } : baseMetadata;
       return this.finalizeError(events, step, toolCall, `工具执行失败：${message}`, metadata);
     }
   }
@@ -680,6 +1106,7 @@ export class AgentLoop {
       name: toolCall.name,
       status: "error",
       content,
+      ...(metadata ? { metadata } : {}),
     };
   }
 

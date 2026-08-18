@@ -18,13 +18,17 @@ async function createWorkspace(): Promise<string> {
   await fs.mkdir(path.join(workspace, "src"));
   await fs.mkdir(path.join(workspace, "node_modules"));
   await fs.mkdir(path.join(workspace, ".git"));
+  await fs.mkdir(path.join(workspace, ".ssh"));
   await fs.writeFile(
     path.join(workspace, "src", "example.ts"),
     ["export const title = 'example';", "export const needle = 'confirmed';", "export const end = true;"].join("\n"),
   );
   await fs.writeFile(path.join(workspace, "README.md"), "公开说明\n");
   await fs.writeFile(path.join(workspace, ".env"), "SECRET=must-not-be-read\n");
+  await fs.writeFile(path.join(workspace, ".npmrc"), "//registry.example/:_authToken=must-not-be-read\n");
+  await fs.writeFile(path.join(workspace, ".ssh", "id_rsa"), "SSH_SECRET=must-not-be-read\n");
   await fs.writeFile(path.join(workspace, "src", ".Env.Local"), "NESTED_SECRET=must-not-be-searched\n");
+  await fs.writeFile(path.join(workspace, "src", ".Pypirc"), "PYPI_SECRET=must-not-be-searched\n");
   await fs.writeFile(path.join(workspace, "long.txt"), Array.from({ length: 100 }, (_, index) => `line-${index + 1}`).join("\n"));
   return workspace;
 }
@@ -39,13 +43,13 @@ test("只读工具只返回工作区中的可见文本证据，并限制输出�
     const listed = await listFiles.execute({}, context(workspace));
     assert.match(listed, /目录 src/);
     assert.match(listed, /文件 README.md/);
-    assert.doesNotMatch(listed, /node_modules|\.git|\.env/i);
+    assert.doesNotMatch(listed, /node_modules|\.git|\.env|\.npmrc|\.ssh/i);
 
     const searched = await searchText.execute({ query: "needle", path: "src" }, context(workspace));
     assert.match(searched, /src\/example.ts:2: export const needle/);
     const protectedSearch = await searchText.execute({ query: "must-not-be-searched", path: "src" }, context(workspace));
     assert.match(protectedSearch, /未找到匹配/);
-    assert.doesNotMatch(protectedSearch, /NESTED_SECRET|\.Env\.Local/);
+    assert.doesNotMatch(protectedSearch, /NESTED_SECRET|PYPI_SECRET|\.Env\.Local|\.Pypirc/);
 
     const read = await readFile.execute({ path: "src/example.ts", startLine: 2, endLine: 2 }, context(workspace));
     assert.match(read.content, /src\/example.ts:2 \| export const needle = 'confirmed';/);
@@ -70,6 +74,9 @@ test("越界和受保护文件会变成标准化错误终态，而不是被读�
     await assert.rejects(readFile.execute({ path: ".env" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: ".ENV" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: "src/.Env.Local" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: ".npmrc" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: "src/.Pypirc" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: ".ssh/id_rsa" }, context(workspace)), /目标路径受保护/);
 
     let callCount = 0;
     const model: ChatModel = {
@@ -104,6 +111,85 @@ test("越界和受保护文件会变成标准化错误终态，而不是被读�
     if (finalized?.type === "tool_finalized") {
       assert.equal(finalized.status, "error");
     }
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("只读工具拒绝把非法 UTF-8 字节静默替换成文本", async () => {
+  const workspace = await createWorkspace();
+  const invalidPath = path.join(workspace, "src", "invalid.ts");
+  try {
+    await fs.writeFile(invalidPath, Buffer.from([0x62, 0x61, 0x64, 0x80, 0x6e, 0x65, 0x65, 0x64, 0x6c, 0x65]));
+
+    await assert.rejects(
+      readFile.execute({ path: "src/invalid.ts" }, context(workspace)),
+      /不是有效 UTF-8 文本/,
+    );
+
+    const searched = await searchText.execute({ query: "bad", path: "src" }, context(workspace));
+    assert.match(searched, /非 UTF-8 文本：1 个（已拒绝搜索其内容）/);
+    assert.doesNotMatch(searched, /src\/invalid\.ts:\d+:/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("search_text 只在确实还有文件未收集时报告文件上限截断", async () => {
+  const workspace = await createWorkspace();
+  const exactDirectory = path.join(workspace, "exact-limit");
+  try {
+    await fs.mkdir(exactDirectory);
+    await Promise.all(
+      Array.from({ length: 200 }, (_, index) => fs.writeFile(path.join(exactDirectory, `${index}.txt`), "plain\n")),
+    );
+    const exact = await searchText.execute({ query: "missing", path: "exact-limit" }, context(workspace));
+    assert.doesNotMatch(exact, /最多收集 200 个文件/);
+
+    await fs.writeFile(path.join(exactDirectory, "overflow.txt"), "plain\n");
+    const overflow = await searchText.execute({ query: "missing", path: "exact-limit" }, context(workspace));
+    assert.match(overflow, /最多收集 200 个文件/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("search_text 只在确实存在第 21 条匹配时报告结果截断", async () => {
+  const workspace = await createWorkspace();
+  const matchesPath = path.join(workspace, "matches.txt");
+  try {
+    await fs.writeFile(matchesPath, Array.from({ length: 20 }, () => "exact-needle").join("\n"), "utf8");
+    const exact = await searchText.execute({ query: "exact-needle", path: "." }, context(workspace));
+    assert.doesNotMatch(exact, /最多返回 20 条匹配/);
+
+    await fs.appendFile(matchesPath, "\nexact-needle", "utf8");
+    const overflow = await searchText.execute({ query: "exact-needle", path: "." }, context(workspace));
+    assert.match(overflow, /最多返回 20 条匹配/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("search_text 在 AbortSignal 已取消时立即停止并返回取消元数据", async () => {
+  const workspace = await createWorkspace();
+  const controller = new AbortController();
+  controller.abort();
+  try {
+    await assert.rejects(
+      searchText.execute(
+        { query: "needle", path: "." },
+        { ...context(workspace), signal: controller.signal },
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /文本搜索已取消/);
+        assert.deepEqual("metadata" in error ? error.metadata : undefined, {
+          action: "search_text",
+          cancelled: true,
+        });
+        return true;
+      },
+    );
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }

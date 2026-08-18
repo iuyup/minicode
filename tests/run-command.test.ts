@@ -99,9 +99,12 @@ async function runCommandAttempt(
 test("默认 runner 在 Windows 通过当前 Node 与 npm-cli.js 启动受控程序", async () => {
   const workspace = await createWorkspace();
   const previousNpmExecPath = process.env.npm_execpath;
-  const fakeNpmExecPath = path.join(workspace, "fake-npm-cli.js");
+  const fakeNpmDirectory = path.join(workspace, "npm");
+  const fakeNpmExecPath = path.join(fakeNpmDirectory, "bin", "npm-cli.js");
   const fakeMarker = path.join(workspace, "fake-npm-ran.txt");
   try {
+    await fs.mkdir(path.dirname(fakeNpmExecPath), { recursive: true });
+    await fs.writeFile(path.join(fakeNpmDirectory, "package.json"), JSON.stringify({ name: "npm" }), "utf8");
     await fs.writeFile(fakeNpmExecPath, "require('node:fs').writeFileSync('fake-npm-ran.txt', 'bad');\n", "utf8");
     process.env.npm_execpath = fakeNpmExecPath;
     const nodeAttempt = await runCommandAttempt(
@@ -179,6 +182,92 @@ test("真实超时会终止直接 Node 进程并进入进程树清理路径", as
       maxOutputChars: 1_000,
     });
     assert.equal(result.timedOut, true);
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    await assert.rejects(fs.access(markerPath));
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("进程输出使用流式 UTF-8 解码，不会在 chunk 边界产生替换字符", async () => {
+  const workspace = await createWorkspace();
+  const scriptPath = path.join(workspace, "split-utf8.mjs");
+  try {
+    await fs.writeFile(
+      scriptPath,
+      "process.stdout.write(Buffer.from([0xe4])); setTimeout(() => process.stdout.write(Buffer.from([0xb8, 0xad])), 20);\n",
+      "utf8",
+    );
+    const result = await runBoundedProcess({
+      executable: process.execPath,
+      args: [scriptPath],
+      cwd: workspace,
+      env: createSanitizedChildEnvironment(),
+      action: "utf8_stream_test",
+      startFailureLabel: "UTF-8 流测试",
+      timeoutMs: 2_000,
+      maxOutputChars: 100,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.output, "中");
+    assert.equal(result.outputLength, 1);
+    assert.equal(result.outputTruncated, false);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("进程输出达到上限后仍准确记录完整长度与截断状态", async () => {
+  const workspace = await createWorkspace();
+  const scriptPath = path.join(workspace, "bounded-output.mjs");
+  try {
+    await fs.writeFile(scriptPath, "process.stdout.write('x'.repeat(100));\n", "utf8");
+    const result = await runBoundedProcess({
+      executable: process.execPath,
+      args: [scriptPath],
+      cwd: workspace,
+      env: createSanitizedChildEnvironment(),
+      action: "bounded_output_test",
+      startFailureLabel: "输出上限测试",
+      timeoutMs: 2_000,
+      maxOutputChars: 10,
+    });
+
+    assert.equal(result.output, "x".repeat(10));
+    assert.equal(result.outputLength, 100);
+    assert.equal(result.outputTruncated, true);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("AbortSignal 会取消进程树并返回明确的 cancelled 状态", async () => {
+  const workspace = await createWorkspace();
+  const markerPath = path.join(workspace, "cancelled-late-marker.txt");
+  const scriptPath = path.join(workspace, "cancel-parent.mjs");
+  const controller = new AbortController();
+  try {
+    await fs.writeFile(
+      scriptPath,
+      "import fs from 'node:fs/promises'; setTimeout(() => void fs.writeFile('cancelled-late-marker.txt', 'late'), 700); setTimeout(() => process.exit(0), 1500);\n",
+      "utf8",
+    );
+    setTimeout(() => controller.abort(), 100);
+    const result = await runBoundedProcess({
+      executable: process.execPath,
+      args: [scriptPath],
+      cwd: workspace,
+      env: createSanitizedChildEnvironment(),
+      action: "cancel_tree_test",
+      startFailureLabel: "取消树测试",
+      timeoutMs: 2_000,
+      maxOutputChars: 1_000,
+      signal: controller.signal,
+    });
+
+    assert.equal(result.cancelled, true);
+    assert.equal(result.timedOut, false);
     await new Promise((resolve) => setTimeout(resolve, 900));
     await assert.rejects(fs.access(markerPath));
   } finally {
@@ -500,6 +589,36 @@ test("Node eval、npm 全局参数和 publish 在确认前被策略阻断", asyn
   }
 });
 
+test("Node 入口后的参数和 npm 双横线后的参数不会被误判为运行时覆盖", async () => {
+  const workspace = await createWorkspace();
+  const observed: CommandRunRequest[] = [];
+  const runner: CommandRunner = {
+    async run(request): Promise<CommandRunResult> {
+      observed.push(request);
+      return successfulResult();
+    },
+  };
+  try {
+    const nodeAttempt = await runCommandAttempt(
+      workspace,
+      { program: "node", args: ["packages/app/scripts/check.mjs", "-e", "--print"], cwd: "." },
+      runner,
+    );
+    const npmAttempt = await runCommandAttempt(
+      workspace,
+      { program: "npm", args: ["run", "build", "--", "--prefix", "script-value"], cwd: "." },
+      runner,
+    );
+
+    assert.equal(toolResult(nodeAttempt)?.status, "success");
+    assert.equal(toolResult(npmAttempt)?.status, "success");
+    assert.deepEqual(observed[0]?.args, ["packages/app/scripts/check.mjs", "-e", "--print"]);
+    assert.deepEqual(observed[1]?.args, ["run", "build", "--", "--prefix", "script-value"]);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("绝对、越界和文件型 cwd 在确认前被路径策略阻断", async () => {
   const workspace = await createWorkspace();
   let runnerCalls = 0;
@@ -658,7 +777,7 @@ test("控制字符和模型提供的 env 在参数校验阶段被拒绝", async 
   }
 });
 
-test("非零退出、超时和截断形成安全终态，审计只保留元数据", async () => {
+test("非零退出、超时、取消和截断形成安全终态，审计只保留元数据", async () => {
   const workspace = await createWorkspace();
   const cases = [
     {
@@ -669,6 +788,7 @@ test("非零退出、超时和截断形成安全终态，审计只保留元数�
         outputLength: 27,
         outputTruncated: false,
         timedOut: false,
+        cancelled: false,
       } satisfies CommandRunResult,
       status: "error",
       message: /受控命令失败/,
@@ -681,9 +801,23 @@ test("非零退出、超时和截断形成安全终态，审计只保留元数�
         outputLength: 27,
         outputTruncated: false,
         timedOut: true,
+        cancelled: false,
       } satisfies CommandRunResult,
       status: "error",
       message: /受控命令超时/,
+    },
+    {
+      result: {
+        exitCode: null,
+        durationMs: 21,
+        output: "SENSITIVE_CANCELLED_OUTPUT_B3",
+        outputLength: 29,
+        outputTruncated: false,
+        timedOut: false,
+        cancelled: true,
+      } satisfies CommandRunResult,
+      status: "error",
+      message: /受控命令已取消/,
     },
     {
       result: {
@@ -693,6 +827,7 @@ test("非零退出、超时和截断形成安全终态，审计只保留元数�
         outputLength: 50_000,
         outputTruncated: true,
         timedOut: false,
+        cancelled: false,
       } satisfies CommandRunResult,
       status: "success",
       message: /输出已截断/,
@@ -722,6 +857,7 @@ test("非零退出、超时和截断形成安全终态，审计只保留元数�
       assert.equal(finalizedAudit(attempt)?.outputLength, commandCase.result.outputLength);
       assert.equal(finalizedAudit(attempt)?.outputTruncated, commandCase.result.outputTruncated);
       assert.equal(finalizedAudit(attempt)?.timedOut, commandCase.result.timedOut);
+      assert.equal(finalizedAudit(attempt)?.cancelled, commandCase.result.cancelled);
       assert.equal(finalizedAudit(attempt)?.riskLevel, "medium");
       assertAuditOmits(attempt, [
         commandCase.result.output,

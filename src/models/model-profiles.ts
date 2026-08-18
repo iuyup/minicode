@@ -1,4 +1,5 @@
 import { deepSeekDefaults } from "./deepseek-model.ts";
+import { validateOpenAiCompatibleBaseUrl } from "./openai-compatible-model.ts";
 
 export type ModelProfileId = "fake" | "deepseek" | "openai-compatible";
 
@@ -100,6 +101,8 @@ export function getModelProfileReadiness(
 ): ModelProfileReadiness {
   if (profile.kind === "fake") return { ready: true };
   if (profile.baseUrl === "") return { ready: false, reason: "缺少 baseUrl 环境变量" };
+  const baseUrlProblem = validateOpenAiCompatibleBaseUrl(profile.baseUrl);
+  if (baseUrlProblem) return { ready: false, reason: baseUrlProblem };
   if (profile.model === "") return { ready: false, reason: "缺少 model 环境变量" };
   if (valueFrom(environment, profile.apiKeyEnvironmentVariable) === "") {
     return { ready: false, reason: `缺少 ${profile.apiKeyEnvironmentVariable}` };

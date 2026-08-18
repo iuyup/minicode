@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import type { Readable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 
 import { ToolExecutionError } from "../agent/contracts.ts";
 
@@ -13,6 +14,7 @@ export interface BoundedProcessResult {
   outputLength: number;
   outputTruncated: boolean;
   timedOut: boolean;
+  cancelled?: boolean;
 }
 
 export interface BoundedProcessOptions {
@@ -24,6 +26,7 @@ export interface BoundedProcessOptions {
   startFailureLabel: string;
   timeoutMs: number;
   maxOutputChars: number;
+  signal?: AbortSignal;
 }
 
 const FORCE_SETTLEMENT_MS = 5_000;
@@ -78,6 +81,17 @@ function requestProcessTreeTermination(child: CapturedChildProcess): void {
  */
 export function runBoundedProcess(options: BoundedProcessOptions): Promise<BoundedProcessResult> {
   const startedAt = Date.now();
+  if (options.signal?.aborted) {
+    return Promise.resolve({
+      exitCode: null,
+      durationMs: 0,
+      output: "",
+      outputLength: 0,
+      outputTruncated: false,
+      timedOut: false,
+      cancelled: true,
+    });
+  }
   let child: CapturedChildProcess;
   try {
     child = spawn(options.executable, [...options.args], {
@@ -96,59 +110,78 @@ export function runBoundedProcess(options: BoundedProcessOptions): Promise<Bound
   let outputLength = 0;
   let outputTruncated = false;
   let timedOut = false;
-  const appendOutput = (chunk: Buffer): void => {
-    const text = sanitizeProcessOutput(chunk.toString("utf8"));
+  let cancelled = false;
+  const stdoutDecoder = new StringDecoder("utf8");
+  const stderrDecoder = new StringDecoder("utf8");
+  let decodersFlushed = false;
+  const appendOutput = (decoded: string): void => {
+    const text = sanitizeProcessOutput(decoded);
     outputLength += text.length;
     const remaining = Math.max(0, options.maxOutputChars - output.length);
     if (remaining > 0) output += text.slice(0, remaining);
     if (text.length > remaining) outputTruncated = true;
   };
-  child.stdout.on("data", appendOutput);
-  child.stderr.on("data", appendOutput);
+  const flushDecoders = (): void => {
+    if (decodersFlushed) return;
+    decodersFlushed = true;
+    appendOutput(stdoutDecoder.end());
+    appendOutput(stderrDecoder.end());
+  };
+  child.stdout.on("data", (chunk: Buffer) => appendOutput(stdoutDecoder.write(chunk)));
+  child.stderr.on("data", (chunk: Buffer) => appendOutput(stderrDecoder.write(chunk)));
 
   return new Promise<BoundedProcessResult>((resolve, reject) => {
     let settled = false;
+    let terminationRequested = false;
     let forceSettlement: NodeJS.Timeout | undefined;
-    const timeout = setTimeout(() => {
-      timedOut = true;
+    const finish = (exitCode: number | null): void => {
+      flushDecoders();
+      settled = true;
+      resolve({
+        exitCode,
+        durationMs: Date.now() - startedAt,
+        output,
+        outputLength,
+        outputTruncated,
+        timedOut,
+        cancelled,
+      });
+    };
+    const requestTermination = (reason: "timeout" | "cancelled"): void => {
+      if (settled || terminationRequested) return;
+      terminationRequested = true;
+      if (reason === "timeout") timedOut = true;
+      else cancelled = true;
       requestProcessTreeTermination(child);
       forceSettlement = setTimeout(() => {
         if (settled) return;
         child.stdout.destroy();
         child.stderr.destroy();
         child.unref();
-        settled = true;
-        resolve({
-          exitCode: null,
-          durationMs: Date.now() - startedAt,
-          output,
-          outputLength,
-          outputTruncated,
-          timedOut: true,
-        });
+        clearTimers();
+        finish(null);
       }, FORCE_SETTLEMENT_MS);
-    }, options.timeoutMs);
+    };
+    const timeout = setTimeout(() => requestTermination("timeout"), options.timeoutMs);
+    const abortListener = (): void => requestTermination("cancelled");
+    options.signal?.addEventListener("abort", abortListener, { once: true });
+    // 补上“启动前检查”和“监听器注册”之间的取消竞态。
+    if (options.signal?.aborted) abortListener();
 
     const clearTimers = (): void => {
       clearTimeout(timeout);
       if (forceSettlement) clearTimeout(forceSettlement);
+      options.signal?.removeEventListener("abort", abortListener);
     };
     child.once("error", (error) => {
       if (settled) return;
-      if (timedOut) {
+      if (terminationRequested) {
         clearTimers();
-        settled = true;
-        resolve({
-          exitCode: null,
-          durationMs: Date.now() - startedAt,
-          output,
-          outputLength,
-          outputTruncated,
-          timedOut: true,
-        });
+        finish(null);
         return;
       }
       clearTimers();
+      flushDecoders();
       settled = true;
       const code = (error as NodeJS.ErrnoException).code ?? "unknown";
       reject(new ToolExecutionError(`无法启动${options.startFailureLabel}（${code}）。`, {
@@ -159,15 +192,7 @@ export function runBoundedProcess(options: BoundedProcessOptions): Promise<Bound
     child.once("close", (exitCode) => {
       if (settled) return;
       clearTimers();
-      settled = true;
-      resolve({
-        exitCode,
-        durationMs: Date.now() - startedAt,
-        output,
-        outputLength,
-        outputTruncated,
-        timedOut,
-      });
+      finish(exitCode);
     });
   });
 }
@@ -233,11 +258,12 @@ export function sanitizeProcessOutput(value: string): string {
 }
 
 export async function resolveNpmCli(): Promise<string> {
+  const nodeDirectory = path.dirname(await fs.realpath(process.execPath));
   const candidates = [
-    process.env.npm_execpath,
-    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
-    path.resolve(path.dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
-  ].filter((candidate): candidate is string => Boolean(candidate));
+    path.join(nodeDirectory, "node_modules", "npm", "bin", "npm-cli.js"),
+    path.resolve(nodeDirectory, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"),
+    ...(process.platform === "win32" ? [] : ["/usr/share/nodejs/npm/bin/npm-cli.js"]),
+  ];
 
   for (const candidate of candidates) {
     try {

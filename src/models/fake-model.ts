@@ -1,6 +1,13 @@
 import type { ChatModel, ModelRequest, ModelResponse, ToolResultMessage } from "../agent/contracts.ts";
 
 const PLAN_CONFIRMATION_PREFIX = "计划已由用户确认。现在开始执行";
+const RUNTIME_USER_MESSAGE_PREFIXES = [
+  PLAN_CONFIRMATION_PREFIX,
+  "固定验证已真实执行并失败。",
+  "修复方向已由用户确认。",
+  "一次修复后的固定验证仍然失败",
+  "一次修复的工具额度已用尽",
+] as const;
 const MAX_STATUS_SUMMARY_ITEMS = 8;
 const MAX_DIFF_SUMMARY_FILES = 6;
 
@@ -12,7 +19,9 @@ type ToolResultWithMetadata = ToolResultMessage & {
 
 function originalUserTask(request: ModelRequest): string {
   return request.messages.findLast(
-    (message) => message.role === "user" && !message.content.startsWith(PLAN_CONFIRMATION_PREFIX),
+    (message) =>
+      message.role === "user" &&
+      !RUNTIME_USER_MESSAGE_PREFIXES.some((prefix) => message.content.startsWith(prefix)),
   )?.content ?? "";
 }
 
@@ -98,6 +107,12 @@ export class FakeModel implements ChatModel {
           "2. 基于读取结果给出最小修改或验证结论。",
           "3. 若任务要求验证，调用已注册的受控验证或命令工具。",
         ].join("\n"),
+      };
+    }
+    if (request.phase === "repair_planning") {
+      return {
+        kind: "final",
+        content: "根据最近一次失败验证，先读取相关实现，进行一次最小修复，再运行同一验证动作复验。",
       };
     }
 

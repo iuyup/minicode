@@ -33,6 +33,7 @@ export interface CommandRunRequest {
   args: readonly string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
 }
 
 export interface CommandRunResult extends BoundedProcessResult {}
@@ -165,6 +166,7 @@ class NodeCommandRunner implements CommandRunner {
       startFailureLabel: "受控命令",
       timeoutMs: TIMEOUT_MS,
       maxOutputChars: MAX_OUTPUT_CHARS,
+      signal: request.signal,
     });
   }
 }
@@ -178,6 +180,7 @@ function metadata(riskLevel: CommandRiskLevel, result: CommandRunResult): ToolEx
     outputLength: result.outputLength,
     outputTruncated: result.outputTruncated,
     timedOut: result.timedOut,
+    cancelled: result.cancelled ?? false,
   };
 }
 
@@ -238,6 +241,7 @@ export function createRunCommandTool(
           args: prepared.args,
           cwd: prepared.cwd,
           env: createSanitizedChildEnvironment(),
+          signal: context.signal,
         });
       } catch (error) {
         if (error instanceof ToolExecutionError) {
@@ -255,6 +259,9 @@ export function createRunCommandTool(
 
       const resultMetadata = metadata(prepared.riskLevel, result);
       const content = renderOutput(prepared, result);
+      if (result.cancelled) {
+        throw new ToolExecutionError(`受控命令已取消。\n${content}`, resultMetadata);
+      }
       if (result.timedOut) {
         throw new ToolExecutionError(`受控命令超时（${TIMEOUT_MS}ms）。\n${content}`, resultMetadata);
       }

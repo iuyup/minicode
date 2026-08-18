@@ -555,7 +555,9 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
       "utf8",
     );
     await fs.writeFile(path.join(workspace, ".ENV"), "ROOT_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, ".npmrc"), "NPM_SECRET_BASELINE\n", "utf8");
     await fs.writeFile(path.join(workspace, "nested", ".Env.Local"), "NESTED_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", ".Pypirc"), "PYPI_SECRET_BASELINE\n", "utf8");
     await fs.writeFile(path.join(workspace, "node_modules", "fixture", "secret.js"), "MODULE_SECRET_BASELINE\n", "utf8");
     await git(executable, workspace, ["add", "--all"]);
     await git(executable, workspace, ["commit", "--quiet", "-m", "baseline"]);
@@ -565,7 +567,9 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     await fs.writeFile(path.join(workspace, "src", "app.ts"), "export const value = 'VISIBLE_CHANGE';\n", "utf8");
     await fs.writeFile(path.join(workspace, "src", "new.ts"), "export const added = true;\n", "utf8");
     await fs.writeFile(path.join(workspace, ".ENV"), "ROOT_SECRET_CHANGED_91AA\n", "utf8");
+    await fs.writeFile(path.join(workspace, ".npmrc"), "NPM_SECRET_CHANGED_A4D2\n", "utf8");
     await fs.writeFile(path.join(workspace, "nested", ".Env.Local"), "NESTED_SECRET_CHANGED_72BB\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", ".Pypirc"), "PYPI_SECRET_CHANGED_C6E3\n", "utf8");
     await fs.writeFile(path.join(workspace, "node_modules", "fixture", "secret.js"), "MODULE_SECRET_CHANGED_53CC\n", "utf8");
 
     await git(executable, workspace, ["config", "filter.evil.clean", "node filter-marker.mjs"]);
@@ -592,9 +596,9 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     assert.deepEqual(indexAfterWorkingChecks, indexBefore);
     assert.match(status.content, /src\/app\.ts/);
     assert.match(status.content, /src\/new\.ts/);
-    assert.doesNotMatch(status.content, /\.ENV|nested\/\.Env\.Local|node_modules\/fixture|ROOT_SECRET|NESTED_SECRET|MODULE_SECRET/);
+    assert.doesNotMatch(status.content, /\.ENV|\.npmrc|nested\/\.Env\.Local|nested\/\.Pypirc|node_modules\/fixture|ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET/);
     assert.match(diff.content, /VISIBLE_CHANGE/);
-    assert.doesNotMatch(diff.content, /ROOT_SECRET|NESTED_SECRET|MODULE_SECRET|nested\/\.env\.local|node_modules\/fixture/);
+    assert.doesNotMatch(diff.content, /ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|\.npmrc|nested\/\.env\.local|nested\/\.pypirc|node_modules\/fixture/);
 
     await git(executable, workspace, ["add", "--all"]);
     const indexBeforeStagedCheck = await fs.readFile(path.join(workspace, ".git", "index"));
@@ -602,7 +606,7 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     const indexAfterStagedCheck = await fs.readFile(path.join(workspace, ".git", "index"));
     assert.deepEqual(indexAfterStagedCheck, indexBeforeStagedCheck);
     assert.match(stagedDiff.content, /VISIBLE_CHANGE/);
-    assert.doesNotMatch(stagedDiff.content, /ROOT_SECRET|NESTED_SECRET|MODULE_SECRET|nested\/\.env\.local|node_modules\/fixture/);
+    assert.doesNotMatch(stagedDiff.content, /ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|\.npmrc|nested\/\.env\.local|nested\/\.pypirc|node_modules\/fixture/);
 
     assert.equal((await git(executable, workspace, ["rev-parse", "HEAD"])).trim(), headBefore);
     assert.equal((await git(executable, workspace, ["branch", "--show-current"])).trim(), branchBefore);

@@ -3,6 +3,7 @@
 import path from "node:path";
 import process from "node:process";
 import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -25,10 +26,12 @@ import {
 
 import { type AgentLoop } from "./agent/agent-loop.ts";
 import type {
+  ChatModel,
   CommandApprovalRequest,
   ConversationMessage,
   EditApprovalRequest,
   PlanApprovalRequest,
+  RepairApprovalRequest,
 } from "./agent/contracts.ts";
 import type { AgentEvent } from "./agent/events.ts";
 import {
@@ -41,10 +44,12 @@ import {
   toolPermissionLabel,
   type CliArguments,
 } from "./runtime.ts";
-import { escapeTerminalText } from "./terminal-safety.ts";
+import { escapeMultilineTerminalText, escapeTerminalText } from "./terminal-safety.ts";
 
 const MAX_CONTEXT_TURNS = 6;
 const MAX_CLIPBOARD_CHARACTERS = 32_000;
+const CLIPBOARD_TIMEOUT_MS = 5_000;
+const WINDOWS_SYSTEM_ROOT = "C:\\Windows";
 const RESET = "\u001B[0m";
 const execFileAsync = promisify(execFile);
 
@@ -60,7 +65,7 @@ const muted = color(90);
 const bold = (text: string): string => `\u001B[1m${text}${RESET}`;
 const underline = (text: string): string => `\u001B[4m${text}${RESET}`;
 
-type ApprovalKind = "plan" | "patch" | "verification" | "command";
+type ApprovalKind = "plan" | "repair" | "patch" | "verification" | "command";
 
 const APPROVAL_SPECS = {
   plan: {
@@ -69,6 +74,13 @@ const APPROVAL_SPECS = {
     waiting: "计划仍在等待确认。精确输入 CONTINUE 开始执行；输入 CANCEL 取消。",
     approved: "计划已确认，正在开始执行。",
     rejected: "已取消计划，未执行工具或修改文件。",
+  },
+  repair: {
+    confirmWord: "CONTINUE",
+    prompt: "CONTINUE / CANCEL",
+    waiting: "修复方向仍在等待确认。精确输入 CONTINUE 继续；输入 CANCEL 停止后续修复。",
+    approved: "修复方向已确认，正在进行一次有界修复。",
+    rejected: "已停止后续修复，当前工作区保持现状。",
   },
   patch: {
     confirmWord: "APPLY",
@@ -101,7 +113,7 @@ const APPROVAL_SPECS = {
 
 const CONTROL_WORD_NOTICES = {
   APPLY: "当前没有待确认补丁，APPLY 未发送给模型。只有出现黄色“待确认补丁”时，精确输入 APPLY 才会写入。",
-  CONTINUE: "当前没有待确认计划，CONTINUE 未发送给模型。",
+  CONTINUE: "当前没有待确认计划或修复方向，CONTINUE 未发送给模型。",
   RUN: "当前没有待确认验证或命令，RUN 未发送给模型。",
   CANCEL: "当前没有待确认操作，CANCEL 未发送给模型。",
 } as const;
@@ -136,29 +148,72 @@ const MARKDOWN_THEME: MarkdownTheme = {
   underline,
 };
 
-function defaultSessionAuditPath(workspaceRoot: string): string {
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return path.resolve(workspaceRoot, "reports", `mini-session-${stamp}.jsonl`);
-}
-
 async function readWindowsClipboard(): Promise<string> {
   if (process.platform !== "win32") {
     throw new Error("当前系统不支持 Ctrl+V 剪贴板读取。");
   }
-  const { stdout } = await execFileAsync(
+
+  const systemRoot = WINDOWS_SYSTEM_ROOT;
+  const executable = path.win32.join(
+    systemRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
     "powershell.exe",
+  );
+  const executableStat = await fs.lstat(executable).catch(() => undefined);
+  if (!executableStat?.isFile()) {
+    throw new Error("未找到可信的 Windows PowerShell 可执行文件，未读取剪贴板。");
+  }
+
+  const { stdout } = await execFileAsync(
+    executable,
     [
       "-NoProfile",
       "-NonInteractive",
       "-Command",
       "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Get-Clipboard -Raw",
     ],
-    { windowsHide: true, maxBuffer: MAX_CLIPBOARD_CHARACTERS + 1 },
+    {
+      windowsHide: true,
+      timeout: CLIPBOARD_TIMEOUT_MS,
+      maxBuffer: (MAX_CLIPBOARD_CHARACTERS + 1) * 4,
+      env: { SystemRoot: systemRoot, WINDIR: systemRoot },
+    },
   );
   if (stdout.length > MAX_CLIPBOARD_CHARACTERS) {
     throw new Error(`剪贴板内容超过 ${MAX_CLIPBOARD_CHARACTERS} 字符，未插入。`);
   }
   return stdout;
+}
+
+/** pi-tui 全量重绘会附带 CSI 3J；这里只保留视口重绘，避免意外删除宿主终端历史。 */
+class ScrollbackPreservingTerminal implements Terminal {
+  readonly #terminal: Terminal;
+
+  constructor(terminal: Terminal) {
+    this.#terminal = terminal;
+  }
+
+  get columns(): number { return this.#terminal.columns; }
+  get rows(): number { return this.#terminal.rows; }
+  get kittyProtocolActive(): boolean { return this.#terminal.kittyProtocolActive; }
+  start(onInput: (data: string) => void, onResize: () => void): void {
+    this.#terminal.start(onInput, onResize);
+  }
+  stop(): void { this.#terminal.stop(); }
+  drainInput(maxMs?: number, idleMs?: number): Promise<void> {
+    return this.#terminal.drainInput(maxMs, idleMs);
+  }
+  write(data: string): void { this.#terminal.write(data.replace(/\u001B\[3J/gu, "")); }
+  moveBy(lines: number): void { this.#terminal.moveBy(lines); }
+  hideCursor(): void { this.#terminal.hideCursor(); }
+  showCursor(): void { this.#terminal.showCursor(); }
+  clearLine(): void { this.#terminal.clearLine(); }
+  clearFromCursor(): void { this.#terminal.clearFromCursor(); }
+  clearScreen(): void { this.#terminal.clearScreen(); }
+  setTitle(title: string): void { this.#terminal.setTitle(title); }
+  setProgress(active: boolean): void { this.#terminal.setProgress(active); }
 }
 
 function appendConversation(history: ConversationMessage[], task: string, answer: string): void {
@@ -169,31 +224,42 @@ function appendConversation(history: ConversationMessage[], task: string, answer
   }
 }
 
+const TOOL_DISPLAY_NAMES = new Map<string, string>([
+  ["get_project_overview", "项目概览"],
+  ["list_files", "文件浏览"],
+  ["search_text", "代码搜索"],
+  ["read_file", "文件读取"],
+  ["inspect_git", "Git 只读检查"],
+  ["apply_patch", "受控补丁"],
+  ["run_project_check", "项目验证"],
+  ["run_command", "受控命令"],
+]);
+
 function toolDisplayName(toolName: string): string {
-  return {
-    get_project_overview: "项目概览",
-    list_files: "文件浏览",
-    search_text: "代码搜索",
-    read_file: "文件读取",
-    inspect_git: "Git 只读检查",
-    apply_patch: "受控补丁",
-    run_project_check: "项目验证",
-    run_command: "受控命令",
-  }[toolName] ?? toolName;
+  const label = TOOL_DISPLAY_NAMES.get(toolName) ?? toolName;
+  return escapeTerminalText(label);
 }
 
 function eventLabel(event: AgentEvent): string {
   switch (event.type) {
     case "model_requested":
       return event.forcedToolName
-        ? `正在请求模型（固定读取 ${event.forcedToolName}）`
+        ? `正在请求模型（固定读取 ${toolDisplayName(event.forcedToolName)}）`
         : "正在请求模型";
     case "plan_proposed":
       return "已生成待确认计划";
     case "plan_decision":
       return event.decision === "approved" ? "计划已确认，开始执行" : "计划已取消";
+    case "repair_proposed":
+      return "已生成待确认修复方向";
+    case "repair_decision":
+      return event.decision === "approved" ? "修复方向已确认" : "后续修复已停止";
     case "tool_call":
       return `准备调用 ${toolDisplayName(event.toolName)}`;
+    case "edit_approval_requested":
+      return `等待确认补丁：${escapeTerminalText(event.path)}`;
+    case "edit_approval_decision":
+      return event.decision === "approved" ? "补丁已确认，准备写入" : "补丁已取消";
     case "command_approval_requested":
       return event.commandKind === "verification"
         ? `等待确认固定验证：${escapeTerminalText(event.action)}`
@@ -206,9 +272,10 @@ function eventLabel(event: AgentEvent): string {
     case "tool_execution_started":
       return `正在执行 ${toolDisplayName(event.toolName)}`;
     case "tool_finalized":
-      return event.status === "success"
-        ? `${toolDisplayName(event.toolName)}已完成`
-        : `${toolDisplayName(event.toolName)}未完成`;
+      if (event.status === "success") return `${toolDisplayName(event.toolName)}已完成`;
+      return event.metadata?.cancelled
+        ? `${toolDisplayName(event.toolName)}已取消`
+        : `${toolDisplayName(event.toolName)}失败`;
     case "policy_decision":
       return `正在应用 ${toolDisplayName(event.toolName)}策略`;
     case "final_answer_rejected":
@@ -216,7 +283,7 @@ function eventLabel(event: AgentEvent): string {
     case "agent_completed":
       return "任务已完成";
     case "agent_stopped":
-      return "任务已停止";
+      return /取消/u.test(event.reason) ? "任务已取消" : "任务已停止";
   }
 }
 
@@ -234,10 +301,14 @@ class Header implements Component {
   invalidate(): void {}
 
   render(width: number): string[] {
-    const workspace = path.basename(this.#options.workspaceRoot) || this.#options.workspaceRoot;
+    const workspace = escapeTerminalText(
+      path.basename(this.#options.workspaceRoot) || this.#options.workspaceRoot,
+    );
+    const model = escapeTerminalText(modelLabel(this.#options));
+    const permissions = escapeTerminalText(toolPermissionLabel(this.#options));
     return [
       renderLine(`${bold(accent("◆ MiniCode"))}  ${muted("轻量 Coding Agent")}`, width),
-      renderLine(`  ${modelLabel(this.#options)}  ${muted("·")}  ${toolPermissionLabel(this.#options)}`, width),
+      renderLine(`  ${model}  ${muted("·")}  ${permissions}`, width),
       renderLine(`  ${muted("工作区")} ${workspace}  ${muted("·  滚轮浏览历史  ·  Ctrl+O 展开工具细节")}`, width),
       renderLine(muted("─".repeat(Math.max(width, 1))), width),
     ];
@@ -266,9 +337,28 @@ class ToolTimeline implements Component {
     if (this.#events.length === 0) return [];
 
     const finalized = this.#events.filter((event) => event.type === "tool_finalized");
-    const failed = finalized.filter((event) => event.status === "error").length;
+    const cancelled = finalized.filter(
+      (event) => event.status === "error" && event.metadata?.cancelled === true,
+    ).length;
+    const failed = finalized.filter(
+      (event) => event.status === "error" && event.metadata?.cancelled !== true,
+    ).length;
+    const terminalEvent = this.#events.findLast(
+      (event) => event.type === "agent_completed" || event.type === "agent_stopped",
+    );
     if (!this.#expanded) {
-      const outcome = failed > 0 ? yellow(`${failed} 次受控拒绝`) : green("无错误终态");
+      const unsuccessfulParts = [
+        ...(failed > 0 ? [`${failed} 次失败`] : []),
+        ...(cancelled > 0 ? [`${cancelled} 次已取消`] : []),
+      ];
+      const issueSummary = unsuccessfulParts.join(" · ");
+      const outcome = terminalEvent?.type === "agent_stopped"
+        ? yellow(`${/取消/u.test(terminalEvent.reason) ? "任务已取消" : "任务已停止"}${issueSummary ? `（${issueSummary}）` : ""}`)
+        : terminalEvent?.type === "agent_completed"
+          ? green(issueSummary ? `已完成（${issueSummary}）` : "成功完成")
+          : issueSummary
+            ? (failed > 0 ? red(issueSummary) : yellow(issueSummary))
+            : muted("进行中");
       return [renderLine(`  ${muted("工具活动已折叠")} · ${finalized.length} 次处理 · ${outcome}`, width)];
     }
 
@@ -322,6 +412,8 @@ export interface MiniTuiCallbacks {
   onExit?: () => void;
   readClipboard?: () => Promise<string>;
   createAgent?: () => AgentLoop;
+  model?: ChatModel;
+  onAgentEvent?: (event: AgentEvent) => void;
 }
 
 /**
@@ -349,6 +441,9 @@ export class MiniTuiApp {
   #running = false;
   #started = false;
   #stopped = false;
+  #taskAbortController?: AbortController;
+  #taskGeneration = 0;
+  #inputGeneration = 0;
 
   constructor(options: CliArguments, terminal: Terminal, agent: AgentLoop, callbacks: MiniTuiCallbacks = {}) {
     this.#options = options;
@@ -357,11 +452,16 @@ export class MiniTuiApp {
     this.#onExit = callbacks.onExit;
     this.#readClipboard = callbacks.readClipboard ?? readWindowsClipboard;
     this.#createAgent = callbacks.createAgent;
-    this.#tui = new TUI(terminal, true);
+    this.#tui = new TUI(new ScrollbackPreservingTerminal(terminal), true);
     this.#loader = new Loader(this.#tui, accent, muted, "等待任务");
     this.#editor = new Editor(this.#tui, EDITOR_THEME, { paddingX: 1, autocompleteMaxVisible: 6 });
     this.#editor.onSubmit = (text) => {
       void this.submit(text);
+    };
+    this.#editor.onChange = (text) => {
+      this.#inputGeneration += 1;
+      const safeText = escapeMultilineTerminalText(text.replace(/\t/g, "    "));
+      if (safeText !== text) this.#editor.setText(safeText);
     };
 
     this.#tui.addInputListener((data) => {
@@ -396,6 +496,10 @@ export class MiniTuiApp {
 
   get awaitingPlanApproval(): boolean {
     return this.#pendingApproval?.kind === "plan";
+  }
+
+  get awaitingRepairApproval(): boolean {
+    return this.#pendingApproval?.kind === "repair";
   }
 
   get awaitingCommandApproval(): boolean {
@@ -434,8 +538,13 @@ export class MiniTuiApp {
 
   stop(): void {
     if (this.#stopped) return;
-    this.resolvePendingApproval(false);
     this.#stopped = true;
+    this.#running = false;
+    this.#taskGeneration += 1;
+    this.#inputGeneration += 1;
+    this.#taskAbortController?.abort();
+    this.#taskAbortController = undefined;
+    this.resolvePendingApproval(false, false);
     this.#loader.stop();
     this.#tui.stop();
   }
@@ -473,23 +582,39 @@ export class MiniTuiApp {
 
     this.#editor.setText("");
     this.#editor.disableSubmit = true;
+    this.#inputGeneration += 1;
     this.#events.splice(0, this.#events.length);
     this.#timeline.setEvents(this.#events);
     this.#running = true;
+    const taskGeneration = ++this.#taskGeneration;
+    const abortController = new AbortController();
+    this.#taskAbortController = abortController;
     this.appendUser(input);
     this.#loader.setMessage("正在准备任务");
     this.#loader.start();
     this.refreshActivity();
 
     try {
-      const result = await this.#agent.run(input, { conversationHistory: this.#history });
+      const result = await this.#agent.run(input, {
+        conversationHistory: this.#history,
+        signal: abortController.signal,
+      });
+      if (this.#stopped || abortController.signal.aborted || taskGeneration !== this.#taskGeneration) return;
       appendConversation(this.#history, input, result.answer);
       this.appendAnswer(result.answer);
     } catch (error) {
+      if (this.#stopped || taskGeneration !== this.#taskGeneration) return;
+      if (abortController.signal.aborted) {
+        this.appendNotice("当前任务已取消，未追加旧回答。", yellow);
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.appendNotice(`任务未完成：${message}`, red);
     } finally {
+      if (taskGeneration !== this.#taskGeneration || this.#stopped) return;
       this.#running = false;
+      this.#taskAbortController = undefined;
+      this.#inputGeneration += 1;
       this.#editor.disableSubmit = false;
       this.#loader.stop();
       this.refreshActivity();
@@ -499,6 +624,7 @@ export class MiniTuiApp {
   }
 
   handleAgentEvent(event: AgentEvent): void {
+    if (this.#stopped) return;
     this.#events.push(event);
     this.#timeline.setEvents(this.#events);
     this.#loader.setMessage(eventLabel(event));
@@ -508,8 +634,16 @@ export class MiniTuiApp {
   requestEditApproval(request: EditApprovalRequest): Promise<boolean> {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
 
-    this.#transcript.addChild(new Text(`${bold(yellow("待确认补丁"))} ${request.path}`, 1, 0));
-    this.#transcript.addChild(new Text(color(37)(request.preview), 2, 1));
+    this.#transcript.addChild(new Text(
+      `${bold(yellow("待确认补丁"))} ${escapeTerminalText(request.path)}`,
+      1,
+      0,
+    ));
+    this.#transcript.addChild(new Text(
+      color(37)(escapeMultilineTerminalText(request.preview)),
+      2,
+      1,
+    ));
     this.appendNotice("补丁尚未写入。请准确输入 APPLY 并按 Enter 写入；输入 CANCEL 取消；其他输入会保留当前待确认补丁。", yellow);
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
@@ -525,7 +659,12 @@ export class MiniTuiApp {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
 
     this.#transcript.addChild(new Text(bold(yellow("待确认计划")), 1, 0));
-    this.#transcript.addChild(new Markdown(request.plan, 2, 1, MARKDOWN_THEME));
+    this.#transcript.addChild(new Markdown(
+      escapeMultilineTerminalText(request.plan),
+      2,
+      1,
+      MARKDOWN_THEME,
+    ));
     this.appendNotice("计划尚未执行。请准确输入 CONTINUE 开始；输入 CANCEL 取消。", yellow);
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
@@ -534,6 +673,39 @@ export class MiniTuiApp {
 
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "plan", resolve };
+    });
+  }
+
+  requestRepairApproval(request: RepairApprovalRequest): Promise<boolean> {
+    if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
+
+    this.#transcript.addChild(new Text(
+      `${bold(yellow("待确认修复方向"))} ${escapeTerminalText(request.failedAction)}`,
+      1,
+      0,
+    ));
+    this.#transcript.addChild(new Text(
+      muted(`修复尝试：${request.attempt} / ${request.maximumAttempts}`),
+      2,
+      0,
+    ));
+    this.#transcript.addChild(new Markdown(
+      escapeMultilineTerminalText(request.direction),
+      2,
+      1,
+      MARKDOWN_THEME,
+    ));
+    this.appendNotice(
+      "修复尚未开始。请准确输入 CONTINUE 允许一次有界修复；输入 CANCEL 停止后续修复并保留当前工作区。后续补丁仍需 APPLY，复验仍需 RUN。",
+      yellow,
+    );
+    this.#editor.setText("");
+    this.#editor.disableSubmit = false;
+    this.#tui.setFocus(this.#editor);
+    this.#tui.requestRender();
+
+    return new Promise((resolve) => {
+      this.#pendingApproval = { kind: "repair", resolve };
     });
   }
 
@@ -578,23 +750,32 @@ export class MiniTuiApp {
       ? "当前是离线演示；输入 /model 查看并切换已配置的模型 Profile。"
       : this.#options.agentMode === "edit"
         ? "当前是受控编辑会话：补丁逐次等待 APPLY，验证与 Node/npm 命令逐次等待 RUN。"
-      : `当前会话会调用 ${modelLabel(this.#options)}，并仅开放已标明的工具权限。`;
+      : `当前会话会调用 ${escapeTerminalText(modelLabel(this.#options))}，并仅开放已标明的工具权限。`;
     this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))} ${muted(mode)}`, 1, 0));
     this.#transcript.addChild(new Text(muted("  鼠标滚轮或终端滚动条可查看历史；支持 Ctrl+V 粘贴，工具细节默认折叠。"), 1, 1));
   }
 
   private appendUser(input: string): void {
     this.#transcript.addChild(new Text(`${bold(green("你"))}`, 1, 0));
-    this.#transcript.addChild(new Text(input, 2, 1));
+    this.#transcript.addChild(new Text(escapeMultilineTerminalText(input), 2, 1));
   }
 
   private appendAnswer(answer: string): void {
     this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))}`, 1, 0));
-    this.#transcript.addChild(new Markdown(answer, 2, 1, MARKDOWN_THEME));
+    this.#transcript.addChild(new Markdown(
+      escapeMultilineTerminalText(answer),
+      2,
+      1,
+      MARKDOWN_THEME,
+    ));
   }
 
   private appendNotice(message: string, tone: (text: string) => string): void {
-    this.#transcript.addChild(new Text(tone(`  ${message}`), 1, 1));
+    this.#transcript.addChild(new Text(
+      tone(`  ${escapeMultilineTerminalText(message)}`),
+      1,
+      1,
+    ));
     this.#tui.requestRender();
   }
 
@@ -607,29 +788,47 @@ export class MiniTuiApp {
 
   private async pasteFromClipboard(): Promise<void> {
     if (this.#stopped || this.#editor.disableSubmit) return;
+    const inputGeneration = ++this.#inputGeneration;
+    const editorText = this.#editor.getExpandedText();
     try {
       const content = await this.#readClipboard();
+      if (
+        this.#stopped ||
+        this.#editor.disableSubmit ||
+        inputGeneration !== this.#inputGeneration ||
+        editorText !== this.#editor.getExpandedText()
+      ) return;
       if (content === "") {
         this.appendNotice("剪贴板没有可插入的文本。", muted);
         return;
       }
-      this.#editor.insertTextAtCursor(content);
+      const safeContent = escapeMultilineTerminalText(content.replace(/\t/g, "    "));
+      this.#editor.insertTextAtCursor(safeContent);
       this.#tui.setFocus(this.#editor);
       this.#tui.requestRender();
     } catch (error) {
+      if (
+        this.#stopped ||
+        this.#editor.disableSubmit ||
+        inputGeneration !== this.#inputGeneration ||
+        editorText !== this.#editor.getExpandedText()
+      ) return;
       const message = error instanceof Error ? error.message : "无法读取系统剪贴板。";
       this.appendNotice(`粘贴失败：${message}`, yellow);
     }
   }
 
-  private resolvePendingApproval(approved: boolean): void {
+  private resolvePendingApproval(approved: boolean, showNotice = true): void {
     const pendingApproval = this.#pendingApproval;
     if (!pendingApproval) return;
     this.#pendingApproval = undefined;
+    this.#inputGeneration += 1;
     this.#editor.setText("");
     this.#editor.disableSubmit = true;
     const spec = APPROVAL_SPECS[pendingApproval.kind];
-    this.appendNotice(approved ? spec.approved : spec.rejected, approved ? green : yellow);
+    if (showNotice && !this.#stopped) {
+      this.appendNotice(approved ? spec.approved : spec.rejected, approved ? green : yellow);
+    }
     pendingApproval.resolve(approved);
   }
 
@@ -640,7 +839,7 @@ export class MiniTuiApp {
     }
     switch (input) {
       case "/help":
-        this.appendNotice("鼠标滚轮或终端滚动条查看历史；Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话与当前终端历史；/exit 退出。计划确认输入 CONTINUE；编辑确认输入 APPLY；验证或命令确认输入 RUN；CANCEL 取消。", accent);
+        this.appendNotice("鼠标滚轮或终端滚动条查看历史；Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话与当前终端历史；/exit 退出。计划或失败修复确认输入 CONTINUE；编辑确认输入 APPLY；验证或命令确认输入 RUN；CANCEL 取消。", accent);
         break;
       case "/status":
         this.appendNotice(
@@ -653,6 +852,7 @@ export class MiniTuiApp {
         this.refreshActivity();
         break;
       case "/clear":
+        this.#inputGeneration += 1;
         this.#history.splice(0, this.#history.length);
         this.#events.splice(0, this.#events.length);
         this.#timeline.setEvents(this.#events);
@@ -660,6 +860,7 @@ export class MiniTuiApp {
         this.appendWelcome();
         this.appendNotice("已清空会话上下文；审计文件不会被删除。", green);
         this.refreshActivity();
+        this.#terminal.write("\u001B[3J");
         this.#tui.requestRender(true);
         break;
       case "/exit":
@@ -697,6 +898,7 @@ export class MiniTuiApp {
         return;
       }
       this.#agent = this.#createAgent();
+      this.#inputGeneration += 1;
       this.#history.splice(0, this.#history.length);
       this.#events.splice(0, this.#events.length);
       this.#timeline.setEvents(this.#events);
@@ -713,12 +915,15 @@ export class MiniTuiApp {
   }
 
   private requestExit(): void {
-    if (this.#pendingApproval) {
+    if (this.#running) {
       this.resolvePendingApproval(false);
+      this.#taskAbortController?.abort();
+      this.#inputGeneration += 1;
+      this.appendNotice("正在取消当前任务；本次待确认操作已关闭。", yellow);
       return;
     }
-    if (this.#running) {
-      this.appendNotice("当前任务仍在执行；这一版暂不支持中断，完成后可再次按 Ctrl+C 或输入 /exit。", yellow);
+    if (this.#pendingApproval) {
+      this.resolvePendingApproval(false);
       return;
     }
     this.stop();
@@ -732,15 +937,17 @@ export function createMiniTui(
   callbacks: MiniTuiCallbacks = {},
 ): MiniTuiApp {
   const options = parseArguments(args);
-  if (!args.includes("--audit")) {
-    options.auditPath = defaultSessionAuditPath(options.workspaceRoot);
-  }
 
   let app: MiniTuiApp | undefined;
   const createConfiguredAgent = (): AgentLoop => createAgent(options, {
-    onEvent: (event) => app?.handleAgentEvent(event),
+    model: callbacks.model,
+    onEvent: (event) => {
+      app?.handleAgentEvent(event);
+      callbacks.onAgentEvent?.(event);
+    },
     requestEditApproval: (request) => app?.requestEditApproval(request) ?? Promise.resolve(false),
     requestPlanApproval: (request) => app?.requestPlanApproval(request) ?? Promise.resolve(false),
+    requestRepairApproval: (request) => app?.requestRepairApproval(request) ?? Promise.resolve(false),
     requestCommandApproval: (request) => app?.requestCommandApproval(request) ?? Promise.resolve(false),
   });
   const agent = createConfiguredAgent();

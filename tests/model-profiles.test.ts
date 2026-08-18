@@ -43,6 +43,26 @@ test("Profile 配置不完整时只指出缺少的环境变量，不回显密钥
   );
 });
 
+test("OpenAI-compatible Profile 拒绝不可安全请求的 baseUrl", () => {
+  const readinessFor = (baseUrl: string) => {
+    const environment: NodeJS.ProcessEnv = {
+      MINICODE_OPENAI_BASE_URL: baseUrl,
+      MINICODE_OPENAI_MODEL: "coder-model",
+      MINICODE_OPENAI_API_KEY: "test-secret-key",
+    };
+    return getModelProfileReadiness(getModelProfile("openai-compatible", environment), environment);
+  };
+
+  assert.match(readinessFor("not a url").reason ?? "", /有效 URL/);
+  assert.match(readinessFor("ftp://gateway.example/v1").reason ?? "", /http 或 https/);
+  assert.match(readinessFor("https://user:secret@gateway.example/v1").reason ?? "", /用户名或密码/);
+  assert.match(readinessFor("https://gateway.example/v1#admin").reason ?? "", /URL 片段/);
+  assert.match(readinessFor("https://gateway.example/v1#").reason ?? "", /URL 片段/);
+  assert.match(readinessFor("https://gateway.example/v1?tenant=demo").reason ?? "", /查询参数/);
+  assert.match(readinessFor("https://gateway.example/v1?").reason ?? "", /查询参数/);
+  assert.deepEqual(readinessFor("http://localhost:8080/v1"), { ready: true });
+});
+
 test("CLI 支持 Profile 选择，同时保留 DeepSeek 旧参数", () => {
   assert.equal(parseModelProfileId("openai"), "openai-compatible");
   assert.equal(parseArguments(["--profile", "openai", "检查项目"]).modelProfile, "openai-compatible");

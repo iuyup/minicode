@@ -365,7 +365,13 @@ test("source-evidence completion turn stops before executing a requested tool", 
     }).run("Explain the implementation."),
     /源码取证已收集足够证据，本轮只能给出最终回答/,
   );
-  assert.equal(recordedEvents.filter((event) => event.type === "tool_call").length, 2);
+  assert.equal(recordedEvents.filter((event) => event.type === "tool_call").length, 3);
+  assert.ok(recordedEvents.some(
+    (event) => event.type === "tool_finalized" &&
+      event.toolCallId === "read-3" &&
+      event.status === "error" &&
+      /只能给出最终回答/.test(event.detail),
+  ));
 });
 
 test("source-evidence mode rejects a citation outside the read source range", async () => {
@@ -554,10 +560,91 @@ test("source-evidence repair turn stops before executing a requested tool", asyn
     }).run("Explain the implementation."),
     /源码证据修复轮只能给出最终回答/,
   );
-  assert.equal(recordedEvents.filter((event) => event.type === "tool_call").length, 1);
+  assert.equal(recordedEvents.filter((event) => event.type === "tool_call").length, 2);
+  assert.ok(recordedEvents.some(
+    (event) => event.type === "tool_finalized" &&
+      event.toolCallId === "read-2" &&
+      event.status === "error" &&
+      /只能给出最终回答/.test(event.detail),
+  ));
   assert.deepEqual(recordedEvents.at(-1), {
     type: "agent_stopped",
     step: 3,
     reason: "源码证据修复轮只能给出最终回答，不能请求工具。",
   });
+});
+
+test("source-evidence mode accepts an actual Unicode path with spaces and a non-TypeScript extension", async () => {
+  const evidencePath = "src/解析 器.py";
+  const unicodeReadTool: AgentTool<JsonValue, ToolExecutionOutput> = {
+    ...sourceReadTool,
+    async execute() {
+      return {
+        content: `${evidencePath}:3 | def parse():`,
+        sourceEvidence: [{ path: evidencePath, startLine: 3, endLine: 8 }],
+      };
+    },
+  };
+  let calls = 0;
+  const model: ChatModel = {
+    async complete() {
+      calls += 1;
+      return calls === 1
+        ? {
+            kind: "tool_calls",
+            content: "Read the implementation.",
+            toolCalls: [{ id: "unicode-read", name: "read_file", input: {} }],
+          }
+        : { kind: "final", content: `The parser is defined at \`${evidencePath}:3-8\`.` };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([unicodeReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Explain the parser.");
+
+  assert.equal(result.answer, `The parser is defined at \`${evidencePath}:3-8\`.`);
+  assert.equal(result.events.some((event) => event.type === "final_answer_rejected"), false);
+});
+
+test("source-evidence mode rejects an unknown citation mixed with a valid read citation", async () => {
+  let calls = 0;
+  const model: ChatModel = {
+    async complete(request) {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Read the verified source.",
+          toolCalls: [{ id: "mixed-read", name: "read_file", input: {} }],
+        };
+      }
+      if (calls === 2) {
+        return {
+          kind: "final",
+          content: "Verified at src/agent/agent-loop.ts:12, with another claim at src/evil.py:1.",
+        };
+      }
+      assert.deepEqual(request.tools, []);
+      assert.match(request.messages.at(-1)?.content ?? "", /未在本轮已读取范围内/);
+      return { kind: "final", content: "Verified only at src/agent/agent-loop.ts:12." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([sourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Reject mixed source claims.");
+
+  assert.equal(result.answer, "Verified only at src/agent/agent-loop.ts:12.");
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "final_answer_rejected"),
+    [{
+      type: "final_answer_rejected",
+      step: 2,
+      reason: "unverified_source_citation",
+      sourceEvidenceCount: 1,
+    }],
+  );
 });

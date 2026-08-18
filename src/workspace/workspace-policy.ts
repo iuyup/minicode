@@ -6,7 +6,23 @@ export interface WorkspacePath {
   relativePath: string;
 }
 
-const PROTECTED_DIRECTORY_NAMES = new Set([".git", "node_modules"]);
+const PROTECTED_DIRECTORY_NAMES = new Set([
+  ".aws",
+  ".git",
+  ".gnupg",
+  ".ssh",
+  "node_modules",
+]);
+
+const PROTECTED_FILE_NAMES = new Set([
+  ".git-credentials",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  ".yarnrc",
+  ".yarnrc.yml",
+  "_netrc",
+]);
 
 export class WorkspaceAccessError extends Error {
   constructor(message: string) {
@@ -19,6 +35,7 @@ export function shouldSkipWorkspaceEntry(name: string): boolean {
   const normalizedName = name.toLowerCase();
   return (
     PROTECTED_DIRECTORY_NAMES.has(normalizedName) ||
+    PROTECTED_FILE_NAMES.has(normalizedName) ||
     normalizedName === ".env" ||
     normalizedName.startsWith(".env.")
   );

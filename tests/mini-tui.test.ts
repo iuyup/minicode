@@ -75,6 +75,103 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
   }
 }
 
+const REPAIR_DIRECTION = "读取失败断言对应的实现，只做最小修复，然后重新运行 test。";
+const LOCAL_CONTROL_WORDS = new Set(["APPLY", "CONTINUE", "RUN", "CANCEL"]);
+
+interface RepairTuiHarness {
+  app: MiniTuiApp;
+  terminal: FakeTerminal;
+  modelRequests: ModelRequest[];
+  readonly runnerCalls: number;
+}
+
+function createRepairTuiHarness(workspace: string): RepairTuiHarness {
+  const terminal = new FakeTerminal();
+  const modelRequests: ModelRequest[] = [];
+  let runnerCalls = 0;
+  const runner: ProjectCheckRunner = {
+    async run(): Promise<ProjectCheckRunResult> {
+      runnerCalls += 1;
+      return {
+        exitCode: 1,
+        durationMs: 4,
+        output: "AssertionError: expected repaired value",
+        outputLength: 39,
+        outputTruncated: false,
+        timedOut: false,
+      };
+    },
+  };
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      modelRequests.push(request);
+      switch (modelRequests.length) {
+        case 1:
+          assert.equal(request.phase, "execution");
+          return {
+            kind: "tool_calls",
+            content: "先运行固定验证。",
+            toolCalls: [{ id: "repair-check-1", name: "run_project_check", input: { action: "test" } }],
+          };
+        case 2:
+          assert.equal(request.phase, "repair_planning");
+          assert.equal(request.tools.length, 0);
+          assert.equal(
+            request.messages.some(
+              (message) => message.role === "tool" && message.name === "run_project_check" && message.status === "error",
+            ),
+            true,
+          );
+          return { kind: "final", content: REPAIR_DIRECTION };
+        case 3:
+          assert.equal(request.phase, "execution");
+          assert.equal(
+            request.messages.some(
+              (message) => message.role === "user" && /修复方向已由用户确认/u.test(message.content),
+            ),
+            true,
+          );
+          assertNoLocalControlWords(modelRequests);
+          return { kind: "final", content: "已按确认的方向结束本次有界修复演示。" };
+        default:
+          throw new Error(`repair TUI 收到未预期的第 ${modelRequests.length} 次模型请求。`);
+      }
+    },
+  };
+  const options = parseArguments(["--workspace", workspace, "--audit", path.join(workspace, "audit.jsonl")]);
+  let app: MiniTuiApp | undefined;
+  const agent = new AgentLoop(model, new ToolRegistry([createRunProjectCheckTool(runner)]), {
+    workspaceRoot: workspace,
+    maxSteps: 3,
+    enableFailureRepair: true,
+    requestCommandApproval: async () => true,
+    requestRepairApproval: (request) => app?.requestRepairApproval(request) ?? Promise.resolve(false),
+    onEvent: (event) => app?.handleAgentEvent(event),
+  });
+  app = new MiniTuiApp(options, terminal, agent);
+  return {
+    app,
+    terminal,
+    modelRequests,
+    get runnerCalls() {
+      return runnerCalls;
+    },
+  };
+}
+
+function assertNoLocalControlWords(requests: readonly ModelRequest[]): void {
+  for (const request of requests) {
+    for (const message of request.messages) {
+      if (message.role !== "user") continue;
+      assert.equal(
+        LOCAL_CONTROL_WORDS.has(message.content.trim().toUpperCase()),
+        false,
+        `本地控制词不应进入模型消息：${message.content}`,
+      );
+    }
+  }
+}
+
 test("mini 使用普通终端历史，不进入备用屏幕或开启鼠标捕获", async () => {
   const source = await fs.readFile(new URL("../src/mini.ts", import.meta.url), "utf8");
 
@@ -113,12 +210,16 @@ test("长会话保持原生 scrollback，clear 才显式清除当前终端历史
     assert.doesNotMatch(terminal.output, /\u001B\[3J/u);
 
     terminal.resize(88, 20);
-    await waitFor(() => terminal.output.includes("\u001B[3J"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.doesNotMatch(terminal.output, /\u001B\[3J/u);
     assert.equal(app.contextTurns, 2);
 
     terminal.output = "";
     await app.submit("/clear");
-    await waitFor(() => terminal.output.includes("\u001B[3J"));
+    await waitFor(() =>
+      terminal.output.includes("\u001B[3J") &&
+      stripAnsi(terminal.output).includes("已清空会话上下文")
+    );
     const clearedOutput = stripAnsi(terminal.output);
     assert.match(clearedOutput, /已清空会话上下文/);
     assert.doesNotMatch(clearedOutput, /历史回答 1-|历史回答 2-/);
@@ -163,6 +264,40 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
   }
 });
 
+test("未指定 audit 时会写入用户级目录而不是工作区 reports", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-default-audit-workspace-"));
+  const localAppData = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-default-audit-user-"));
+  const terminal = new FakeTerminal();
+  const originalLocalAppData = process.env.LOCALAPPDATA;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      return { kind: "final", content: "默认审计路径验证完成。" };
+    },
+  };
+  let app: MiniTuiApp | undefined;
+
+  try {
+    process.env.LOCALAPPDATA = localAppData;
+    app = createMiniTui(["--workspace", workspace], terminal, { model });
+    app.start();
+    await app.submit("验证默认审计位置");
+
+    const auditRoot = path.join(localAppData, "MiniCode", "audit");
+    const auditFiles = await fs.readdir(auditRoot);
+    assert.equal(auditFiles.length, 1);
+    assert.match(auditFiles[0] ?? "", /^session-.*\.jsonl$/u);
+    const audit = await fs.readFile(path.join(auditRoot, auditFiles[0] ?? ""), "utf8");
+    assert.match(audit, /"type":"agent_completed"/u);
+    await assert.rejects(fs.access(path.join(workspace, "reports")));
+  } finally {
+    app?.stop();
+    if (originalLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = originalLocalAppData;
+    await fs.rm(workspace, { recursive: true, force: true });
+    await fs.rm(localAppData, { recursive: true, force: true });
+  }
+});
+
 test("mini TUI intercepts Ctrl+V and inserts plain clipboard text into the editor", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-clipboard-"));
   const terminal = new FakeTerminal();
@@ -180,6 +315,247 @@ test("mini TUI intercepts Ctrl+V and inserts plain clipboard text into the edito
   } finally {
     await fs.rm(reportDirectory, { recursive: true, force: true });
   }
+});
+
+test("Ctrl+V 在进入编辑器前转义剪贴板终端控制符", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-safe-clipboard-"));
+  const terminal = new FakeTerminal();
+  const rawControl = "\u001B[6n";
+  let app: MiniTuiApp | undefined;
+  try {
+    const currentApp = createMiniTui(
+      ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+      terminal,
+      { readClipboard: async () => `first\tsecond${rawControl}` },
+    );
+    app = currentApp;
+    currentApp.start();
+    terminal.send("\u0016");
+    await waitFor(() => currentApp.editorText.includes("second"));
+
+    assert.equal(currentApp.editorText, "first    second\\u001B[6n");
+    assert.doesNotMatch(terminal.output, /\u001B\[6n/u);
+  } finally {
+    app?.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("晚返回的剪贴板不会跨任务插入编辑器", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-late-clipboard-"));
+  const terminal = new FakeTerminal();
+  let clipboardCalls = 0;
+  let resolveClipboard: ((value: string) => void) | undefined;
+  const clipboard = new Promise<string>((resolve) => {
+    resolveClipboard = resolve;
+  });
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      return { kind: "final", content: "当前任务已经完成。" };
+    },
+  };
+  const options = parseArguments([
+    "--workspace",
+    process.cwd(),
+    "--audit",
+    path.join(reportDirectory, "audit.jsonl"),
+  ]);
+  const app = new MiniTuiApp(
+    options,
+    terminal,
+    new AgentLoop(model, new ToolRegistry([]), { workspaceRoot: process.cwd() }),
+    {
+      readClipboard: () => {
+        clipboardCalls += 1;
+        return clipboard;
+      },
+    },
+  );
+
+  try {
+    app.start();
+    terminal.send("\u0016");
+    await waitFor(() => clipboardCalls === 1);
+    await app.submit("在剪贴板返回前先完成这个任务");
+    resolveClipboard?.("不应跨任务插入的旧剪贴板");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(app.editorText, "");
+    assert.doesNotMatch(stripAnsi(terminal.output), /不应跨任务插入的旧剪贴板/u);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("晚返回的剪贴板不会覆盖等待期间的新键入或更新的粘贴", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-stale-paste-"));
+  const terminal = new FakeTerminal();
+  const resolvers: Array<(value: string) => void> = [];
+  const app = createMiniTui(
+    ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+    terminal,
+    {
+      readClipboard: () => new Promise<string>((resolve) => resolvers.push(resolve)),
+    },
+  );
+  try {
+    app.start();
+    terminal.send("\u0016");
+    await waitFor(() => resolvers.length === 1);
+    terminal.send("fresh");
+    resolvers[0]("-LATE-");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(app.editorText, "fresh");
+
+    terminal.send("\u0016");
+    terminal.send("\u0016");
+    await waitFor(() => resolvers.length === 3);
+    resolvers[2]("-NEW-");
+    await waitFor(() => app.editorText === "fresh-NEW-");
+    resolvers[1]("-OLD-");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(app.editorText, "fresh-NEW-");
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("编辑器原生输入也会把双向控制字符转成可见文本", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-safe-native-paste-"));
+  const terminal = new FakeTerminal();
+  const app = createMiniTui(
+    ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+    terminal,
+  );
+  try {
+    app.start();
+    terminal.send("safe\u202Eevil");
+    await waitFor(() => app.editorText.includes("evil"));
+    assert.equal(app.editorText, "safe\\u202Eevil");
+    assert.doesNotMatch(terminal.output, /\u202E/u);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("TUI 转义用户、模型、审批和未知工具中的 CSI 与 OSC", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-terminal-safety-"));
+  const terminal = new FakeTerminal();
+  const csi = "\u001B[6n";
+  const osc = "\u001B]9;MINICODE-PWN\u0007";
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      return { kind: "final", content: `模型回答 ${osc}` };
+    },
+  };
+  const options = parseArguments([
+    "--workspace",
+    process.cwd(),
+    "--audit",
+    path.join(reportDirectory, "audit.jsonl"),
+  ]);
+  const app = new MiniTuiApp(
+    options,
+    terminal,
+    new AgentLoop(model, new ToolRegistry([]), { workspaceRoot: process.cwd() }),
+  );
+
+  try {
+    app.start();
+    await app.submit(`用户任务 ${csi}`);
+
+    app.handleAgentEvent({
+      type: "model_requested",
+      step: 2,
+      forcedToolName: `__proto__${csi}`,
+    });
+    app.handleAgentEvent({
+      type: "tool_call",
+      step: 2,
+      toolCallId: "unsafe-tool",
+      toolName: `constructor${osc}`,
+    });
+    app.handleAgentEvent({
+      type: "tool_finalized",
+      step: 2,
+      toolCallId: "unsafe-tool",
+      toolName: `constructor${osc}`,
+      status: "error",
+      detail: `cancelled${csi}`,
+      metadata: { cancelled: true },
+    });
+    app.handleAgentEvent({
+      type: "tool_finalized",
+      step: 2,
+      toolCallId: "failed-tool",
+      toolName: "read_file",
+      status: "error",
+      detail: "ordinary failure",
+    });
+    app.handleAgentEvent({ type: "agent_stopped", step: 2, reason: "任务已取消。" });
+    await waitFor(() => stripAnsi(terminal.output).includes("1 次失败 · 1 次已取消"));
+    terminal.send("\u000f");
+
+    const editApproval = app.requestEditApproval({
+      path: `src/${csi}.ts`,
+      preview: `safe line\n${osc}`,
+    });
+    await app.submit("CANCEL");
+    assert.equal(await editApproval, false);
+
+    const planApproval = app.requestPlanApproval({ plan: `- 计划\n- ${osc}` });
+    await app.submit("CANCEL");
+    assert.equal(await planApproval, false);
+
+    const repairApproval = app.requestRepairApproval({
+      failedAction: `test${csi}`,
+      direction: `修复方向\n${osc}`,
+      attempt: 1,
+      maximumAttempts: 1,
+    });
+    await app.submit("CANCEL");
+    assert.equal(await repairApproval, false);
+
+    const commandApproval = app.requestCommandApproval({
+      kind: "command",
+      action: `run_command${csi}`,
+      command: `node ${osc}`,
+      workingDirectory: `C:\\safe${csi}`,
+      riskLevel: "medium",
+      risk: `risk ${osc}`,
+    });
+    await app.submit("CANCEL");
+    assert.equal(await commandApproval, false);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.doesNotMatch(terminal.output, /\u001B\[6n/u);
+    assert.doesNotMatch(terminal.output, /\u001B\]9;MINICODE-PWN\u0007/u);
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /\\u001B\[6n/u);
+    assert.match(output, /\\u001B\]9;MINICODE-PWN\\u0007/u);
+    assert.match(output, /__proto__\\u001B\[6n/u);
+    assert.match(output, /constructor\\u001B\]9;MINICODE-PWN\\u0007/u);
+    assert.match(output, /任务已取消|已取消/u);
+    assert.match(output, /1 次失败 · 1 次已取消/u);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("Windows 剪贴板只启动绝对系统 PowerShell 并限制环境与输出", async () => {
+  const source = await fs.readFile(new URL("../src/mini.ts", import.meta.url), "utf8");
+
+  assert.match(source, /System32[\s\S]*WindowsPowerShell[\s\S]*v1\.0[\s\S]*powershell\.exe/u);
+  assert.doesNotMatch(source, /execFileAsync\(\s*["']powershell\.exe["']/u);
+  assert.match(source, /WINDOWS_SYSTEM_ROOT = "C:\\\\Windows"/u);
+  assert.doesNotMatch(source, /process\.env\.(?:SystemRoot|WINDIR)/u);
+  assert.match(source, /timeout:\s*CLIPBOARD_TIMEOUT_MS/u);
+  assert.match(source, /maxBuffer:\s*\(MAX_CLIPBOARD_CHARACTERS \+ 1\) \* 4/u);
+  assert.match(source, /env:\s*\{ SystemRoot: systemRoot, WINDIR: systemRoot \}/u);
 });
 
 test("mini TUI lists configured Profiles and switches model without sending a request", async () => {
@@ -236,11 +612,185 @@ test("mini TUI never sends reserved approval words to the model without a pendin
     assert.equal(app.contextTurns, 0);
     await waitFor(() => stripAnsi(terminal.output).includes("当前没有待确认补丁"));
     assert.match(stripAnsi(terminal.output), /当前没有待确认补丁/);
+    assert.match(stripAnsi(terminal.output), /当前没有待确认计划或修复方向/);
     assert.match(stripAnsi(terminal.output), /当前没有待确认验证/);
     assert.match(stripAnsi(terminal.output), /当前没有待确认操作/);
   } finally {
     app?.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("修复方向面板只接受精确 CONTINUE，错误输入保持等待且控制词不进入模型", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-repair-continue-"));
+  const harness = createRepairTuiHarness(workspace);
+  try {
+    harness.app.start();
+    const task = harness.app.submit("运行测试，并在真实失败后提出一次有界修复方向");
+    await waitFor(() => harness.app.awaitingRepairApproval);
+
+    const pendingOutput = stripAnsi(harness.terminal.output);
+    assert.equal(harness.runnerCalls, 1);
+    assert.equal(harness.modelRequests.length, 2);
+    assert.match(pendingOutput, /待确认修复方向.*test/u);
+    assert.match(pendingOutput, /已生成待确认修复方向/u);
+    assert.match(pendingOutput, /修复尝试：1 \/ 1/u);
+    assert.match(pendingOutput, new RegExp(REPAIR_DIRECTION, "u"));
+    assert.match(pendingOutput, /后续补丁仍需 APPLY，复验仍需 RUN/u);
+    assert.match(pendingOutput, /等待确认：CONTINUE \/ CANCEL/u);
+
+    await harness.app.submit("continue");
+    assert.equal(harness.app.awaitingRepairApproval, true);
+    assert.equal(harness.modelRequests.length, 2);
+    await harness.app.submit("请先解释失败原因");
+    assert.equal(harness.app.awaitingRepairApproval, true);
+    assert.equal(harness.modelRequests.length, 2);
+    await waitFor(() => stripAnsi(harness.terminal.output).includes("修复方向仍在等待确认"));
+
+    await harness.app.submit("CONTINUE");
+    await task;
+
+    assert.equal(harness.app.awaitingRepairApproval, false);
+    assert.equal(harness.modelRequests.length, 3);
+    assert.equal(harness.app.contextTurns, 1);
+    await waitFor(
+      () => stripAnsi(harness.terminal.output).includes("修复尚未完成成功复验"),
+      2_000,
+    );
+    assert.match(stripAnsi(harness.terminal.output), /修复方向已确认，正在进行一次有界修复/u);
+    assert.match(stripAnsi(harness.terminal.output), /修复尚未完成成功复验，任务以未完成状态停止/u);
+    assert.doesNotMatch(stripAnsi(harness.terminal.output), /已按确认的方向结束本次有界修复演示/u);
+    assertNoLocalControlWords(harness.modelRequests);
+  } finally {
+    harness.app.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("CANCEL 会闭锁后续修复，且不会把取消词发送给模型", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-repair-cancel-"));
+  const harness = createRepairTuiHarness(workspace);
+  try {
+    harness.app.start();
+    const task = harness.app.submit("运行测试，并在失败后等待我决定是否修复");
+    await waitFor(() => harness.app.awaitingRepairApproval);
+
+    await harness.app.submit("CANCEL");
+    await task;
+
+    assert.equal(harness.app.awaitingRepairApproval, false);
+    assert.equal(harness.runnerCalls, 1);
+    assert.equal(harness.modelRequests.length, 2);
+    assert.equal(harness.app.contextTurns, 1);
+    await waitFor(() => stripAnsi(harness.terminal.output).includes("已停止后续修复"));
+    const output = stripAnsi(harness.terminal.output);
+    assert.match(output, /已停止后续修复，当前工作区保持现状/u);
+    assert.match(output, /用户未确认修复方向，未继续修改文件或运行验证/u);
+    assertNoLocalControlWords(harness.modelRequests);
+  } finally {
+    harness.app.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("stop 会把待确认修复按拒绝收口且不再请求模型", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-repair-stop-"));
+  const harness = createRepairTuiHarness(workspace);
+  try {
+    harness.app.start();
+    const task = harness.app.submit("运行测试，并在失败后等待修复确认");
+    await waitFor(() => harness.app.awaitingRepairApproval);
+
+    harness.app.stop();
+    await task;
+
+    assert.equal(harness.app.awaitingRepairApproval, false);
+    assert.equal(harness.runnerCalls, 1);
+    assert.equal(harness.modelRequests.length, 2);
+    assert.equal(harness.app.contextTurns, 0);
+    assertNoLocalControlWords(harness.modelRequests);
+  } finally {
+    harness.app.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("运行中 Ctrl+C 会取消忽略 signal 的模型请求且不追加晚回答", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-cancel-model-"));
+  const terminal = new FakeTerminal();
+  let modelCalls = 0;
+  let resolveModel: ((response: ModelResponse) => void) | undefined;
+  let exits = 0;
+  const model: ChatModel = {
+    complete(_request, signal): Promise<ModelResponse> {
+      modelCalls += 1;
+      assert.ok(signal);
+      return new Promise((resolve) => {
+        resolveModel = resolve;
+      });
+    },
+  };
+  const options = parseArguments([
+    "--workspace",
+    process.cwd(),
+    "--audit",
+    path.join(reportDirectory, "audit.jsonl"),
+  ]);
+  const app = new MiniTuiApp(
+    options,
+    terminal,
+    new AgentLoop(model, new ToolRegistry([]), { workspaceRoot: process.cwd() }),
+    { onExit: () => { exits += 1; } },
+  );
+
+  try {
+    app.start();
+    const task = app.submit("等待一个不会自行结束的模型");
+    await waitFor(() => modelCalls === 1 && app.running);
+    terminal.send("\u0003");
+    await task;
+
+    assert.equal(app.running, false);
+    assert.equal(app.awaitingApproval, false);
+    assert.equal(app.contextTurns, 0);
+    assert.equal(exits, 0);
+    await waitFor(() => stripAnsi(terminal.output).includes("当前任务已取消"));
+    assert.match(stripAnsi(terminal.output), /当前任务已取消/u);
+
+    resolveModel?.({ kind: "final", content: "不应出现的晚回答" });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.doesNotMatch(stripAnsi(terminal.output), /不应出现的晚回答/u);
+    assert.equal(app.contextTurns, 0);
+
+    terminal.send("\u0003");
+    assert.equal(exits, 1);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("运行中 Ctrl+C 会同时关闭待确认修复", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-cancel-approval-"));
+  const harness = createRepairTuiHarness(workspace);
+  try {
+    harness.app.start();
+    const task = harness.app.submit("运行测试，并在修复确认处等待取消");
+    await waitFor(() => harness.app.awaitingRepairApproval);
+
+    harness.terminal.send("\u0003");
+    await task;
+
+    assert.equal(harness.app.awaitingRepairApproval, false);
+    assert.equal(harness.app.running, false);
+    assert.equal(harness.app.contextTurns, 0);
+    assert.equal(harness.runnerCalls, 1);
+    assert.equal(harness.modelRequests.length, 2);
+    await waitFor(() => stripAnsi(harness.terminal.output).includes("正在取消当前任务"));
+    assert.match(stripAnsi(harness.terminal.output), /正在取消当前任务/u);
+  } finally {
+    harness.app.stop();
+    await fs.rm(workspace, { recursive: true, force: true });
   }
 });
 

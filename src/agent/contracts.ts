@@ -33,6 +33,7 @@ export interface ToolResultMessage {
   name: string;
   status: "success" | "error";
   content: string;
+  metadata?: ToolExecutionMetadata;
   sourceEvidence?: readonly SourceEvidence[];
 }
 
@@ -63,6 +64,7 @@ export interface ToolExecutionContext {
   task: string;
   step: number;
   workspaceRoot: string;
+  signal?: AbortSignal;
   requireSourceEvidence?: boolean;
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
@@ -78,6 +80,13 @@ export interface EditApprovalRequest {
 
 export interface PlanApprovalRequest {
   plan: string;
+}
+
+export interface RepairApprovalRequest {
+  failedAction: string;
+  direction: string;
+  attempt: number;
+  maximumAttempts: number;
 }
 
 export type CommandApprovalKind = "verification" | "command";
@@ -106,6 +115,7 @@ export interface ToolExecutionMetadata {
   outputLength?: number;
   outputTruncated?: boolean;
   timedOut?: boolean;
+  cancelled?: boolean;
 }
 
 export interface SourceEvidence {
@@ -162,7 +172,7 @@ export interface ModelRequest {
   messages: readonly AgentMessage[];
   tools: readonly ToolDescription[];
   workingState: string;
-  phase?: "planning" | "execution";
+  phase?: "planning" | "repair_planning" | "execution";
   toolChoice?: ForcedFunctionToolChoice;
 }
 
@@ -171,5 +181,5 @@ export type ModelResponse =
   | { kind: "final"; content: string };
 
 export interface ChatModel {
-  complete(request: ModelRequest): Promise<ModelResponse>;
+  complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse>;
 }

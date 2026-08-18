@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import type { AgentTool, JsonValue, ToolExecutionOutput, ValidationResult } from "../agent/contracts.ts";
 import { WorkspaceAccessError, WorkspacePolicy } from "../workspace/workspace-policy.ts";
 import { validateLineNumber, validateObjectWithKeys } from "./input-validation.ts";
+import { decodeUtf8Strict, InvalidUtf8Error } from "./text-decoding.ts";
 
 interface ReadFileInput {
   path: string;
@@ -82,7 +83,16 @@ export const readFile: AgentTool<ReadFileInput, ToolExecutionOutput> = {
       throw new WorkspaceAccessError("拒绝读取可能是二进制的文件。");
     }
 
-    const lines = content.toString("utf8").split(/\r?\n/);
+    let decoded: string;
+    try {
+      decoded = decodeUtf8Strict(content);
+    } catch (error) {
+      if (error instanceof InvalidUtf8Error) {
+        throw new WorkspaceAccessError("拒绝读取不是有效 UTF-8 文本的文件。");
+      }
+      throw error;
+    }
+    const lines = decoded.split(/\r?\n/);
     const startLine = input.startLine ?? 1;
     if (startLine > lines.length) {
       throw new WorkspaceAccessError(`startLine 超出文件范围：文件共 ${lines.length} 行。`);

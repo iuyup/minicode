@@ -116,7 +116,14 @@ test("apply 模式只有确认后才原子写入，并且审计不保存补丁�
     assert.match(requestedPreview, /--- src\/example.ts/);
     assert.match(await fs.readFile(path.join(workspace, TARGET_PATH), "utf8"), /after-value/);
     assert.doesNotMatch(attempt.rawAudit, /before-value|after-value/);
-    assert.deepEqual(lifecycle(attempt.audit), ["tool_call", "tool_execution_started", "policy_decision", "tool_finalized"]);
+    assert.deepEqual(lifecycle(attempt.audit), [
+      "tool_call",
+      "tool_execution_started",
+      "policy_decision",
+      "edit_approval_requested",
+      "edit_approval_decision",
+      "tool_finalized",
+    ]);
     assert.equal(finalStatus(attempt.audit), "success");
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
@@ -184,8 +191,110 @@ test("用户拒绝确认时保持原文件，并产生错误终态", async () =>
 
     assert.equal(await fs.readFile(path.join(workspace, TARGET_PATH), "utf8"), ORIGINAL_SOURCE);
     assert.equal(attempt.result.messages.find((message) => message.role === "tool")?.status, "error");
-    assert.deepEqual(lifecycle(attempt.audit), ["tool_call", "tool_execution_started", "policy_decision", "tool_finalized"]);
+    assert.deepEqual(lifecycle(attempt.audit), [
+      "tool_call",
+      "tool_execution_started",
+      "policy_decision",
+      "edit_approval_requested",
+      "edit_approval_decision",
+      "tool_finalized",
+    ]);
     assert.equal(finalStatus(attempt.audit), "error");
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("apply_patch 拒绝非法 UTF-8 且保持原始字节不变", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  const invalidBytes = Buffer.from([0x62, 0x65, 0x66, 0x6f, 0x72, 0x65, 0x80, 0x76, 0x61, 0x6c, 0x75, 0x65]);
+  try {
+    await fs.writeFile(targetPath, invalidBytes);
+    let askedForApproval = false;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "before", newText: "after" },
+      "apply",
+      async () => {
+        askedForApproval = true;
+        return true;
+      },
+    );
+
+    assert.equal(askedForApproval, false);
+    assert.deepEqual(await fs.readFile(targetPath), invalidBytes);
+    const toolResult = attempt.result.messages.find((message) => message.role === "tool");
+    assert.equal(toolResult?.status, "error");
+    assert.match(toolResult?.content ?? "", /不是有效 UTF-8 文本/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("apply_patch 严格解码后仍保留原文件的 UTF-8 BOM", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  try {
+    await fs.writeFile(targetPath, Buffer.concat([bom, Buffer.from(ORIGINAL_SOURCE, "utf8")]));
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "before-value", newText: "after-value" },
+      "apply",
+      async () => true,
+    );
+
+    const updatedBytes = await fs.readFile(targetPath);
+    assert.equal(attempt.result.messages.find((message) => message.role === "tool")?.status, "success");
+    assert.deepEqual(updatedBytes.subarray(0, 3), bom);
+    assert.match(updatedBytes.subarray(3).toString("utf8"), /after-value/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("APPLY 返回后若任务已取消，原子写入不会开始", async () => {
+  const workspace = await createWorkspace();
+  const controller = new AbortController();
+  try {
+    await assert.rejects(
+      applyPatch.execute(
+        { path: TARGET_PATH, oldText: "before-value", newText: "after-value" },
+        {
+          task: "取消补丁",
+          step: 1,
+          workspaceRoot: workspace,
+          executionMode: "apply",
+          signal: controller.signal,
+          requestEditApproval: async () => {
+            controller.abort();
+            return true;
+          },
+        },
+      ),
+      /补丁写入已取消/,
+    );
+    assert.equal(await fs.readFile(path.join(workspace, TARGET_PATH), "utf8"), ORIGINAL_SOURCE);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("apply_patch 原子替换后保留 POSIX 文件 mode", { skip: process.platform === "win32" }, async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  try {
+    await fs.chmod(targetPath, 0o751);
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "before-value", newText: "after-value" },
+      "apply",
+      async () => true,
+    );
+
+    assert.equal(attempt.result.messages.find((message) => message.role === "tool")?.status, "success");
+    assert.equal((await fs.stat(targetPath)).mode & 0o777, 0o751);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }

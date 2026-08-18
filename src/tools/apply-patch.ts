@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { AgentTool, JsonObject, JsonValue, ValidationResult } from "../agent/contracts.ts";
+import { ToolExecutionError, type AgentTool, type JsonValue, type ValidationResult } from "../agent/contracts.ts";
 import { WorkspaceAccessError, WorkspacePolicy } from "../workspace/workspace-policy.ts";
 import { validateObjectWithKeys } from "./input-validation.ts";
+import { decodeUtf8Strict, InvalidUtf8Error } from "./text-decoding.ts";
 
 interface ApplyPatchInput {
   path: string;
@@ -81,15 +82,35 @@ function renderPreview(relativePath: string, oldText: string, newText: string): 
   ].join("\n");
 }
 
-async function writeAtomically(targetPath: string, content: string): Promise<void> {
+function throwIfCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new ToolExecutionError("补丁写入已取消。", { action: "apply_patch", cancelled: true });
+  }
+}
+
+async function writeAtomically(
+  targetPath: string,
+  content: string,
+  mode: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  const permissionBits = mode & 0o7777;
   const temporaryPath = path.join(
     path.dirname(targetPath),
     `.${path.basename(targetPath)}.minicode-${randomUUID()}.tmp`,
   );
   let temporaryFileExists = false;
   try {
-    await fs.writeFile(temporaryPath, content, "utf8");
+    const temporaryFile = await fs.open(temporaryPath, "wx", permissionBits);
     temporaryFileExists = true;
+    try {
+      await temporaryFile.writeFile(content, "utf8");
+      await temporaryFile.sync();
+    } finally {
+      await temporaryFile.close();
+    }
+    await fs.chmod(temporaryPath, permissionBits);
+    throwIfCancelled(signal);
     await fs.rename(temporaryPath, targetPath);
     temporaryFileExists = false;
   } finally {
@@ -143,7 +164,15 @@ export const applyPatch: AgentTool<ApplyPatchInput> = {
       throw new WorkspaceAccessError("拒绝修改可能是二进制的文件。");
     }
 
-    const source = sourceBytes.toString("utf8");
+    let source: string;
+    try {
+      source = decodeUtf8Strict(sourceBytes);
+    } catch (error) {
+      if (error instanceof InvalidUtf8Error) {
+        throw new WorkspaceAccessError("拒绝修改不是有效 UTF-8 文本的文件。");
+      }
+      throw error;
+    }
     const occurrences = countOccurrences(source, input.oldText);
     if (occurrences === 0) {
       throw new WorkspaceAccessError("oldText 未在目标文件中找到，未修改文件。");
@@ -165,13 +194,24 @@ export const applyPatch: AgentTool<ApplyPatchInput> = {
     if (!approved) {
       throw new WorkspaceAccessError("用户未确认补丁，未修改文件。");
     }
+    throwIfCancelled(context.signal);
 
-    const latestBytes = await fs.readFile(target.absolutePath);
-    if (!latestBytes.equals(sourceBytes)) {
+    const [latestBytes, latestStat] = await Promise.all([
+      fs.readFile(target.absolutePath),
+      fs.stat(target.absolutePath),
+    ]);
+    if (
+      !latestStat.isFile()
+      || latestStat.dev !== stat.dev
+      || latestStat.ino !== stat.ino
+      || (latestStat.mode & 0o7777) !== (stat.mode & 0o7777)
+      || !latestBytes.equals(sourceBytes)
+    ) {
       throw new WorkspaceAccessError("文件在确认期间发生变化，已取消写入以避免覆盖他人修改。");
     }
 
-    await writeAtomically(target.absolutePath, updated);
+    throwIfCancelled(context.signal);
+    await writeAtomically(target.absolutePath, updated, stat.mode, context.signal);
     return ["补丁已应用。", preview].join("\n");
   },
 };

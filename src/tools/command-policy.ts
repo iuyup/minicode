@@ -108,7 +108,8 @@ export function evaluateCommandPolicy(programInput: string, args: readonly strin
   }
 
   if (program === "node") {
-    if (args.some(isNodeInlineCodeArgument)) {
+    // Node 在入口脚本之后不再解析运行时参数；-e/--print 等值此时只是脚本自己的参数。
+    if (args[0] !== undefined && isNodeInlineCodeArgument(args[0])) {
       return block(
         "不允许使用 Node 的 eval/print 内联代码参数；请运行工作区中的可审查脚本。",
         "Node 内联代码参数已被策略阻断。",
@@ -140,7 +141,10 @@ export function evaluateCommandPolicy(programInput: string, args: readonly strin
     };
   }
 
-  if (args.some(isNpmLocationOverride)) {
+  // `--` 后的内容会原样传给 npm script，不应再按 npm 自身的目录覆盖参数处理。
+  const passthroughIndex = args.indexOf("--");
+  const npmArguments = passthroughIndex === -1 ? args : args.slice(0, passthroughIndex);
+  if (npmArguments.some(isNpmLocationOverride)) {
     return block(
       "不允许 npm 全局操作、配置文件覆盖或工作目录覆盖。",
       "npm 工作区边界覆盖参数已被策略阻断。",

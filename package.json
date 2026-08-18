@@ -14,7 +14,8 @@
     "demo": "node src/cli.ts",
     "mini": "node src/mini.ts",
     "prepare:edit-smoke": "node scripts/create-edit-smoke-workspace.mjs",
-    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/run-command.test.ts tests/inspect-git.test.ts tests/deepseek-model.test.ts tests/model-profiles.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts tests/mini-tui.test.ts",
+    "test:success-chain": "node --test tests/edit-workflow-e2e.test.ts",
+    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/run-command.test.ts tests/inspect-git.test.ts tests/deepseek-model.test.ts tests/model-profiles.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts tests/mini-tui.test.ts tests/edit-workflow-e2e.test.ts tests/terminal-safety.test.ts",
     "check": "tsc -p tsconfig.json"
   },
   "devDependencies": {

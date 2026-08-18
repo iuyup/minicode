@@ -4,13 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { AgentLoop } from "../src/agent/agent-loop.ts";
+import { AgentLoop, type AgentRunResult } from "../src/agent/agent-loop.ts";
 import type { AgentEvent, AgentEventAuditLog } from "../src/agent/events.ts";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { DeepSeekModel, deepSeekDefaults } from "../src/models/deepseek-model.ts";
-import { OpenAiCompatibleModel } from "../src/models/openai-compatible-model.ts";
-import { createAgent, parseArguments } from "../src/runtime.ts";
+import { OpenAiCompatibleModel, openAiCompatibleDefaults } from "../src/models/openai-compatible-model.ts";
+import { createAgent, defaultAuditPath, parseArguments, printRunResult } from "../src/runtime.ts";
 import { getProjectOverview } from "../src/tools/get-project-overview.ts";
 
 function requestFixture(): ModelRequest {
@@ -47,10 +47,30 @@ function requestFixture(): ModelRequest {
 }
 
 function jsonResponse(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), {
+  const normalized = asCompletionPayload(payload);
+  return new Response(JSON.stringify(normalized), {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function asCompletionPayload(payload: unknown): unknown {
+  if (typeof payload !== "object" || payload === null || !("choices" in payload)) return payload;
+  const choices = (payload as { choices?: unknown }).choices;
+  if (!Array.isArray(choices)) return payload;
+  return {
+    ...payload,
+    choices: choices.map((choice) => {
+      if (typeof choice !== "object" || choice === null || "finish_reason" in choice) return choice;
+      const message = "message" in choice && typeof choice.message === "object" && choice.message !== null
+        ? choice.message as { tool_calls?: unknown }
+        : undefined;
+      return {
+        ...choice,
+        finish_reason: Array.isArray(message?.tool_calls) ? "tool_calls" : "stop",
+      };
+    }),
+  };
 }
 
 test("DeepSeekModel 发送 OpenAI 兼容请求，并显式关闭思考模式", async () => {
@@ -431,4 +451,189 @@ test("DeepSeek HTTP 失败不会暴露响应正文，AgentLoop 会记录模型�
 
 test("DeepSeekModel 拒绝空 API Key", () => {
   assert.throws(() => new DeepSeekModel({ apiKey: "  " }), /DEEPSEEK_API_KEY 不能为空/);
+});
+
+test("OpenAiCompatibleModel 构造器本身也拒绝不安全的 baseUrl", () => {
+  const create = (baseUrl: string) => new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl,
+    model: "test-model",
+    providerName: "Test provider",
+  });
+  assert.throws(() => create("file:///tmp/v1"), /http 或 https/);
+  assert.throws(() => create("https://user:secret@example.test/v1"), /用户名或密码/);
+  assert.throws(() => create("https://example.test/v1?"), /查询参数/);
+  assert.throws(() => create("https://example.test/v1#"), /URL 片段/);
+});
+
+test("OpenAiCompatibleModel 严格校验 finish_reason、最终文本和工具调用标识", async () => {
+  const payloads: Array<{ payload: unknown; expected: RegExp }> = [
+    {
+      payload: { choices: [{ message: { role: "assistant", content: "未标记终态" } }] },
+      expected: /缺少 finish_reason/,
+    },
+    {
+      payload: { choices: [{ finish_reason: "length", message: { role: "assistant", content: "被截断" } }] },
+      expected: /长度限制被截断/,
+    },
+    {
+      payload: { choices: [{ finish_reason: "stop", message: { role: "assistant", content: "   " } }] },
+      expected: /空的最终回答/,
+    },
+    {
+      payload: { choices: [{ finish_reason: "tool_calls", message: { role: "assistant", content: "", tool_calls: [] } }] },
+      expected: /工具数组为空或无效/,
+    },
+    {
+      payload: {
+        choices: [{
+          finish_reason: "tool_calls",
+          message: {
+            role: "assistant",
+            content: "",
+            tool_calls: [{ id: " ", type: "function", function: { name: "read_file", arguments: "{}" } }],
+          },
+        }],
+      },
+      expected: /缺少非空 id 或工具名/,
+    },
+    {
+      payload: {
+        choices: [{
+          finish_reason: "tool_calls",
+          message: {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              { id: "same", type: "function", function: { name: "read_file", arguments: "{}" } },
+              { id: "same", type: "function", function: { name: "list_files", arguments: "{}" } },
+            ],
+          },
+        }],
+      },
+      expected: /重复的工具调用 id：same/,
+    },
+  ];
+
+  for (const { payload, expected } of payloads) {
+    const model = new OpenAiCompatibleModel({
+      apiKey: "test-key",
+      baseUrl: "https://example.test/v1",
+      model: "test-model",
+      providerName: "Test provider",
+      fetchImplementation: async () => new Response(JSON.stringify(payload)),
+    });
+    await assert.rejects(model.complete(requestFixture()), expected);
+  }
+});
+
+test("OpenAiCompatibleModel 超时覆盖响应正文读取且不会被 pending reader 掩盖", async () => {
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "test-model",
+    providerName: "Test provider",
+    timeoutMs: 20,
+    fetchImplementation: async () => new Response(new ReadableStream<Uint8Array>({
+      pull() {
+        return new Promise<void>(() => {});
+      },
+    })),
+  });
+
+  await assert.rejects(model.complete(requestFixture()), /请求超时（20ms）/);
+});
+
+test("OpenAiCompatibleModel 限制响应体并传播外部取消", async () => {
+  const oversized = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "test-model",
+    providerName: "Test provider",
+    maxResponseBytes: 32,
+    fetchImplementation: async () => new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { role: "assistant", content: "x".repeat(100) } }],
+    })),
+  });
+  await assert.rejects(oversized.complete(requestFixture()), /响应正文超过 32 字节上限/);
+
+  const controller = new AbortController();
+  const captured: { signal?: AbortSignal } = {};
+  const cancellable = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "test-model",
+    providerName: "Test provider",
+    fetchImplementation: async (_input, init) => {
+      captured.signal = init?.signal as AbortSignal;
+      return await new Promise<Response>(() => {});
+    },
+  });
+  const pending = cancellable.complete(requestFixture(), controller.signal);
+  controller.abort();
+  await assert.rejects(pending, /请求已取消/);
+  assert.equal(captured.signal?.aborted, true);
+  assert.equal(openAiCompatibleDefaults.maxResponseBytes, 1_048_576);
+});
+
+test("OpenAiCompatibleModel 拒绝响应正文中的非法 UTF-8", async () => {
+  const invalidResponse = Buffer.concat([
+    Buffer.from('{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"', "utf8"),
+    Buffer.from([0xff]),
+    Buffer.from('"}}]}', "utf8"),
+  ]);
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "test-model",
+    providerName: "Test provider",
+    fetchImplementation: async () => new Response(invalidResponse),
+  });
+
+  await assert.rejects(model.complete(requestFixture()), /响应解析失败/);
+});
+
+test("非 TUI 运行结果会转义模型、工具和路径中的终端控制序列", () => {
+  const csi = "\u001B[2J";
+  const osc = "\u001B]2;PWN\u0007";
+  const result: AgentRunResult = {
+    answer: `answer ${osc}`,
+    messages: [],
+    events: [{ type: "tool_call", step: 1, toolCallId: "unsafe", toolName: `read_file${csi}` }],
+    workingState: `state ${csi}`,
+    sourceEvidence: [{ path: `src/${osc}.ts`, startLine: 1, endLine: 1 }],
+  };
+  const options = parseArguments(["--require-source-evidence", "检查输出"]);
+  options.auditPath = `C:\\audit${osc}.jsonl`;
+  let output = "";
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => {
+    output += `${values.map(String).join(" ")}\n`;
+  };
+  try {
+    printRunResult(result, options);
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.doesNotMatch(output, /\u001B\[2J|\u001B\]2;PWN\u0007/u);
+  assert.match(output, /\\u001B\[2J/u);
+  assert.match(output, /\\u001B\]2;PWN\\u0007/u);
+});
+
+test("parseArguments 不吞缺值选项，拒绝未知选项并支持显式任务分隔符", () => {
+  assert.throws(() => parseArguments(["--workspace", "--guided"]), /--workspace 后必须提供一个值/);
+  assert.throws(() => parseArguments(["--unknown"]), /未知选项：--unknown/);
+  const parsed = parseArguments(["--guided", "--", "--looks-like-an-option", "继续任务"]);
+  assert.equal(parsed.guided, true);
+  assert.equal(parsed.task, "--looks-like-an-option 继续任务");
+});
+
+test("默认审计路径位于用户级目录并具有会话唯一文件名", () => {
+  const auditPath = defaultAuditPath();
+  const expectedRoot = process.platform === "win32" && process.env.LOCALAPPDATA?.trim()
+    ? path.join(process.env.LOCALAPPDATA, "MiniCode", "audit")
+    : path.join(os.homedir(), ".minicode", "audit");
+  assert.equal(path.dirname(auditPath), expectedRoot);
+  assert.match(path.basename(auditPath), /^session-.+\.jsonl$/);
 });

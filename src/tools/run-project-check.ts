@@ -25,7 +25,7 @@ interface RunProjectCheckInput {
 export interface ProjectCheckRunResult extends BoundedProcessResult {}
 
 export interface ProjectCheckRunner {
-  run(action: ProjectCheckAction, workspaceRoot: string): Promise<ProjectCheckRunResult>;
+  run(action: ProjectCheckAction, workspaceRoot: string, signal?: AbortSignal): Promise<ProjectCheckRunResult>;
 }
 
 const ACTION_ARGUMENTS: Record<ProjectCheckAction, readonly string[]> = {
@@ -52,7 +52,7 @@ function validate(input: JsonValue): ValidationResult<RunProjectCheckInput> {
 }
 
 class NpmProjectCheckRunner implements ProjectCheckRunner {
-  async run(action: ProjectCheckAction, workspaceRoot: string): Promise<ProjectCheckRunResult> {
+  async run(action: ProjectCheckAction, workspaceRoot: string, signal?: AbortSignal): Promise<ProjectCheckRunResult> {
     const npmCli = await resolveNpmCli();
     return runBoundedProcess({
       executable: process.execPath,
@@ -63,6 +63,7 @@ class NpmProjectCheckRunner implements ProjectCheckRunner {
       startFailureLabel: ` ${ACTION_LABELS[action]}`,
       timeoutMs: TIMEOUT_MS,
       maxOutputChars: MAX_OUTPUT_CHARS,
+      signal,
     });
   }
 }
@@ -76,6 +77,7 @@ function metadata(action: ProjectCheckAction, result: ProjectCheckRunResult): To
     outputLength: result.outputLength,
     outputTruncated: result.outputTruncated,
     timedOut: result.timedOut,
+    cancelled: result.cancelled ?? false,
   };
 }
 
@@ -125,7 +127,7 @@ export function createRunProjectCheckTool(
       });
       let result: ProjectCheckRunResult;
       try {
-        result = await runner.run(input.action, context.workspaceRoot);
+        result = await runner.run(input.action, context.workspaceRoot, context.signal);
       } catch (error) {
         if (error instanceof ToolExecutionError) {
           throw new ToolExecutionError(error.message, {
@@ -143,6 +145,9 @@ export function createRunProjectCheckTool(
       const resultMetadata = metadata(input.action, result);
       const content = renderOutput(input.action, result);
 
+      if (result.cancelled) {
+        throw new ToolExecutionError(`固定验证动作已取消。\n${content}`, resultMetadata);
+      }
       if (result.timedOut) {
         throw new ToolExecutionError(`固定验证动作超时（${TIMEOUT_MS}ms）。\n${content}`, resultMetadata);
       }

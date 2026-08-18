@@ -311,6 +311,34 @@ test("超时与截断作为受限执行结果处理，审计不保存输出", as
   }
 });
 
+test("执行中取消固定验证会返回取消错误并记录 cancelled 元数据", async () => {
+  const workspace = await createWorkspace({ test: "node -e \"console.log('unused')\"" });
+  try {
+    const runner: ProjectCheckRunner = {
+      async run(): Promise<ProjectCheckRunResult> {
+        return {
+          exitCode: null,
+          durationMs: 25,
+          output: "cancelled locally",
+          outputLength: 17,
+          outputTruncated: false,
+          timedOut: false,
+          cancelled: true,
+        };
+      },
+    };
+    const attempt = await runCheckAttempt(workspace, createRunProjectCheckTool(runner), { action: "test" });
+
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /固定验证动作已取消/);
+    assert.equal(finalizedAudit(attempt)?.cancelled, true);
+    assert.equal(finalizedAudit(attempt)?.timedOut, false);
+    assert.doesNotMatch(attempt.rawAudit, /cancelled locally/);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("固定验证动作无法启动时仍保留动作审计和错误终态", async () => {
   const workspace = await createWorkspace({ test: "node -e \"console.log('unused')\"" });
   try {

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline/promises";
@@ -8,10 +10,11 @@ import type {
   CommandApprovalRequest,
   EditApprovalRequest,
   PlanApprovalRequest,
+  RepairApprovalRequest,
   ToolExecutionMode,
 } from "./agent/contracts.ts";
 import { JsonlAuditLog, type AgentEvent } from "./agent/events.ts";
-import { escapeTerminalText } from "./terminal-safety.ts";
+import { escapeMultilineTerminalText, escapeTerminalText } from "./terminal-safety.ts";
 import { ToolRegistry } from "./agent/tool-registry.ts";
 import { FakeModel } from "./models/fake-model.ts";
 import {
@@ -46,9 +49,11 @@ export interface CliArguments {
 }
 
 export interface CreateAgentOptions {
+  model?: ChatModel;
   onEvent?: (event: AgentEvent) => void;
   requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
   requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
+  requestRepairApproval?: (request: RepairApprovalRequest) => Promise<boolean>;
   requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
 }
 
@@ -72,6 +77,7 @@ const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
   "run_command 必须把程序、参数数组和工作区相对目录分开提供；第一版只支持 node/npm，不接受直接 Shell、管道、重定向、Git、提权、后台任务或环境变量注入。npm/工作区脚本自身仍可能启动 Shell 或子进程。",
   "Git 只能通过 inspect_git 的 status、diff、staged_diff 固定动作读取；不得要求暂存、提交、切换分支、重置或推送。完成修改和验证后，在工具预算允许时读取 Git 状态与相关差异，并明确提交仍由用户手动完成。",
   "终端会完整展示命令、工作目录和风险等级；只有用户精确输入 RUN 才会执行。RUN 是本地确认词，不能作为用户消息处理或要求模型等待。",
+  "在 guided 编辑模式中，固定验证真实失败后会进入一次无工具修复方向阶段；只给出失败判断、拟修改文件和复验动作，等待本地 CONTINUE 确认后再继续。一次修复复验仍失败时必须停止修复并总结未完成状态。",
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
 
@@ -96,11 +102,27 @@ const DEEPSEEK_SOURCE_EVIDENCE_PROMPT = [
   "若收到源码证据修复反馈，下一轮只能给出最终回答，不得请求工具。",
 ].join(" ");
 
+export function defaultAuditPath(): string {
+  const userAuditRoot = process.platform === "win32" && process.env.LOCALAPPDATA?.trim()
+    ? path.join(process.env.LOCALAPPDATA, "MiniCode", "audit")
+    : path.join(os.homedir(), ".minicode", "audit");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return path.join(userAuditRoot, `session-${stamp}-${randomUUID()}.jsonl`);
+}
+
+function requiredOptionValue(args: readonly string[], index: number, optionName: string): string {
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error(`${optionName} 后必须提供一个值。`);
+  }
+  return value;
+}
+
 export function parseArguments(args: string[]): CliArguments {
   let workspaceRoot = process.cwd();
   let executionMode: ToolExecutionMode = "propose";
   let agentMode: CliArguments["agentMode"] = "read";
-  let auditPath = path.resolve("reports/tool-audit.jsonl");
+  let auditPath = defaultAuditPath();
   let modelProfile: ModelProfileId = "fake";
   const deepseekProfile = getModelProfile("deepseek");
   let deepseekModel = deepseekProfile.kind === "openai-compatible" ? deepseekProfile.model : "";
@@ -110,9 +132,12 @@ export function parseArguments(args: string[]): CliArguments {
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
+    if (argument === "--") {
+      taskParts.push(...args.slice(index + 1));
+      break;
+    }
     if (argument === "--workspace") {
-      const requestedWorkspace = args[index + 1];
-      if (!requestedWorkspace) throw new Error("--workspace 后必须提供一个目录路径。");
+      const requestedWorkspace = requiredOptionValue(args, index, "--workspace");
       workspaceRoot = requestedWorkspace;
       index += 1;
       continue;
@@ -123,7 +148,7 @@ export function parseArguments(args: string[]): CliArguments {
       continue;
     }
     if (argument === "--mode") {
-      const requestedMode = args[index + 1];
+      const requestedMode = requiredOptionValue(args, index, "--mode");
       if (requestedMode !== "read" && requestedMode !== "edit") {
         throw new Error("--mode 只能是 read 或 edit。");
       }
@@ -133,14 +158,13 @@ export function parseArguments(args: string[]): CliArguments {
       continue;
     }
     if (argument === "--audit") {
-      const requestedAuditPath = args[index + 1];
-      if (!requestedAuditPath) throw new Error("--audit 后必须提供一个文件路径。");
+      const requestedAuditPath = requiredOptionValue(args, index, "--audit");
       auditPath = path.resolve(requestedAuditPath);
       index += 1;
       continue;
     }
     if (argument === "--model") {
-      const requestedProvider = args[index + 1];
+      const requestedProvider = requiredOptionValue(args, index, "--model");
       if (requestedProvider !== "fake" && requestedProvider !== "deepseek") {
         throw new Error("--model 只能是 fake 或 deepseek。");
       }
@@ -149,8 +173,8 @@ export function parseArguments(args: string[]): CliArguments {
       continue;
     }
     if (argument === "--profile") {
-      const requestedProfile = args[index + 1];
-      const parsedProfile = requestedProfile ? parseModelProfileId(requestedProfile) : undefined;
+      const requestedProfile = requiredOptionValue(args, index, "--profile");
+      const parsedProfile = parseModelProfileId(requestedProfile);
       if (!parsedProfile) {
         throw new Error("--profile 只支持 fake、deepseek 或 openai-compatible。");
       }
@@ -159,8 +183,7 @@ export function parseArguments(args: string[]): CliArguments {
       continue;
     }
     if (argument === "--deepseek-model") {
-      const requestedModel = args[index + 1];
-      if (!requestedModel) throw new Error("--deepseek-model 后必须提供模型标识。");
+      const requestedModel = requiredOptionValue(args, index, "--deepseek-model");
       deepseekModel = requestedModel;
       index += 1;
       continue;
@@ -172,6 +195,9 @@ export function parseArguments(args: string[]): CliArguments {
     if (argument === "--guided") {
       guided = true;
       continue;
+    }
+    if (argument.startsWith("--")) {
+      throw new Error(`未知选项：${argument}。若任务文本需要以 -- 开头，请先使用独立的 --。`);
     }
     taskParts.push(argument);
   }
@@ -251,7 +277,9 @@ async function requestTerminalApproval(request: EditApprovalRequest): Promise<bo
 
   const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    process.stdout.write(`\n待写入文件：${request.path}\n${request.preview}\n`);
+    process.stdout.write(
+      `\n待写入文件：${escapeTerminalText(request.path)}\n${escapeMultilineTerminalText(request.preview)}\n`,
+    );
     const answer = await terminal.question("输入 APPLY 确认写入，输入其他内容取消：");
     return answer.trim() === "APPLY";
   } finally {
@@ -266,8 +294,25 @@ async function requestTerminalPlanApproval(request: PlanApprovalRequest): Promis
 
   const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    process.stdout.write(`\n待确认计划：\n${request.plan}\n`);
+    process.stdout.write(`\n待确认计划：\n${escapeMultilineTerminalText(request.plan)}\n`);
     const answer = await terminal.question("输入 CONTINUE 开始执行，输入 CANCEL 取消：");
+    return answer.trim() === "CONTINUE";
+  } finally {
+    terminal.close();
+  }
+}
+
+async function requestTerminalRepairApproval(request: RepairApprovalRequest): Promise<boolean> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error("失败修复只能在交互式终端中使用，以便人工确认修复方向。");
+  }
+
+  const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    process.stdout.write(
+      `\n待确认修复方向（失败动作：${escapeTerminalText(request.failedAction)}，尝试 ${request.attempt}/${request.maximumAttempts}）：\n${escapeMultilineTerminalText(request.direction)}\n`,
+    );
+    const answer = await terminal.question("输入 CONTINUE 允许一次修复，输入 CANCEL 停止：");
     return answer.trim() === "CONTINUE";
   } finally {
     terminal.close();
@@ -305,12 +350,14 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
           ? editTools
           : [...readOnlyTools, applyPatch, runProjectCheck],
   );
-  return new AgentLoop(createModel(argumentsValue), registry, {
+  return new AgentLoop(options.model ?? createModel(argumentsValue), registry, {
     workspaceRoot: argumentsValue.workspaceRoot,
     maxSteps: argumentsValue.agentMode === "edit" ? 7 : undefined,
     executionMode: argumentsValue.executionMode,
     requireSourceEvidence: argumentsValue.requireSourceEvidence,
     requirePlanApproval: argumentsValue.guided,
+    planningPrompt: argumentsValue.guided ? GUIDED_PLAN_PROMPT : undefined,
+    enableFailureRepair: argumentsValue.guided && argumentsValue.agentMode === "edit",
     requireReadBeforeEdit: usesRemoteModel(argumentsValue) && argumentsValue.agentMode === "edit",
     ...(usesRemoteModel(argumentsValue)
       ? {
@@ -320,7 +367,6 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
               : argumentsValue.agentMode === "edit"
                 ? `${DEEPSEEK_EDIT_SYSTEM_PROMPT} ${DEEPSEEK_EDIT_TOOL_PROTOCOL}`
                 : DEEPSEEK_SYSTEM_PROMPT,
-            ...(argumentsValue.guided ? [GUIDED_PLAN_PROMPT] : []),
           ].join(" "),
           maxToolCallsPerStep: argumentsValue.requireSourceEvidence || argumentsValue.agentMode === "edit" ? 1 : 2,
           maxToolCalls: 6,
@@ -332,6 +378,9 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
       : undefined,
     requestPlanApproval: argumentsValue.guided
       ? options.requestPlanApproval ?? requestTerminalPlanApproval
+      : undefined,
+    requestRepairApproval: argumentsValue.guided && argumentsValue.agentMode === "edit"
+      ? options.requestRepairApproval ?? requestTerminalRepairApproval
       : undefined,
     requestCommandApproval: options.requestCommandApproval ?? requestTerminalCommandApproval,
     auditLog: new JsonlAuditLog(argumentsValue.auditPath),
@@ -360,32 +409,32 @@ export function toolPermissionLabel(argumentsValue: CliArguments): string {
 
 export function printRunResult(result: AgentRunResult, argumentsValue: CliArguments): void {
   console.log("=== 生命周期事件 ===");
-  console.log(`模型：${modelLabel(argumentsValue)}`);
-  console.log(`工具权限：${toolPermissionLabel(argumentsValue)}`);
+  console.log(`模型：${escapeTerminalText(modelLabel(argumentsValue))}`);
+  console.log(`工具权限：${escapeTerminalText(toolPermissionLabel(argumentsValue))}`);
   console.log(`源码证据校验：${argumentsValue.requireSourceEvidence ? "已启用" : "未启用"}`);
   for (const event of result.events) {
     if (event.type === "tool_finalized") {
-      console.log(`${event.type} (${event.status}) -> ${event.toolName}`);
+      console.log(`${event.type} (${event.status}) -> ${escapeTerminalText(event.toolName)}`);
     } else if (event.type === "model_requested" && event.forcedToolName) {
-      console.log(`${event.type} (强制) -> ${event.forcedToolName}`);
+      console.log(`${event.type} (强制) -> ${escapeTerminalText(event.forcedToolName)}`);
     } else if ("toolName" in event) {
-      console.log(`${event.type} -> ${event.toolName}`);
+      console.log(`${event.type} -> ${escapeTerminalText(event.toolName)}`);
     } else {
       console.log(event.type);
     }
   }
 
   console.log("\n=== 最终回答 ===");
-  console.log(result.answer);
+  console.log(escapeMultilineTerminalText(result.answer));
   if (argumentsValue.requireSourceEvidence) {
     console.log("\n=== 已验证源码证据 ===");
     for (const evidence of result.sourceEvidence) {
-      console.log(`${evidence.path}:${evidence.startLine}-${evidence.endLine}`);
+      console.log(`${escapeTerminalText(evidence.path)}:${evidence.startLine}-${evidence.endLine}`);
     }
   }
   console.log("\n=== 任务账本 ===");
-  console.log(result.workingState);
-  console.log(`\n审计文件：${argumentsValue.auditPath}`);
+  console.log(escapeMultilineTerminalText(result.workingState));
+  console.log(`\n审计文件：${escapeTerminalText(argumentsValue.auditPath)}`);
 }
 
 export async function runDemo(args: string[] = process.argv.slice(2)): Promise<void> {
