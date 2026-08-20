@@ -1170,6 +1170,137 @@ test("AbortSignal reaches model and tools, rejects remaining calls, and records 
   });
 });
 
+test("permanently pending approvals are bounded by AbortSignal", async (t) => {
+  async function settleWithin(promise: Promise<unknown>): Promise<void> {
+    await Promise.race([
+      promise.then(() => undefined, () => undefined),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("approval cancellation did not settle")), 500);
+      }),
+    ]);
+  }
+
+  function pendingApproval<T>(controller: AbortController) {
+    return async (_request: T, signal?: AbortSignal): Promise<boolean> => {
+      assert.equal(signal, controller.signal);
+      queueMicrotask(() => controller.abort());
+      return await new Promise<boolean>(() => {});
+    };
+  }
+
+  await t.test("plan approval", async () => {
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+    const agent = new AgentLoop({
+      async complete() {
+        return { kind: "final", content: "Inspect before changing anything." };
+      },
+    }, new ToolRegistry([]), {
+      workspaceRoot: process.cwd(),
+      requirePlanApproval: true,
+      requestPlanApproval: pendingApproval(controller),
+      onEvent: (event) => events.push(event),
+    });
+    const resultPromise = agent.run("Cancel a pending plan.", { signal: controller.signal });
+    await settleWithin(resultPromise);
+    const result = await resultPromise;
+    assert.match(result.answer, /取消/);
+    assert.doesNotMatch(result.answer, /确认不可用/);
+    assert.equal(events.at(-1)?.type, "agent_stopped");
+  });
+
+  await t.test("command approval", async () => {
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+    const projectCheck = createProjectCheckTool(["success"]);
+    const model: ChatModel = {
+      async complete() {
+        return {
+          kind: "tool_calls",
+          content: "Run one check.",
+          toolCalls: [{ id: "pending-command", name: "run_project_check", input: {} }],
+        };
+      },
+    };
+    const agent = new AgentLoop(model, new ToolRegistry([projectCheck.tool]), {
+      workspaceRoot: process.cwd(),
+      requestCommandApproval: pendingApproval(controller),
+      onEvent: (event) => events.push(event),
+    });
+    await settleWithin(agent.run("Cancel a pending command.", { signal: controller.signal }));
+    assert.equal(projectCheck.executionCount, 0);
+    assert.equal(events.some((event) => event.type === "tool_execution_started"), false);
+    assert.equal(events.at(-1)?.type, "agent_stopped");
+  });
+
+  await t.test("edit approval", async () => {
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+    let editEffects = 0;
+    const editTool: AgentTool<JsonValue> = {
+      ...emptyTool,
+      name: "pending_edit",
+      async execute(_input, context) {
+        const approved = await context.requestEditApproval?.({
+          path: "src/example.ts",
+          preview: "safe preview",
+        });
+        if (approved) editEffects += 1;
+        return "edit closed";
+      },
+    };
+    const model: ChatModel = {
+      async complete() {
+        return {
+          kind: "tool_calls",
+          content: "Request one edit.",
+          toolCalls: [{ id: "pending-edit", name: "pending_edit", input: {} }],
+        };
+      },
+    };
+    const agent = new AgentLoop(model, new ToolRegistry([editTool]), {
+      workspaceRoot: process.cwd(),
+      requestEditApproval: pendingApproval(controller),
+      onEvent: (event) => events.push(event),
+    });
+    await settleWithin(agent.run("Cancel a pending edit.", { signal: controller.signal }));
+    assert.equal(editEffects, 0);
+    assert.equal(events.at(-1)?.type, "agent_stopped");
+  });
+
+  await t.test("repair approval", async () => {
+    const controller = new AbortController();
+    const events: AgentEvent[] = [];
+    const projectCheck = createProjectCheckTool(["nonzero"]);
+    let modelCalls = 0;
+    const model: ChatModel = {
+      async complete(request) {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            kind: "tool_calls",
+            content: "Run the failing check.",
+            toolCalls: [{ id: "repair-check", name: "run_project_check", input: {} }],
+          };
+        }
+        assert.equal(request.phase, "repair_planning");
+        return { kind: "final", content: "Apply one small repair." };
+      },
+    };
+    const agent = new AgentLoop(model, new ToolRegistry([projectCheck.tool]), {
+      workspaceRoot: process.cwd(),
+      enableFailureRepair: true,
+      requestCommandApproval: async () => true,
+      requestRepairApproval: pendingApproval(controller),
+      onEvent: (event) => events.push(event),
+    });
+    await settleWithin(agent.run("Cancel a pending repair.", { signal: controller.signal }));
+    assert.equal(projectCheck.executionCount, 1);
+    assert.equal(modelCalls, 2);
+    assert.equal(events.at(-1)?.type, "agent_stopped");
+  });
+});
+
 test("a passing recheck without a successful patch cannot complete a repair", async () => {
   const projectCheck = createProjectCheckTool(["nonzero", "success"]);
   const failedPatch = createCountingTool("apply_patch", () => {

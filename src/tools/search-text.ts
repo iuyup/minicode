@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 
 import type { AgentTool, JsonValue, ValidationResult } from "../agent/contracts.ts";
 import { ToolExecutionError } from "../agent/contracts.ts";
-import { WorkspaceAccessError, WorkspacePolicy, shouldSkipWorkspaceEntry } from "../workspace/workspace-policy.ts";
+import { WorkspaceAccessError, WorkspacePolicy } from "../workspace/workspace-policy.ts";
 import { validateObjectWithKeys, validateOptionalPath } from "./input-validation.ts";
 import { decodeUtf8Strict, InvalidUtf8Error } from "./text-decoding.ts";
 
@@ -80,7 +80,17 @@ async function readDirectoryBounded(directory: string, budget: SearchBudget): Pr
   return entries.sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function collectFiles(directory: string, budget: SearchBudget, depth: number): Promise<void> {
+function childRelativePath(parent: string, child: string): string {
+  return parent === "." ? child : `${parent}/${child}`;
+}
+
+async function collectFiles(
+  directory: string,
+  relativeDirectory: string,
+  policy: WorkspacePolicy,
+  budget: SearchBudget,
+  depth: number,
+): Promise<void> {
   if (shouldStop(budget)) return;
   if (budget.directoriesVisited >= MAX_DIRECTORIES_TO_SCAN) {
     budget.directoryLimitReached = true;
@@ -91,11 +101,15 @@ async function collectFiles(directory: string, budget: SearchBudget, depth: numb
   const entries = await readDirectoryBounded(directory, budget);
   for (const entry of entries) {
     if (shouldStop(budget)) return;
-    if (entry.isSymbolicLink() || shouldSkipWorkspaceEntry(entry.name)) {
+    if (entry.isSymbolicLink()) {
       continue;
     }
 
     const fullPath = path.join(directory, entry.name);
+    const relativePath = childRelativePath(relativeDirectory, entry.name);
+    if (await policy.shouldSkipPath(relativePath)) {
+      continue;
+    }
     if (entry.isDirectory()) {
       if (depth >= MAX_SEARCH_DEPTH) {
         budget.depthLimitReached = true;
@@ -105,7 +119,7 @@ async function collectFiles(directory: string, budget: SearchBudget, depth: numb
         budget.fileLimitReached = true;
         continue;
       }
-      await collectFiles(fullPath, budget, depth + 1);
+      await collectFiles(fullPath, relativePath, policy, budget, depth + 1);
     } else if (entry.isFile()) {
       if (budget.files.length >= MAX_FILES_TO_SCAN) {
         budget.fileLimitReached = true;
@@ -161,7 +175,7 @@ export const searchText: AgentTool<SearchTextInput> = {
       timeLimitReached: false,
       cancelled: false,
     };
-    await collectFiles(scope.absolutePath, budget, 0);
+    await collectFiles(scope.absolutePath, scope.relativePath, policy, budget, 0);
     if (budget.cancelled) {
       throw new ToolExecutionError("文本搜索已取消。", { action: "search_text", cancelled: true });
     }

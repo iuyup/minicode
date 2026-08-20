@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { constants, type BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import process from "node:process";
 
 import { ToolExecutionError, type AgentTool, type JsonValue, type ValidationResult } from "../agent/contracts.ts";
 import { WorkspaceAccessError, WorkspacePolicy } from "../workspace/workspace-policy.ts";
@@ -13,10 +15,40 @@ interface ApplyPatchInput {
   newText: string;
 }
 
+interface RenderedBlock {
+  complete: boolean;
+  lines: string[];
+}
+
+interface RenderedPreview {
+  complete: boolean;
+  text: string;
+}
+
+interface FileIdentity {
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  size: bigint;
+}
+
+interface TargetSnapshot {
+  bytes: Buffer;
+  identity: FileIdentity;
+}
+
+interface PreparedPatchTarget {
+  absolutePath: string;
+  relativePath: string;
+  file: TargetSnapshot;
+  parent: FileIdentity;
+}
+
 const MAX_CHANGE_CHARS = 8_000;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_PREVIEW_LINES = 40;
 const MAX_PREVIEW_LINE_CHARS = 200;
+const CHANGED_DURING_APPROVAL_MESSAGE = "文件或父目录在确认期间发生变化，已取消写入以避免覆盖其他对象。";
 
 function validateText(value: JsonValue | undefined, key: string, allowEmpty: boolean): ValidationResult<string> {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
@@ -58,28 +90,137 @@ function countOccurrences(content: string, target: string): number {
       return count;
     }
     count += 1;
-    start = index + target.length;
+    if (count > 1) {
+      return count;
+    }
+    start = index + 1;
   }
   return count;
 }
 
-function renderBlock(prefix: string, content: string): string[] {
-  const lines = content.split(/\r?\n/).slice(0, MAX_PREVIEW_LINES);
-  const rendered = lines.map((line) => `${prefix}${line.slice(0, MAX_PREVIEW_LINE_CHARS)}`);
-  if (content.split(/\r?\n/).length > MAX_PREVIEW_LINES) {
+function renderBlock(prefix: string, content: string): RenderedBlock {
+  const allLines = content.split(/\r\n|\r|\n/);
+  const rendered: string[] = [];
+  let complete = allLines.length <= MAX_PREVIEW_LINES;
+
+  for (const line of allLines.slice(0, MAX_PREVIEW_LINES)) {
+    if (line.length > MAX_PREVIEW_LINE_CHARS) {
+      complete = false;
+      rendered.push(`${prefix}${line.slice(0, MAX_PREVIEW_LINE_CHARS)}[预览已截断]`);
+    } else {
+      rendered.push(`${prefix}${line}`);
+    }
+  }
+  if (allLines.length > MAX_PREVIEW_LINES) {
     rendered.push(`${prefix}[预览已截断]`);
   }
-  return rendered;
+  return { complete, lines: rendered };
 }
 
-function renderPreview(relativePath: string, oldText: string, newText: string): string {
-  return [
-    `--- ${relativePath}`,
-    `+++ ${relativePath}`,
-    "@@ 精确文本替换 @@",
-    ...renderBlock("-", oldText),
-    ...renderBlock("+", newText),
-  ].join("\n");
+function renderPreview(relativePath: string, oldText: string, newText: string): RenderedPreview {
+  const oldBlock = renderBlock("-", oldText);
+  const newBlock = renderBlock("+", newText);
+  return {
+    complete: oldBlock.complete && newBlock.complete,
+    text: [
+      `--- ${relativePath}`,
+      `+++ ${relativePath}`,
+      "@@ 精确文本替换 @@",
+      ...oldBlock.lines,
+      ...newBlock.lines,
+    ].join("\n"),
+  };
+}
+
+function identityFrom(stats: { dev: bigint; ino: bigint; mode: bigint; size: bigint }): FileIdentity {
+  return { dev: stats.dev, ino: stats.ino, mode: stats.mode, size: stats.size };
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity, compareSize = true): boolean {
+  return (
+    left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && (!compareSize || left.size === right.size)
+  );
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = path.normalize(left);
+  const normalizedRight = path.normalize(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function changedDuringApproval(): WorkspaceAccessError {
+  return new WorkspaceAccessError(CHANGED_DURING_APPROVAL_MESSAGE);
+}
+
+async function readTargetSnapshot(targetPath: string, relativePath: string): Promise<TargetSnapshot> {
+  const initialPathStats = await fs.lstat(targetPath, { bigint: true });
+  if (!initialPathStats.isFile() || initialPathStats.isSymbolicLink()) {
+    throw new WorkspaceAccessError(`apply_patch 只能修改普通文件：${relativePath}`);
+  }
+  const initialRealPath = await fs.realpath(targetPath);
+  if (!samePath(initialRealPath, targetPath)) {
+    throw new WorkspaceAccessError(`无法安全确认补丁目标的真实路径：${relativePath}`);
+  }
+
+  const openFlags = constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW);
+  const targetFile = await fs.open(targetPath, openFlags);
+  let beforeRead: BigIntStats;
+  let afterRead: BigIntStats;
+  let bytes: Buffer;
+  try {
+    beforeRead = await targetFile.stat({ bigint: true });
+    if (!beforeRead.isFile()) {
+      throw new WorkspaceAccessError(`apply_patch 只能修改普通文件：${relativePath}`);
+    }
+    if (beforeRead.size > BigInt(MAX_FILE_BYTES)) {
+      throw new WorkspaceAccessError(`文件超过 ${MAX_FILE_BYTES} 字节限制，拒绝修改。`);
+    }
+    bytes = await targetFile.readFile();
+    afterRead = await targetFile.stat({ bigint: true });
+  } finally {
+    await targetFile.close();
+  }
+
+  const finalPathStats = await fs.lstat(targetPath, { bigint: true });
+  const finalRealPath = await fs.realpath(targetPath);
+  const beforeIdentity = identityFrom(beforeRead);
+  const afterIdentity = identityFrom(afterRead);
+  const finalPathIdentity = identityFrom(finalPathStats);
+  if (
+    !finalPathStats.isFile()
+    || finalPathStats.isSymbolicLink()
+    || !samePath(finalRealPath, targetPath)
+    || !sameIdentity(beforeIdentity, afterIdentity)
+    || !sameIdentity(afterIdentity, finalPathIdentity)
+    || BigInt(bytes.length) !== afterIdentity.size
+  ) {
+    throw new WorkspaceAccessError("文件在安全读取期间发生变化，未继续处理补丁。");
+  }
+
+  return { bytes, identity: afterIdentity };
+}
+
+async function readParentIdentity(targetPath: string): Promise<FileIdentity> {
+  const parentPath = path.dirname(targetPath);
+  const initialStats = await fs.lstat(parentPath, { bigint: true });
+  if (!initialStats.isDirectory() || initialStats.isSymbolicLink()) {
+    throw new WorkspaceAccessError("补丁目标的父目录不是可安全写入的普通目录。");
+  }
+  const realParentPath = await fs.realpath(parentPath);
+  const finalStats = await fs.stat(parentPath, { bigint: true });
+  if (
+    !samePath(realParentPath, parentPath)
+    || !finalStats.isDirectory()
+    || !sameIdentity(identityFrom(initialStats), identityFrom(finalStats))
+  ) {
+    throw new WorkspaceAccessError("无法安全确认补丁目标的父目录身份。");
+  }
+  return identityFrom(finalStats);
 }
 
 function throwIfCancelled(signal: AbortSignal | undefined): void {
@@ -88,13 +229,51 @@ function throwIfCancelled(signal: AbortSignal | undefined): void {
   }
 }
 
+async function assertPreparedTargetUnchanged(
+  policy: WorkspacePolicy,
+  inputPath: string,
+  prepared: PreparedPatchTarget,
+  expectedParent: FileIdentity,
+  compareParentSize: boolean,
+  signal?: AbortSignal,
+): Promise<void> {
+  throwIfCancelled(signal);
+  try {
+    const resolved = await policy.resolveWritePath(inputPath);
+    if (
+      !samePath(resolved.absolutePath, prepared.absolutePath)
+      || resolved.relativePath !== prepared.relativePath
+    ) {
+      throw changedDuringApproval();
+    }
+    const parentIdentity = await readParentIdentity(resolved.absolutePath);
+    if (!sameIdentity(parentIdentity, expectedParent, compareParentSize)) {
+      throw changedDuringApproval();
+    }
+    const currentFile = await readTargetSnapshot(resolved.absolutePath, resolved.relativePath);
+    if (
+      !sameIdentity(currentFile.identity, prepared.file.identity)
+      || !currentFile.bytes.equals(prepared.file.bytes)
+    ) {
+      throw changedDuringApproval();
+    }
+  } catch (error) {
+    if (error instanceof ToolExecutionError) throw error;
+    throwIfCancelled(signal);
+    throw changedDuringApproval();
+  }
+  throwIfCancelled(signal);
+}
+
 async function writeAtomically(
   targetPath: string,
   content: string,
-  mode: number,
+  mode: bigint,
+  expectedParent: FileIdentity,
+  verifyBeforeRename: (parentWithTemporaryFile: FileIdentity) => Promise<void>,
   signal?: AbortSignal,
 ): Promise<void> {
-  const permissionBits = mode & 0o7777;
+  const permissionBits = Number(mode & 0o7777n);
   const temporaryPath = path.join(
     path.dirname(targetPath),
     `.${path.basename(targetPath)}.minicode-${randomUUID()}.tmp`,
@@ -106,11 +285,20 @@ async function writeAtomically(
     try {
       await temporaryFile.writeFile(content, "utf8");
       await temporaryFile.sync();
+      await temporaryFile.chmod(permissionBits);
     } finally {
       await temporaryFile.close();
     }
-    await fs.chmod(temporaryPath, permissionBits);
+
+    const parentWithTemporaryFile = await readParentIdentity(targetPath);
+    if (!sameIdentity(parentWithTemporaryFile, expectedParent, false)) {
+      throw changedDuringApproval();
+    }
     throwIfCancelled(signal);
+    await verifyBeforeRename(parentWithTemporaryFile);
+    throwIfCancelled(signal);
+
+    // Best effort：Node 没有跨平台 dirfd/renameat；最后一次身份检查与 rename 之间仍有极小父目录竞态窗口。
     await fs.rename(temporaryPath, targetPath);
     temporaryFileExists = false;
   } finally {
@@ -151,15 +339,29 @@ export const applyPatch: AgentTool<ApplyPatchInput> = {
       reason: "目标位于工作区内，且不属于受保护路径。",
     });
 
-    const stat = await fs.stat(target.absolutePath);
-    if (!stat.isFile()) {
-      throw new WorkspaceAccessError(`apply_patch 只能修改普通文件：${target.relativePath}`);
+    throwIfCancelled(context.signal);
+    const initialParent = await readParentIdentity(target.absolutePath);
+    const initialFile = await readTargetSnapshot(target.absolutePath, target.relativePath);
+    const stableParent = await readParentIdentity(target.absolutePath);
+    if (!sameIdentity(initialParent, stableParent)) {
+      throw new WorkspaceAccessError("补丁目标的父目录在准备期间发生变化，未继续处理补丁。");
     }
-    if (stat.size > MAX_FILE_BYTES) {
-      throw new WorkspaceAccessError(`文件超过 ${MAX_FILE_BYTES} 字节限制，拒绝修改。`);
-    }
+    const prepared: PreparedPatchTarget = {
+      absolutePath: target.absolutePath,
+      relativePath: target.relativePath,
+      file: initialFile,
+      parent: stableParent,
+    };
+    await assertPreparedTargetUnchanged(
+      new WorkspacePolicy(context.workspaceRoot),
+      input.path,
+      prepared,
+      prepared.parent,
+      true,
+      context.signal,
+    );
 
-    const sourceBytes = await fs.readFile(target.absolutePath);
+    const sourceBytes = prepared.file.bytes;
     if (sourceBytes.includes(0)) {
       throw new WorkspaceAccessError("拒绝修改可能是二进制的文件。");
     }
@@ -184,34 +386,51 @@ export const applyPatch: AgentTool<ApplyPatchInput> = {
     const updated = source.replace(input.oldText, input.newText);
     const preview = renderPreview(target.relativePath, input.oldText, input.newText);
     if ((context.executionMode ?? "propose") === "propose") {
-      return ["补丁预览，未写入文件。", preview].join("\n");
+      return ["补丁预览，未写入文件。", preview.text].join("\n");
+    }
+
+    if (!preview.complete) {
+      throw new WorkspaceAccessError(
+        `补丁预览超过 ${MAX_PREVIEW_LINES} 行或包含超过 ${MAX_PREVIEW_LINE_CHARS} 字符的行，`
+        + "无法无损展示并确认；请将修改拆成更小的补丁。",
+      );
     }
 
     if (!context.requestEditApproval) {
       throw new WorkspaceAccessError("当前为 apply 模式，但没有可用的人工确认回调，未修改文件。");
     }
-    const approved = await context.requestEditApproval({ path: target.relativePath, preview });
+    const approved = await context.requestEditApproval(
+      { path: target.relativePath, preview: preview.text },
+      context.signal,
+    );
     if (!approved) {
       throw new WorkspaceAccessError("用户未确认补丁，未修改文件。");
     }
     throwIfCancelled(context.signal);
 
-    const [latestBytes, latestStat] = await Promise.all([
-      fs.readFile(target.absolutePath),
-      fs.stat(target.absolutePath),
-    ]);
-    if (
-      !latestStat.isFile()
-      || latestStat.dev !== stat.dev
-      || latestStat.ino !== stat.ino
-      || (latestStat.mode & 0o7777) !== (stat.mode & 0o7777)
-      || !latestBytes.equals(sourceBytes)
-    ) {
-      throw new WorkspaceAccessError("文件在确认期间发生变化，已取消写入以避免覆盖他人修改。");
-    }
-
-    throwIfCancelled(context.signal);
-    await writeAtomically(target.absolutePath, updated, stat.mode, context.signal);
-    return ["补丁已应用。", preview].join("\n");
+    await assertPreparedTargetUnchanged(
+      policy,
+      input.path,
+      prepared,
+      prepared.parent,
+      true,
+      context.signal,
+    );
+    await writeAtomically(
+      prepared.absolutePath,
+      updated,
+      prepared.file.identity.mode,
+      prepared.parent,
+      async (parentWithTemporaryFile) => assertPreparedTargetUnchanged(
+        new WorkspacePolicy(context.workspaceRoot),
+        input.path,
+        prepared,
+        parentWithTemporaryFile,
+        true,
+        context.signal,
+      ),
+      context.signal,
+    );
+    return ["补丁已应用。", preview.text].join("\n");
   },
 };

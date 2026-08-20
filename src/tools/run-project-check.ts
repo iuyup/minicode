@@ -7,7 +7,7 @@ import type {
   ToolExecutionOutput,
   ValidationResult,
 } from "../agent/contracts.ts";
-import { ToolExecutionError } from "../agent/contracts.ts";
+import { ToolExecutionError, ToolPolicyError } from "../agent/contracts.ts";
 import {
   createSanitizedChildEnvironment,
   runBoundedProcess,
@@ -15,6 +15,11 @@ import {
   type BoundedProcessResult,
 } from "./child-process-safety.ts";
 import { validateObjectWithKeys } from "./input-validation.ts";
+import {
+  prepareNpmRuntimeBinding,
+  verifyNpmRuntimeBinding,
+  type PreparedNpmRuntimeBinding,
+} from "./run-command.ts";
 
 export type ProjectCheckAction = "test" | "check";
 
@@ -25,7 +30,12 @@ interface RunProjectCheckInput {
 export interface ProjectCheckRunResult extends BoundedProcessResult {}
 
 export interface ProjectCheckRunner {
-  run(action: ProjectCheckAction, workspaceRoot: string, signal?: AbortSignal): Promise<ProjectCheckRunResult>;
+  run(
+    action: ProjectCheckAction,
+    workspaceRoot: string,
+    signal?: AbortSignal,
+    runtime?: { readonly nodeExecutablePath: string; readonly npmCliPath: string },
+  ): Promise<ProjectCheckRunResult>;
 }
 
 const ACTION_ARGUMENTS: Record<ProjectCheckAction, readonly string[]> = {
@@ -52,10 +62,15 @@ function validate(input: JsonValue): ValidationResult<RunProjectCheckInput> {
 }
 
 class NpmProjectCheckRunner implements ProjectCheckRunner {
-  async run(action: ProjectCheckAction, workspaceRoot: string, signal?: AbortSignal): Promise<ProjectCheckRunResult> {
-    const npmCli = await resolveNpmCli();
+  async run(
+    action: ProjectCheckAction,
+    workspaceRoot: string,
+    signal?: AbortSignal,
+    runtime?: { readonly nodeExecutablePath: string; readonly npmCliPath: string },
+  ): Promise<ProjectCheckRunResult> {
+    const npmCli = runtime?.npmCliPath ?? await resolveNpmCli();
     return runBoundedProcess({
-      executable: process.execPath,
+      executable: runtime?.nodeExecutablePath ?? process.execPath,
       args: [npmCli, ...ACTION_ARGUMENTS[action]],
       cwd: workspaceRoot,
       env: createSanitizedChildEnvironment(),
@@ -65,6 +80,33 @@ class NpmProjectCheckRunner implements ProjectCheckRunner {
       maxOutputChars: MAX_OUTPUT_CHARS,
       signal,
     });
+  }
+}
+
+function blockedProjectCheck(
+  action: ProjectCheckAction,
+  message: string,
+  reason: string,
+): ToolPolicyError {
+  return new ToolPolicyError(
+    `固定验证动作未执行：${message}`,
+    { decision: "blocked", path: ".", reason },
+    { action, riskLevel: "medium" },
+  );
+}
+
+async function prepareProjectCheck(
+  action: ProjectCheckAction,
+  workspaceRoot: string,
+): Promise<PreparedNpmRuntimeBinding> {
+  try {
+    return await prepareNpmRuntimeBinding(workspaceRoot, ".");
+  } catch {
+    throw blockedProjectCheck(
+      action,
+      "无法安全绑定工作区根目录、本机 Node/npm 入口与 package.json；请确认它们存在且未被读取策略保护。",
+      "固定验证环境未通过审批前身份与内容绑定。",
+    );
   }
 }
 
@@ -94,6 +136,62 @@ function renderOutput(action: ProjectCheckAction, result: ProjectCheckRunResult)
   ].join("\n");
 }
 
+async function executePreparedProjectCheck(
+  input: RunProjectCheckInput,
+  binding: PreparedNpmRuntimeBinding,
+  context: Parameters<NonNullable<AgentTool<RunProjectCheckInput, ToolExecutionOutput>["execute"]>>[1],
+  runner: ProjectCheckRunner,
+): Promise<ToolExecutionOutput> {
+  try {
+    await verifyNpmRuntimeBinding(binding, context.workspaceRoot);
+  } catch {
+    throw blockedProjectCheck(
+      input.action,
+      "审批期间工作区、Node/npm 入口或 package.json 失效、被替换或内容发生变化。",
+      "固定验证环境未通过审批后身份与内容复核。",
+    );
+  }
+
+  context.recordPolicyDecision?.({
+    decision: "allowed",
+    path: ".",
+    reason: `允许固定验证动作：${input.action}；工作目录、执行入口与项目定义已通过审批后复核。`,
+  });
+  let result: ProjectCheckRunResult;
+  try {
+    result = await runner.run(input.action, binding.cwd, context.signal, {
+      nodeExecutablePath: binding.nodeExecutable.path,
+      npmCliPath: binding.npmCli.path,
+    });
+  } catch (error) {
+    if (error instanceof ToolExecutionError) {
+      throw new ToolExecutionError(error.message, {
+        ...error.metadata,
+        action: input.action,
+        riskLevel: "medium",
+      });
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ToolExecutionError(`固定验证动作无法启动：${message}`, {
+      action: input.action,
+      riskLevel: "medium",
+    });
+  }
+  const resultMetadata = metadata(input.action, result);
+  const content = renderOutput(input.action, result);
+
+  if (result.cancelled) {
+    throw new ToolExecutionError(`固定验证动作已取消。\n${content}`, resultMetadata);
+  }
+  if (result.timedOut) {
+    throw new ToolExecutionError(`固定验证动作超时（${TIMEOUT_MS}ms）。\n${content}`, resultMetadata);
+  }
+  if (result.exitCode !== 0) {
+    throw new ToolExecutionError(`固定验证动作失败。\n${content}`, resultMetadata);
+  }
+  return { content, metadata: resultMetadata };
+}
+
 export function createRunProjectCheckTool(
   runner: ProjectCheckRunner = new NpmProjectCheckRunner(),
 ): AgentTool<RunProjectCheckInput, ToolExecutionOutput> {
@@ -109,52 +207,23 @@ export function createRunProjectCheckTool(
       additionalProperties: false,
     },
     validate,
-    getCommandApprovalRequest(input, workspaceRoot) {
+    async prepareCommandExecution(input, workspaceRoot) {
+      const binding = await prepareProjectCheck(input.action, workspaceRoot);
       return {
-        kind: "verification",
-        action: input.action,
-        command: ACTION_LABELS[input.action],
-        workingDirectory: workspaceRoot,
-        riskLevel: "medium",
-        risk: COMMAND_RISK,
+        approvalRequest: {
+          kind: "verification",
+          action: input.action,
+          command: ACTION_LABELS[input.action],
+          workingDirectory: binding.cwd,
+          riskLevel: "medium",
+          risk: COMMAND_RISK,
+        },
+        execute: async (context) => executePreparedProjectCheck(input, binding, context, runner),
       };
     },
     async execute(input, context): Promise<ToolExecutionOutput> {
-      context.recordPolicyDecision?.({
-        decision: "allowed",
-        path: ".",
-        reason: `允许固定验证动作：${input.action}；工作目录固定为工作区根目录。`,
-      });
-      let result: ProjectCheckRunResult;
-      try {
-        result = await runner.run(input.action, context.workspaceRoot, context.signal);
-      } catch (error) {
-        if (error instanceof ToolExecutionError) {
-          throw new ToolExecutionError(error.message, {
-            ...error.metadata,
-            action: input.action,
-            riskLevel: "medium",
-          });
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        throw new ToolExecutionError(`固定验证动作无法启动：${message}`, {
-          action: input.action,
-          riskLevel: "medium",
-        });
-      }
-      const resultMetadata = metadata(input.action, result);
-      const content = renderOutput(input.action, result);
-
-      if (result.cancelled) {
-        throw new ToolExecutionError(`固定验证动作已取消。\n${content}`, resultMetadata);
-      }
-      if (result.timedOut) {
-        throw new ToolExecutionError(`固定验证动作超时（${TIMEOUT_MS}ms）。\n${content}`, resultMetadata);
-      }
-      if (result.exitCode !== 0) {
-        throw new ToolExecutionError(`固定验证动作失败。\n${content}`, resultMetadata);
-      }
-      return { content, metadata: resultMetadata };
+      const binding = await prepareProjectCheck(input.action, context.workspaceRoot);
+      return executePreparedProjectCheck(input, binding, context, runner);
     },
   };
 }

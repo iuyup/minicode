@@ -30,6 +30,7 @@ export interface GitRunRequest {
   env: NodeJS.ProcessEnv;
   action: string;
   maxOutputChars: number;
+  signal?: AbortSignal;
 }
 
 export interface GitRunner {
@@ -77,15 +78,44 @@ const PROTECTED_PATHSPECS = [
   ":(exclude,glob,icase)**/_netrc",
   ":(exclude,icase).git-credentials",
   ":(exclude,glob,icase)**/.git-credentials",
+  ":(exclude,icase).minicodeignore",
+  ":(exclude,glob,icase)**/.minicodeignore",
+  ":(exclude,glob,icase)credentials*.json",
+  ":(exclude,glob,icase)**/credentials*.json",
+  ":(exclude,glob,icase)secrets.json",
+  ":(exclude,glob,icase)secrets.yml",
+  ":(exclude,glob,icase)secrets.yaml",
+  ":(exclude,glob,icase)**/secrets.json",
+  ":(exclude,glob,icase)**/secrets.yml",
+  ":(exclude,glob,icase)**/secrets.yaml",
+  ":(exclude,glob,icase)service-account*.json",
+  ":(exclude,glob,icase)**/service-account*.json",
+  ":(exclude,glob,icase)*.pem",
+  ":(exclude,glob,icase)*.key",
+  ":(exclude,glob,icase)*.p12",
+  ":(exclude,glob,icase)*.pfx",
+  ":(exclude,glob,icase)**/*.pem",
+  ":(exclude,glob,icase)**/*.key",
+  ":(exclude,glob,icase)**/*.p12",
+  ":(exclude,glob,icase)**/*.pfx",
+  ":(exclude,icase).aws",
+  ":(exclude,glob,icase)**/.aws",
   ":(exclude,glob,icase).aws/**",
   ":(exclude,glob,icase)**/.aws/**",
+  ":(exclude,icase).ssh",
+  ":(exclude,glob,icase)**/.ssh",
   ":(exclude,glob,icase).ssh/**",
   ":(exclude,glob,icase)**/.ssh/**",
+  ":(exclude,icase).gnupg",
+  ":(exclude,glob,icase)**/.gnupg",
   ":(exclude,glob,icase).gnupg/**",
   ":(exclude,glob,icase)**/.gnupg/**",
+  ":(exclude,icase)node_modules",
+  ":(exclude,glob,icase)**/node_modules",
   ":(exclude,glob,icase)node_modules/**",
   ":(exclude,glob,icase)**/node_modules/**",
   ":(exclude,icase).git",
+  ":(exclude,glob,icase)**/.git",
   ":(exclude,glob,icase)**/.git/**",
 ] as const;
 
@@ -158,7 +188,60 @@ function metadata(action: GitInspectionAction, result: BoundedProcessResult): To
     outputLength: result.outputLength,
     outputTruncated: result.outputTruncated,
     timedOut: result.timedOut,
+    cancelled: result.cancelled ?? false,
   };
+}
+
+function cancellationError(
+  action: GitInspectionAction,
+  result?: BoundedProcessResult,
+): ToolExecutionError {
+  return new ToolExecutionError(
+    "Git 只读检查已取消。",
+    result
+      ? metadata(action, { ...result, cancelled: true })
+      : { action: actionName(action), timedOut: false, cancelled: true },
+  );
+}
+
+function throwIfCancelled(
+  action: GitInspectionAction,
+  signal: AbortSignal | undefined,
+  result?: BoundedProcessResult,
+): void {
+  if (signal?.aborted || result?.cancelled) {
+    throw cancellationError(action, result);
+  }
+}
+
+async function runWithCancellation(
+  runner: GitRunner,
+  request: GitRunRequest,
+  action: GitInspectionAction,
+): Promise<BoundedProcessResult> {
+  throwIfCancelled(action, request.signal);
+  const running = runner.run(request);
+  if (!request.signal) {
+    const result = await running;
+    throwIfCancelled(action, undefined, result);
+    return result;
+  }
+
+  const signal = request.signal;
+  let abortListener: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abortListener = () => reject(cancellationError(action));
+    signal.addEventListener("abort", abortListener, { once: true });
+    if (signal.aborted) abortListener();
+  });
+
+  try {
+    const result = await Promise.race([running, aborted]);
+    throwIfCancelled(action, signal, result);
+    return result;
+  } finally {
+    if (abortListener) signal.removeEventListener("abort", abortListener);
+  }
 }
 
 function createGitEnvironment(): NodeJS.ProcessEnv {
@@ -275,16 +358,20 @@ function hasIncludeDirective(contents: string): boolean {
 async function assertLocalConfigHasNoIncludes(
   action: GitInspectionAction,
   gitDirectory: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   for (const fileName of ["config", "config.worktree"] as const) {
+    throwIfCancelled(action, signal);
     const configPath = path.join(gitDirectory, fileName);
     let stats: Awaited<ReturnType<typeof fs.lstat>>;
     try {
       stats = await fs.lstat(configPath);
     } catch (error) {
+      throwIfCancelled(action, signal);
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw blocked(action, "无法安全读取仓库配置。", "Git 配置文件未通过本地预扫描。");
     }
+    throwIfCancelled(action, signal);
     if (!stats.isFile() || stats.isSymbolicLink() || stats.size > MAX_LOCAL_CONFIG_SCAN_BYTES) {
       throw blocked(action, "仓库配置文件类型或大小不受支持。", "Git 配置文件未通过本地预扫描。");
     }
@@ -292,8 +379,10 @@ async function assertLocalConfigHasNoIncludes(
     try {
       contents = await fs.readFile(configPath, "utf8");
     } catch {
+      throwIfCancelled(action, signal);
       throw blocked(action, "无法安全读取仓库配置。", "Git 配置文件未通过本地预扫描。");
     }
+    throwIfCancelled(action, signal);
     if (hasIncludeDirective(contents)) {
       throw blocked(
         action,
@@ -307,15 +396,19 @@ async function assertLocalConfigHasNoIncludes(
 async function assertNoExternalObjectAlternates(
   action: GitInspectionAction,
   gitDirectory: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   for (const fileName of ["alternates", "http-alternates"] as const) {
+    throwIfCancelled(action, signal);
     const alternatePath = path.join(gitDirectory, "objects", "info", fileName);
     try {
       await fs.lstat(alternatePath);
     } catch (error) {
+      throwIfCancelled(action, signal);
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw blocked(action, "无法安全检查 Git 外部对象库配置。", "Git 对象库边界未通过本地预扫描。");
     }
+    throwIfCancelled(action, signal);
     throw blocked(
       action,
       "仓库声明了外部 Git 对象库；为避免读取工作区外或网络位置，本工具不会处理该仓库。",
@@ -382,18 +475,35 @@ function executableCandidates(source: NodeJS.ProcessEnv): string[] {
 export async function resolveGitExecutable(
   workspaceRoot: string,
   source: NodeJS.ProcessEnv = process.env,
+  signal?: AbortSignal,
 ): Promise<string> {
+  if (signal?.aborted) {
+    throw new ToolExecutionError("Git 只读检查已取消。", { action: "inspect_git", cancelled: true });
+  }
   const realWorkspaceRoot = await fs.realpath(workspaceRoot);
+  if (signal?.aborted) {
+    throw new ToolExecutionError("Git 只读检查已取消。", { action: "inspect_git", cancelled: true });
+  }
   const expectedName = process.platform === "win32" ? "git.exe" : "git";
   for (const candidate of executableCandidates(source)) {
+    if (signal?.aborted) {
+      throw new ToolExecutionError("Git 只读检查已取消。", { action: "inspect_git", cancelled: true });
+    }
     try {
       const realCandidate = await fs.realpath(candidate);
       const stats = await fs.stat(realCandidate);
+      if (signal?.aborted) {
+        throw new ToolExecutionError("Git 只读检查已取消。", { action: "inspect_git", cancelled: true });
+      }
       if (!stats.isFile()) continue;
       if (path.basename(realCandidate).toLowerCase() !== expectedName) continue;
       if (isInside(realWorkspaceRoot, realCandidate)) continue;
       return realCandidate;
-    } catch {
+    } catch (error) {
+      if (error instanceof ToolExecutionError) throw error;
+      if (signal?.aborted) {
+        throw new ToolExecutionError("Git 只读检查已取消。", { action: "inspect_git", cancelled: true });
+      }
       // 尝试下一个本机安装位置。
     }
   }
@@ -406,7 +516,7 @@ class BoundedGitRunner implements GitRunner {
   #executable: string | undefined;
 
   async run(request: GitRunRequest): Promise<BoundedProcessResult> {
-    this.#executable ??= await resolveGitExecutable(request.cwd);
+    this.#executable ??= await resolveGitExecutable(request.cwd, process.env, request.signal);
     return runBoundedProcess({
       executable: this.#executable,
       args: request.args,
@@ -416,6 +526,7 @@ class BoundedGitRunner implements GitRunner {
       startFailureLabel: "Git 只读检查",
       timeoutMs: TIMEOUT_MS,
       maxOutputChars: request.maxOutputChars,
+      signal: request.signal,
     });
   }
 }
@@ -423,36 +534,47 @@ class BoundedGitRunner implements GitRunner {
 async function prepareRepository(
   action: GitInspectionAction,
   workspaceRoot: string,
+  signal?: AbortSignal,
 ): Promise<PreparedRepository> {
+  throwIfCancelled(action, signal);
   const workspacePolicy = new WorkspacePolicy(workspaceRoot);
   let resolvedRoot;
   try {
     resolvedRoot = await workspacePolicy.resolveReadPath(".");
     const rootStats = await fs.stat(resolvedRoot.absolutePath);
+    throwIfCancelled(action, signal);
     if (!rootStats.isDirectory()) throw new Error("not a directory");
-  } catch {
+  } catch (error) {
+    if (error instanceof ToolExecutionError) throw error;
+    throwIfCancelled(action, signal);
     throw blocked(action, "工作区根目录不存在或未通过真实路径校验。", "工作区根目录未通过路径策略。");
   }
 
+  throwIfCancelled(action, signal);
   const gitDirectory = path.join(resolvedRoot.absolutePath, ".git");
   try {
     const gitStats = await fs.lstat(gitDirectory);
+    throwIfCancelled(action, signal);
     if (!gitStats.isDirectory() || gitStats.isSymbolicLink()) throw new Error("not a local git directory");
     const realGitDirectory = await fs.realpath(gitDirectory);
+    throwIfCancelled(action, signal);
     if (!samePath(realGitDirectory, path.join(resolvedRoot.absolutePath, ".git"))) {
       throw new Error("git directory escaped workspace");
     }
     try {
       await fs.lstat(path.join(realGitDirectory, "commondir"));
+      throwIfCancelled(action, signal);
       throw new Error("linked worktree metadata");
     } catch (error) {
+      throwIfCancelled(action, signal);
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    await assertLocalConfigHasNoIncludes(action, realGitDirectory);
-    await assertNoExternalObjectAlternates(action, realGitDirectory);
+    await assertLocalConfigHasNoIncludes(action, realGitDirectory, signal);
+    await assertNoExternalObjectAlternates(action, realGitDirectory, signal);
   } catch (error) {
     // 具体的策略错误需要保留，避免被下面的通用仓库边界错误覆盖。
-    if (error instanceof ToolPolicyError) throw error;
+    if (error instanceof ToolExecutionError) throw error;
+    throwIfCancelled(action, signal);
     throw blocked(
       action,
       "第一版只支持工作区根目录内包含普通 .git 目录的仓库；非仓库、父级仓库和 linked worktree 均已拒绝。",
@@ -460,6 +582,7 @@ async function prepareRepository(
     );
   }
 
+  throwIfCancelled(action, signal);
   return {
     workspaceRoot: resolvedRoot.absolutePath,
     env: createGitEnvironment(),
@@ -471,18 +594,24 @@ async function runPreflight(
   runner: GitRunner,
   repository: PreparedRepository,
   action: GitInspectionAction,
+  signal?: AbortSignal,
 ): Promise<readonly string[]> {
   const execute = (
     args: readonly string[],
     maxOutputChars = PREFLIGHT_OUTPUT_CHARS,
     env = repository.env,
-  ) => runner.run({
-    args,
-    cwd: repository.workspaceRoot,
-    env,
-    action: actionName(action),
-    maxOutputChars,
-  });
+  ) => runWithCancellation(
+    runner,
+    {
+      args,
+      cwd: repository.workspaceRoot,
+      env,
+      action: actionName(action),
+      maxOutputChars,
+      signal,
+    },
+    action,
+  );
 
   const version = await execute(["--version"]);
   if (version.timedOut || version.exitCode !== 0) {
@@ -516,8 +645,10 @@ async function runPreflight(
   try {
     realReportedRoot = await fs.realpath(rootCheck.output.trim());
   } catch {
+    throwIfCancelled(action, signal);
     throw blocked(action, "Git 返回了无效的仓库根目录。", "Git 仓库根目录未通过真实路径校验。");
   }
+  throwIfCancelled(action, signal);
   if (!samePath(realReportedRoot, repository.workspaceRoot)) {
     throw blocked(
       action,
@@ -573,6 +704,7 @@ async function runPreflight(
   if (dangerousConfig.exitCode !== 1) {
     throw new ToolExecutionError("无法完成 Git 配置安全检查，未运行只读检查。", metadata(action, dangerousConfig));
   }
+  throwIfCancelled(action, signal);
   return normalizationConfig;
 }
 
@@ -614,8 +746,17 @@ export function createInspectGitTool(
     },
     validate,
     async execute(input, context): Promise<ToolExecutionOutput> {
-      const repository = await prepareRepository(input.action, context.workspaceRoot);
-      const normalizationConfig = await runPreflight(runner, repository, input.action);
+      const workspacePolicy = new WorkspacePolicy(context.workspaceRoot);
+      if (await workspacePolicy.hasCustomIgnoreRules()) {
+        throw blocked(
+          input.action,
+          "工作区启用了 .minicodeignore；当前版本不会把自定义读取规则近似翻译成 Git pathspec，因而默认关闭 Git 输出以避免泄露被忽略内容。",
+          "自定义 .minicodeignore 无法由固定 Git pathspec 完整表达。",
+        );
+      }
+      const repository = await prepareRepository(input.action, context.workspaceRoot, context.signal);
+      const normalizationConfig = await runPreflight(runner, repository, input.action, context.signal);
+      throwIfCancelled(input.action, context.signal);
       context.recordPolicyDecision?.({
         decision: "allowed",
         path: ".",
@@ -624,14 +765,22 @@ export function createInspectGitTool(
 
       let result: BoundedProcessResult;
       try {
-        result = await runner.run({
-          args: actionArgs(input.action, normalizationConfig),
-          cwd: repository.workspaceRoot,
-          env: repository.env,
-          action: actionName(input.action),
-          maxOutputChars: MAX_OUTPUT_CHARS,
-        });
+        result = await runWithCancellation(
+          runner,
+          {
+            args: actionArgs(input.action, normalizationConfig),
+            cwd: repository.workspaceRoot,
+            env: repository.env,
+            action: actionName(input.action),
+            maxOutputChars: MAX_OUTPUT_CHARS,
+            signal: context.signal,
+          },
+          input.action,
+        );
       } catch (error) {
+        if (context.signal?.aborted) {
+          throw cancellationError(input.action);
+        }
         if (error instanceof ToolExecutionError) {
           throw new ToolExecutionError(error.message, {
             ...error.metadata,
@@ -642,6 +791,9 @@ export function createInspectGitTool(
       }
 
       const resultMetadata = metadata(input.action, result);
+      if (result.cancelled) {
+        throw cancellationError(input.action, result);
+      }
       if (result.timedOut) {
         throw new ToolExecutionError(`Git 只读检查超时（${TIMEOUT_MS}ms）。`, resultMetadata);
       }

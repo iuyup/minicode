@@ -67,7 +67,7 @@ export interface ToolExecutionContext {
   signal?: AbortSignal;
   requireSourceEvidence?: boolean;
   executionMode?: ToolExecutionMode;
-  requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
+  requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
   recordPolicyDecision?: (decision: ToolPolicyDecision) => void;
 }
 
@@ -122,6 +122,8 @@ export interface SourceEvidence {
   path: string;
   startLine: number;
   endLine: number;
+  /** 行内容在发给模型前被截断；这些行不能作为完整源码证据。 */
+  truncatedLines?: readonly number[];
 }
 
 export interface ToolExecutionOutput {
@@ -131,6 +133,13 @@ export interface ToolExecutionOutput {
 }
 
 export type ToolExecutionResult = string | ToolExecutionOutput;
+
+export interface PreparedCommandExecution<
+  TOutput extends ToolExecutionResult = ToolExecutionResult,
+> {
+  approvalRequest: CommandApprovalRequest;
+  execute(context: ToolExecutionContext): Promise<TOutput>;
+}
 
 export class ToolExecutionError extends Error {
   readonly metadata?: ToolExecutionMetadata;
@@ -165,6 +174,14 @@ export interface AgentTool<TInput = JsonValue, TOutput extends ToolExecutionResu
     input: TInput,
     workspaceRoot: string,
   ): CommandApprovalRequest | Promise<CommandApprovalRequest>;
+  /**
+   * 将审批展示和获批后的执行绑定到同一个一次性准备结果。
+   * 命令类工具应优先实现此接口，而不是在审批后重新解析模型输入。
+   */
+  prepareCommandExecution?(
+    input: TInput,
+    workspaceRoot: string,
+  ): PreparedCommandExecution<TOutput> | Promise<PreparedCommandExecution<TOutput>>;
   execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
 }
 

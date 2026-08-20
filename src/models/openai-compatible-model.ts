@@ -11,7 +11,18 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_TOKENS = 2_048;
 const DEFAULT_MAX_RESPONSE_BYTES = 1_048_576;
 
-export function validateOpenAiCompatibleBaseUrl(value: string): string | undefined {
+export interface OpenAiCompatibleTransportPolicy {
+  allowInsecureHttp?: boolean;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+export function validateOpenAiCompatibleBaseUrl(
+  value: string,
+  policy: OpenAiCompatibleTransportPolicy = {},
+): string | undefined {
   let url: URL;
   try {
     url = new URL(value);
@@ -32,6 +43,9 @@ export function validateOpenAiCompatibleBaseUrl(value: string): string | undefin
   }
   if (url.search !== "" || value.includes("?")) {
     return "baseUrl 不允许包含查询参数";
+  }
+  if (url.protocol === "http:" && !isLoopbackHostname(url.hostname) && policy.allowInsecureHttp !== true) {
+    return "baseUrl 的非本机 HTTP 连接默认禁用；请使用 HTTPS，或显式设置 MINICODE_ALLOW_INSECURE_HTTP=1";
   }
   return undefined;
 }
@@ -60,6 +74,7 @@ export interface OpenAiCompatibleModelOptions {
   timeoutMs?: number;
   maxTokens?: number;
   maxResponseBytes?: number;
+  allowInsecureHttp?: boolean;
   fetchImplementation?: typeof fetch;
 }
 
@@ -274,7 +289,9 @@ export class OpenAiCompatibleModel implements ChatModel {
     if (baseUrl === "") {
       throw new Error(`${this.#providerName} 的 baseUrl 不能为空。`);
     }
-    const baseUrlProblem = validateOpenAiCompatibleBaseUrl(baseUrl);
+    const baseUrlProblem = validateOpenAiCompatibleBaseUrl(baseUrl, {
+      allowInsecureHttp: options.allowInsecureHttp,
+    });
     if (baseUrlProblem) {
       throw new Error(`${this.#providerName} 的 baseUrl 配置无效：${baseUrlProblem}。`);
     }
@@ -317,6 +334,7 @@ export class OpenAiCompatibleModel implements ChatModel {
     try {
       const response = await abortable(this.#fetch(this.#endpoint, {
         method: "POST",
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           authorization: `Bearer ${this.#apiKey}`,

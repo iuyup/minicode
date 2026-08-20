@@ -48,6 +48,25 @@ const sourceReadTool: AgentTool<JsonValue, ToolExecutionOutput> = {
   },
 };
 
+const truncatedSourceReadTool: AgentTool<JsonValue, ToolExecutionOutput> = {
+  ...sourceReadTool,
+  async execute() {
+    return {
+      content: [
+        "src/agent/agent-loop.ts:10 | complete line",
+        "src/agent/agent-loop.ts:11 | partial [行内容已截断]",
+        "src/agent/agent-loop.ts:12 | another complete line",
+      ].join("\n"),
+      sourceEvidence: [{
+        path: "src/agent/agent-loop.ts",
+        startLine: 10,
+        endLine: 12,
+        truncatedLines: [11],
+      }],
+    };
+  },
+};
+
 test("source-evidence mode stops an answer without read_file evidence", async () => {
   const recordedEvents: AgentEvent[] = [];
   const auditLog: AgentEventAuditLog = {
@@ -128,6 +147,44 @@ test("source-evidence mode accepts a fully verified source range citation", asyn
   }).run("Explain the implementation.");
 
   assert.equal(result.events.some((event) => event.type === "final_answer_rejected"), false);
+});
+
+test("source-evidence mode rejects truncated lines and only offers complete ranges for repair", async () => {
+  let callCount = 0;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      callCount += 1;
+      if (callCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Read the source.",
+          toolCalls: [{ id: "read-truncated", name: "read_file", input: {} }],
+        };
+      }
+      if (callCount === 2) {
+        return { kind: "final", content: "The evidence is at src/agent/agent-loop.ts:11." };
+      }
+      const repairPrompt = request.messages.at(-1);
+      assert.equal(repairPrompt?.role, "user");
+      assert.match(repairPrompt?.content ?? "", /`src\/agent\/agent-loop\.ts:10`/);
+      assert.match(repairPrompt?.content ?? "", /`src\/agent\/agent-loop\.ts:12`/);
+      assert.doesNotMatch(repairPrompt?.content ?? "", /agent-loop\.ts:10-12/);
+      assert.doesNotMatch(repairPrompt?.content ?? "", /`src\/agent\/agent-loop\.ts:11`/);
+      return { kind: "final", content: "The visible evidence is at src/agent/agent-loop.ts:12." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([truncatedSourceReadTool]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  }).run("Explain the implementation.");
+
+  assert.equal(callCount, 3);
+  assert.equal(result.answer, "The visible evidence is at src/agent/agent-loop.ts:12.");
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "final_answer_rejected").map((event) => event.reason),
+    ["unverified_source_citation"],
+  );
 });
 
 test("source-evidence mode allows one supplemental search-read pair then forces a final answer", async () => {

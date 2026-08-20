@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 
 import type { AgentTool, JsonValue, ValidationResult } from "../agent/contracts.ts";
-import { WorkspaceAccessError, WorkspacePolicy, shouldSkipWorkspaceEntry } from "../workspace/workspace-policy.ts";
+import { WorkspaceAccessError, WorkspacePolicy } from "../workspace/workspace-policy.ts";
 import { validateObjectWithKeys, validateOptionalPath } from "./input-validation.ts";
 
 interface ListFilesInput {
@@ -9,6 +9,10 @@ interface ListFilesInput {
 }
 
 const MAX_ENTRIES = 80;
+
+function childRelativePath(parent: string, child: string): string {
+  return parent === "." ? child : `${parent}/${child}`;
+}
 
 function validate(input: JsonValue): ValidationResult<ListFilesInput> {
   const object = validateObjectWithKeys(input, ["path"]);
@@ -37,14 +41,18 @@ export const listFiles: AgentTool<ListFilesInput> = {
     }
 
     const entries = await fs.readdir(directory.absolutePath, { withFileTypes: true });
-    const visible = entries
-      .filter((entry) => !entry.isSymbolicLink() && !shouldSkipWorkspaceEntry(entry.name))
-      .sort((left, right) => left.name.localeCompare(right.name))
+    const visibleEntries = [];
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const relativePath = childRelativePath(directory.relativePath, entry.name);
+      if (await policy.shouldSkipPath(relativePath)) continue;
+      visibleEntries.push(entry);
+    }
+    visibleEntries.sort((left, right) => left.name.localeCompare(right.name));
+    const visible = visibleEntries
       .slice(0, MAX_ENTRIES)
       .map((entry) => `${entry.isDirectory() ? "目录" : "文件"} ${entry.name}`);
-    const truncated = entries.filter(
-      (entry) => !entry.isSymbolicLink() && !shouldSkipWorkspaceEntry(entry.name),
-    ).length > MAX_ENTRIES;
+    const truncated = visibleEntries.length > MAX_ENTRIES;
     const renderedEntries = visible.length === 0 ? ["（没有可见条目）"] : visible;
 
     return [

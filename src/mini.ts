@@ -752,7 +752,21 @@ export class MiniTuiApp {
         ? "当前是受控编辑会话：补丁逐次等待 APPLY，验证与 Node/npm 命令逐次等待 RUN。"
       : `当前会话会调用 ${escapeTerminalText(modelLabel(this.#options))}，并仅开放已标明的工具权限。`;
     this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))} ${muted(mode)}`, 1, 0));
+    if (this.#options.modelProfile !== "fake") {
+      this.#transcript.addChild(new Text(
+        yellow(`  ${escapeMultilineTerminalText(this.remoteDataNotice())}`),
+        1,
+        0,
+      ));
+    }
     this.#transcript.addChild(new Text(muted("  鼠标滚轮或终端滚动条可查看历史；支持 Ctrl+V 粘贴，工具细节默认折叠。"), 1, 1));
+  }
+
+  private remoteDataNotice(): string {
+    return [
+      `远程数据提示：当前工作区 ${this.#options.workspaceRoot} 将连接 ${modelLabel(this.#options)}。`,
+      "按工具实际调用，用户任务、目录/搜索结果、源码片段、Git 状态或差异，以及编辑参数和获准进程输出可能发送给该远程服务。",
+    ].join(" ");
   }
 
   private appendUser(input: string): void {
@@ -880,7 +894,7 @@ export class MiniTuiApp {
         return `${marker} ${profile.id} · ${profile.label} · ${modelProfileReadiness(profile)}`;
       });
       this.appendNotice(
-        `模型 Profile：\n${choices.join("\n")}\nOpenAI-compatible 配置：MINICODE_OPENAI_BASE_URL、MINICODE_OPENAI_MODEL、MINICODE_OPENAI_API_KEY。\n输入 /model <profile> 切换；切换会清除后续发送给模型的会话上下文。`,
+        `模型 Profile：\n${choices.join("\n")}\nOpenAI-compatible 配置：MINICODE_OPENAI_BASE_URL、MINICODE_OPENAI_MODEL、MINICODE_OPENAI_API_KEY。默认只允许 HTTPS 或本机回环 HTTP；MINICODE_ALLOW_INSECURE_HTTP=1 可显式放行其他明文 HTTP，但会暴露密钥与正文。\n输入 /model <profile> 切换；切换会清除后续发送给模型的会话上下文。`,
         accent,
       );
       return;
@@ -906,6 +920,9 @@ export class MiniTuiApp {
         `已切换到 ${modelLabel(this.#options)}；为避免不同模型混用上下文，后续发送给模型的会话已清空。`,
         green,
       );
+      if (this.#options.modelProfile !== "fake") {
+        this.appendNotice(this.remoteDataNotice(), yellow);
+      }
       this.refreshActivity();
     } catch (error) {
       Object.assign(this.#options, previousOptions);

@@ -12,6 +12,7 @@ import { FakeModel } from "../src/models/fake-model.ts";
 import { listFiles } from "../src/tools/list-files.ts";
 import { readFile } from "../src/tools/read-file.ts";
 import { searchText } from "../src/tools/search-text.ts";
+import { WorkspacePolicy } from "../src/workspace/workspace-policy.ts";
 
 async function createWorkspace(): Promise<string> {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-readonly-"));
@@ -29,6 +30,7 @@ async function createWorkspace(): Promise<string> {
   await fs.writeFile(path.join(workspace, ".ssh", "id_rsa"), "SSH_SECRET=must-not-be-read\n");
   await fs.writeFile(path.join(workspace, "src", ".Env.Local"), "NESTED_SECRET=must-not-be-searched\n");
   await fs.writeFile(path.join(workspace, "src", ".Pypirc"), "PYPI_SECRET=must-not-be-searched\n");
+  await fs.writeFile(path.join(workspace, "src", "long-line.ts"), `${"x".repeat(241)}\nexport const visible = true;\n`);
   await fs.writeFile(path.join(workspace, "long.txt"), Array.from({ length: 100 }, (_, index) => `line-${index + 1}`).join("\n"));
   return workspace;
 }
@@ -59,6 +61,18 @@ test("只读工具只返回工作区中的可见文本证据，并限制输出�
     assert.match(truncated.content, /单次最多读取 80 行/);
     assert.doesNotMatch(truncated.content, /long.txt:81 \|/);
     assert.deepEqual(truncated.sourceEvidence, [{ path: "long.txt", startLine: 1, endLine: 80 }]);
+
+    const longLine = await readFile.execute(
+      { path: "src/long-line.ts", startLine: 1, endLine: 2 },
+      context(workspace, true),
+    );
+    assert.match(longLine.content, /src\/long-line\.ts:1 .*\[行内容已截断\]/);
+    assert.deepEqual(longLine.sourceEvidence, [{
+      path: "src/long-line.ts",
+      startLine: 1,
+      endLine: 2,
+      truncatedLines: [1],
+    }]);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }
@@ -113,6 +127,115 @@ test("越界和受保护文件会变成标准化错误终态，而不是被读�
     }
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("扩展的内置敏感规则在任意层级和大小写下统一约束 list、search 与 read", async () => {
+  const workspace = await createWorkspace();
+  const protectedFiles = [
+    ["Credentials.Production.JSON", "CREDENTIAL_MARKER_1"],
+    ["src/Secrets.YaML", "YAML_SECRET_MARKER_2"],
+    ["src/service-account-prod.json", "SERVICE_ACCOUNT_MARKER_3"],
+    ["src/server.PEM", "PEM_MARKER_4"],
+    ["src/signing.Key", "KEY_MARKER_5"],
+    ["src/certificate.P12", "P12_MARKER_6"],
+    ["src/archive.PfX", "PFX_MARKER_7"],
+  ] as const;
+  try {
+    for (const [relativePath, marker] of protectedFiles) {
+      await fs.writeFile(path.join(workspace, ...relativePath.split("/")), `${marker}\n`, "utf8");
+    }
+
+    const rootListing = await listFiles.execute({}, context(workspace));
+    const sourceListing = await listFiles.execute({ path: "src" }, context(workspace));
+    const searched = await searchText.execute({ query: "MARKER", path: "." }, context(workspace));
+    for (const [relativePath, marker] of protectedFiles) {
+      assert.doesNotMatch(`${rootListing}\n${sourceListing}\n${searched}`, new RegExp(marker, "iu"));
+      assert.doesNotMatch(`${rootListing}\n${sourceListing}`, new RegExp(path.basename(relativePath), "iu"));
+      await assert.rejects(
+        readFile.execute({ path: relativePath }, context(workspace)),
+        /目标路径受保护/,
+      );
+    }
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test(".minicodeignore 使用根相对小型 glob，并让 list、search、read 与 write 策略一致闭锁", async () => {
+  const workspace = await createWorkspace();
+  try {
+    await fs.mkdir(path.join(workspace, "private"));
+    await fs.mkdir(path.join(workspace, "generated"));
+    await fs.mkdir(path.join(workspace, "docs"));
+    await fs.mkdir(path.join(workspace, "cache"));
+    await fs.writeFile(path.join(workspace, ".minicodeignore"), [
+      "# 规则相对工作区根目录",
+      "PRIVATE/**",
+      "generated/*.ts",
+      "docs/?raft.md",
+      "cache/",
+    ].join("\n"), "utf8");
+    await fs.writeFile(path.join(workspace, "private", "secret.txt"), "CUSTOM_PRIVATE_MARKER\n", "utf8");
+    await fs.writeFile(path.join(workspace, "generated", "hidden.ts"), "CUSTOM_GENERATED_MARKER\n", "utf8");
+    await fs.writeFile(path.join(workspace, "generated", "visible.md"), "VISIBLE_GENERATED_TEXT\n", "utf8");
+    await fs.writeFile(path.join(workspace, "docs", "draft.md"), "CUSTOM_DRAFT_MARKER\n", "utf8");
+    await fs.writeFile(path.join(workspace, "cache", "item.txt"), "CUSTOM_CACHE_MARKER\n", "utf8");
+
+    const policy = new WorkspacePolicy(workspace);
+    assert.equal(await policy.hasCustomIgnoreRules(), true);
+    const rootListing = await listFiles.execute({}, context(workspace));
+    assert.doesNotMatch(rootListing, /\.minicodeignore|private|cache/i);
+    const generatedListing = await listFiles.execute({ path: "generated" }, context(workspace));
+    assert.doesNotMatch(generatedListing, /hidden\.ts/i);
+    assert.match(generatedListing, /visible\.md/i);
+
+    const searched = await searchText.execute({ query: "CUSTOM_", path: "." }, context(workspace));
+    assert.match(searched, /未找到匹配/);
+    assert.doesNotMatch(searched, /PRIVATE|GENERATED|DRAFT|CACHE/);
+    const visible = await searchText.execute({ query: "VISIBLE_GENERATED_TEXT", path: "." }, context(workspace));
+    assert.match(visible, /generated\/visible\.md/);
+
+    for (const relativePath of [
+      "private/secret.txt",
+      "generated/hidden.ts",
+      "docs/draft.md",
+      "cache/item.txt",
+      ".minicodeignore",
+    ]) {
+      await assert.rejects(readFile.execute({ path: relativePath }, context(workspace)), /目标路径受保护/);
+      await assert.rejects(policy.resolveWritePath(relativePath), /目标路径受保护/);
+    }
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test(".minicodeignore 的反向规则、非法 UTF-8 与超限正文均失败关闭", async () => {
+  const cases: readonly [string, Buffer, RegExp][] = [
+    ["negation", Buffer.from("!.env\n", "utf8"), /不支持的 ! 反向规则/],
+    ["invalid-utf8", Buffer.from([0xff]), /不是有效的 UTF-8/],
+    ["oversized", Buffer.alloc(64 * 1024 + 1, 0x61), /超过 65536 字节限制/],
+  ];
+  for (const [label, content, expected] of cases) {
+    const workspace = await createWorkspace();
+    try {
+      await fs.writeFile(path.join(workspace, ".minicodeignore"), content);
+      await assert.rejects(
+        readFile.execute({ path: "README.md" }, context(workspace)),
+        expected,
+        label,
+      );
+      // Built-ins are checked before custom rules, so an invalid `!` rule can
+      // never be used to unprotect a credential path.
+      await assert.rejects(
+        readFile.execute({ path: ".env" }, context(workspace)),
+        /目标路径受保护/,
+        label,
+      );
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   }
 });
 

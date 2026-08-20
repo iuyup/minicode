@@ -539,6 +539,21 @@ test("Node eval、npm 全局参数和 publish 在确认前被策略阻断", asyn
       marker: "SENSITIVE_SHORT_GLOBAL_2C",
     },
     {
+      input: { program: "npm", args: ["test", "--workspace", "SENSITIVE_WORKSPACE_2D"], cwd: "." },
+      message: /npm 全局操作、配置文件覆盖或工作目录覆盖/,
+      marker: "SENSITIVE_WORKSPACE_2D",
+    },
+    {
+      input: { program: "npm", args: ["run", "check", "--workspaces=true", "SENSITIVE_WORKSPACES_2E"], cwd: "." },
+      message: /npm 全局操作、配置文件覆盖或工作目录覆盖/,
+      marker: "SENSITIVE_WORKSPACES_2E",
+    },
+    {
+      input: { program: "npm", args: ["test", "-w=packages/SENSITIVE_SHORT_WORKSPACE_2F"], cwd: "." },
+      message: /npm 全局操作、配置文件覆盖或工作目录覆盖/,
+      marker: "SENSITIVE_SHORT_WORKSPACE_2F",
+    },
+    {
       input: { program: "npm", args: ["publish", "--tag", "SENSITIVE_PUBLISH_3"], cwd: "." },
       message: /npm 动作不在第一版允许列表/,
       marker: "SENSITIVE_PUBLISH_3",
@@ -606,14 +621,14 @@ test("Node 入口后的参数和 npm 双横线后的参数不会被误判为运�
     );
     const npmAttempt = await runCommandAttempt(
       workspace,
-      { program: "npm", args: ["run", "build", "--", "--prefix", "script-value"], cwd: "." },
+      { program: "npm", args: ["run", "build", "--", "--prefix", "--workspace", "script-value"], cwd: "." },
       runner,
     );
 
     assert.equal(toolResult(nodeAttempt)?.status, "success");
     assert.equal(toolResult(npmAttempt)?.status, "success");
     assert.deepEqual(observed[0]?.args, ["packages/app/scripts/check.mjs", "-e", "--print"]);
-    assert.deepEqual(observed[1]?.args, ["run", "build", "--", "--prefix", "script-value"]);
+    assert.deepEqual(observed[1]?.args, ["run", "build", "--", "--prefix", "--workspace", "script-value"]);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }
@@ -701,6 +716,155 @@ test("审批期间 cwd 失效会在执行期二次校验中记录 blocked 且保
     assertAuditOmits(attempt, [workspace]);
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("审批期间新增 .minicodeignore 保护 cwd 时保持零进程", async () => {
+  const workspace = await createWorkspace();
+  let runnerCalls = 0;
+  const runner: CommandRunner = {
+    async run(): Promise<CommandRunResult> {
+      runnerCalls += 1;
+      return successfulResult();
+    },
+  };
+  try {
+    const attempt = await runCommandAttempt(
+      workspace,
+      { program: "npm", args: ["--version"], cwd: "packages/app" },
+      runner,
+      async () => {
+        await fs.writeFile(path.join(workspace, ".minicodeignore"), "packages/**\n", "utf8");
+        return true;
+      },
+    );
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /工作目录未通过工作区路径策略/);
+    assert.equal(
+      attempt.audit.find((event) => event.type === "policy_decision")?.decision,
+      "blocked",
+    );
+    assertAuditOmits(attempt, [workspace]);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("审批期间同路径替换为另一个有效 cwd 仍会 blocked 且保持零进程", async () => {
+  const workspace = await createWorkspace();
+  const nestedCwd = path.join(workspace, "packages", "app");
+  const originalCwd = path.join(workspace, "packages", "approved-app");
+  let runnerCalls = 0;
+  const runner: CommandRunner = {
+    async run(): Promise<CommandRunResult> {
+      runnerCalls += 1;
+      return successfulResult();
+    },
+  };
+  try {
+    const attempt = await runCommandAttempt(
+      workspace,
+      { program: "npm", args: ["--version"], cwd: "packages/app" },
+      runner,
+      async () => {
+        await fs.rename(nestedCwd, originalCwd);
+        await fs.mkdir(nestedCwd, { recursive: true });
+        return true;
+      },
+    );
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /审批期间可能已失效或被替换/);
+    assert.equal(
+      attempt.audit.find((event) => event.type === "policy_decision")?.decision,
+      "blocked",
+    );
+    assert.equal(lifecycle(attempt).includes("tool_execution_started"), true);
+    assertAuditOmits(attempt, [workspace]);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("审批期间 Node 入口脚本同路径替换会被身份与内容复核拒绝", async () => {
+  const workspace = await createWorkspace();
+  const entryPath = path.join(workspace, "packages", "app", "scripts", "check.mjs");
+  let runnerCalls = 0;
+  const runner: CommandRunner = {
+    async run(): Promise<CommandRunResult> {
+      runnerCalls += 1;
+      return successfulResult();
+    },
+  };
+  try {
+    const attempt = await runCommandAttempt(
+      workspace,
+      { program: "node", args: ["scripts/check.mjs"], cwd: "packages/app" },
+      runner,
+      async () => {
+        await fs.rm(entryPath);
+        await fs.writeFile(entryPath, "// replacement\n", "utf8");
+        return true;
+      },
+    );
+
+    assert.equal(runnerCalls, 0);
+    assert.equal(toolResult(attempt)?.status, "error");
+    assert.match(toolResult(attempt)?.content ?? "", /Node 入口脚本在审批期间/);
+    assert.equal(
+      attempt.audit.find((event) => event.type === "policy_decision")?.decision,
+      "blocked",
+    );
+    assertAuditOmits(attempt, [workspace, "replacement"]);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("npm 审批期间最近 package.json 原地修改或同路径替换都会保持零进程", async (t) => {
+  for (const replacement of [false, true]) {
+    await t.test(replacement ? "same-path replacement" : "in-place modification", async () => {
+      const workspace = await createWorkspace();
+      const packagePath = path.join(workspace, "package.json");
+      let runnerCalls = 0;
+      const runner: CommandRunner = {
+        async run(): Promise<CommandRunResult> {
+          runnerCalls += 1;
+          return successfulResult("SHOULD_NOT_RUN");
+        },
+      };
+      try {
+        const attempt = await runCommandAttempt(
+          workspace,
+          { program: "npm", args: ["run", "check"], cwd: "packages/app" },
+          runner,
+          async () => {
+            if (replacement) await fs.rm(packagePath);
+            await fs.writeFile(
+              packagePath,
+              JSON.stringify({ scripts: { check: "node -e \"console.log('SENSITIVE_CHANGED_SCRIPT')\"" } }),
+              "utf8",
+            );
+            return true;
+          },
+        );
+
+        assert.equal(runnerCalls, 0);
+        assert.equal(toolResult(attempt)?.status, "error");
+        assert.match(toolResult(attempt)?.content ?? "", /package\.json 在审批期间/u);
+        assert.equal(
+          attempt.audit.find((event) => event.type === "policy_decision")?.decision,
+          "blocked",
+        );
+        assert.equal(lifecycle(attempt).includes("tool_execution_started"), true);
+        assertAuditOmits(attempt, [workspace, "SENSITIVE_CHANGED_SCRIPT", "SHOULD_NOT_RUN"]);
+      } finally {
+        await fs.rm(workspace, { recursive: true, force: true });
+      }
+    });
   }
 });
 

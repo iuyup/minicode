@@ -7,7 +7,14 @@ import test from "node:test";
 import { promisify } from "node:util";
 
 import { AgentLoop } from "../src/agent/agent-loop.ts";
-import type { ChatModel, JsonObject, ModelRequest, ModelResponse, ToolResultMessage } from "../src/agent/contracts.ts";
+import {
+  ToolExecutionError,
+  type ChatModel,
+  type JsonObject,
+  type ModelRequest,
+  type ModelResponse,
+  type ToolResultMessage,
+} from "../src/agent/contracts.ts";
 import { JsonlAuditLog } from "../src/agent/events.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { FakeModel } from "../src/models/fake-model.ts";
@@ -76,8 +83,12 @@ function fakeRunner(
   };
 }
 
-function toolContext(workspaceRoot: string, recordPolicyDecision?: (decision: { decision: "allowed" | "blocked"; path: string; reason: string }) => void) {
-  return { task: "读取 Git 变更", step: 1, workspaceRoot, recordPolicyDecision };
+function toolContext(
+  workspaceRoot: string,
+  recordPolicyDecision?: (decision: { decision: "allowed" | "blocked"; path: string; reason: string }) => void,
+  signal?: AbortSignal,
+) {
+  return { task: "读取 Git 变更", step: 1, workspaceRoot, recordPolicyDecision, signal };
 }
 
 function scriptedGitModel(input: JsonObject): ChatModel {
@@ -118,6 +129,7 @@ test("inspect_git 只接受三个固定动作，不能注入路径或任意 Git 
 
 test("三个动作映射为固定参数、根目录和脱敏环境，且不包含 Git 写操作", async () => {
   const workspace = await createRepositoryShell();
+  const controller = new AbortController();
   const previousApiKey = process.env.MINICODE_OPENAI_API_KEY;
   const previousGitConfigCount = process.env.GIT_CONFIG_COUNT;
   process.env.MINICODE_OPENAI_API_KEY = "SENSITIVE_GIT_API_KEY_7A91";
@@ -128,9 +140,15 @@ test("三个动作映射为固定参数、根目录和脱敏环境，且不包�
       const decisions: string[] = [];
       const result = await createInspectGitTool(runner).execute(
         { action },
-        toolContext(workspace, (decision) => decisions.push(`${decision.decision}:${decision.path}`)),
+        toolContext(
+          workspace,
+          (decision) => decisions.push(`${decision.decision}:${decision.path}`),
+          controller.signal,
+        ),
       );
       assert.equal(runner.mainCalls.length, 1);
+      assert.equal(runner.calls.length >= 5, true);
+      assert.equal(runner.calls.every((call) => call.signal === controller.signal), true);
       const main = runner.mainCalls[0];
       assert.equal(main.cwd, await fs.realpath(workspace));
       assert.equal(main.action, action === "status" ? "git_status" : action === "diff" ? "git_diff" : "git_staged_diff");
@@ -148,6 +166,11 @@ test("三个动作映射为固定参数、根目录和脱敏环境，且不包�
       assert.equal(runner.calls.filter((call) => call.args.includes("config")).every((call) => call.args.includes("--no-includes")), true);
       assert.equal(main.args.some((argument) => argument.includes(".env.*")), true);
       assert.equal(main.args.some((argument) => argument.includes("node_modules")), true);
+      assert.equal(main.args.includes(":(exclude,glob,icase)**/.ssh"), true);
+      assert.equal(main.args.includes(":(exclude,glob,icase)**/.git"), true);
+      assert.equal(main.args.some((argument) => argument.includes("credentials*.json")), true);
+      assert.equal(main.args.some((argument) => argument.includes("service-account*.json")), true);
+      assert.equal(main.args.some((argument) => argument.includes("*.pem")), true);
       for (const forbidden of ["add", "commit", "checkout", "reset", "push", "switch", "restore"] ) {
         assert.equal(main.args.includes(forbidden), false);
       }
@@ -167,6 +190,22 @@ test("三个动作映射为固定参数、根目录和脱敏环境，且不包�
     else process.env.MINICODE_OPENAI_API_KEY = previousApiKey;
     if (previousGitConfigCount === undefined) delete process.env.GIT_CONFIG_COUNT;
     else process.env.GIT_CONFIG_COUNT = previousGitConfigCount;
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("存在自定义 .minicodeignore 时 Git 工具确认前闭锁，避免绕过读取策略", async () => {
+  const workspace = await createRepositoryShell();
+  const runner = fakeRunner(workspace);
+  try {
+    await fs.writeFile(path.join(workspace, ".minicodeignore"), "private/**\n", "utf8");
+    await assert.rejects(
+      createInspectGitTool(runner).execute({ action: "diff" }, toolContext(workspace)),
+      /启用了 \.minicodeignore/,
+    );
+    assert.equal(runner.calls.length, 0);
+    assert.equal(runner.mainCalls.length, 0);
+  } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }
 });
@@ -352,6 +391,120 @@ test("Git 根目录不一致或存在外部 filter/diff driver 时不会执行�
     assert.equal(filterRunner.mainCalls.length, 0);
   } finally {
     await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("已取消的 Git 预检返回 cancelled 元数据而不是普通版本失败", async () => {
+  const workspace = await createRepositoryShell("minicode-git-cancelled-preflight-");
+  const controller = new AbortController();
+  const runner = fakeRunner(workspace);
+  runner.run = async (request): Promise<BoundedProcessResult> => {
+    runner.calls.push(request);
+    return processResult("SENSITIVE_CANCELLED_PREFLIGHT_OUTPUT", null, { cancelled: true });
+  };
+
+  try {
+    await assert.rejects(
+      createInspectGitTool(runner).execute(
+        { action: "status" },
+        toolContext(workspace, undefined, controller.signal),
+      ),
+      (error: Error) => {
+        assert.ok(error instanceof ToolExecutionError);
+        assert.match(error.message, /Git 只读检查已取消/);
+        assert.doesNotMatch(error.message, /无法确认 Git 版本|失败|超时|SENSITIVE/);
+        const metadata = error.metadata;
+        assert.ok(metadata);
+        assert.equal(metadata.action, "git_status");
+        assert.equal(metadata.cancelled, true);
+        assert.equal(metadata.timedOut, false);
+        return true;
+      },
+    );
+    assert.equal(runner.calls.length, 1);
+    assert.equal(runner.calls[0].signal, controller.signal);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("预先取消会在文件系统预检前闭锁且不启动 Git", async () => {
+  const workspace = await createRepositoryShell("minicode-git-pre-aborted-");
+  const controller = new AbortController();
+  const runner = fakeRunner(workspace);
+  controller.abort();
+
+  try {
+    await assert.rejects(
+      createInspectGitTool(runner).execute(
+        { action: "diff" },
+        toolContext(workspace, undefined, controller.signal),
+      ),
+      (error: Error) => {
+        assert.ok(error instanceof ToolExecutionError);
+        assert.match(error.message, /Git 只读检查已取消/);
+        const metadata = error.metadata;
+        assert.ok(metadata);
+        assert.equal(metadata.action, "git_diff");
+        assert.equal(metadata.cancelled, true);
+        return true;
+      },
+    );
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("AbortSignal 可结束忽略取消且永久 pending 的 Git runner", async () => {
+  const workspace = await createRepositoryShell("minicode-git-pending-cancel-");
+  const controller = new AbortController();
+  const runner = fakeRunner(workspace);
+  let notifyMainStarted: (() => void) | undefined;
+  const mainStarted = new Promise<void>((resolve) => {
+    notifyMainStarted = resolve;
+  });
+  runner.run = async (request): Promise<BoundedProcessResult> => {
+    runner.calls.push(request);
+    if (request.args.length === 1 && request.args[0] === "--version") {
+      return processResult("git version 2.55.0\n");
+    }
+    if (request.args.includes("rev-parse")) return processResult(`${workspace}\n`);
+    if (request.args.includes("config")) return processResult("", 1);
+    runner.mainCalls.push(request);
+    notifyMainStarted?.();
+    return new Promise<BoundedProcessResult>(() => undefined);
+  };
+
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const execution = createInspectGitTool(runner).execute(
+      { action: "status" },
+      toolContext(workspace, undefined, controller.signal),
+    );
+    await mainStarted;
+    controller.abort();
+
+    const boundedExecution = Promise.race([
+      execution,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Git 取消未在期限内结束")), 500);
+      }),
+    ]);
+    await assert.rejects(boundedExecution, (error: Error) => {
+      assert.ok(error instanceof ToolExecutionError);
+      assert.match(error.message, /Git 只读检查已取消/);
+      const metadata = error.metadata;
+      assert.ok(metadata);
+      assert.equal(metadata.action, "git_status");
+      assert.equal(metadata.cancelled, true);
+      return true;
+    });
+    assert.equal(runner.mainCalls.length, 1);
+    assert.equal(runner.calls.every((call) => call.signal === controller.signal), true);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    await fs.rm(workspace, { recursive: true, force: true });
   }
 });
 
@@ -558,6 +711,12 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     await fs.writeFile(path.join(workspace, ".npmrc"), "NPM_SECRET_BASELINE\n", "utf8");
     await fs.writeFile(path.join(workspace, "nested", ".Env.Local"), "NESTED_SECRET_BASELINE\n", "utf8");
     await fs.writeFile(path.join(workspace, "nested", ".Pypirc"), "PYPI_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, "Credentials.Production.JSON"), "CREDENTIAL_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", "Secrets.YML"), "YAML_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", "service-account-prod.json"), "SERVICE_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", "private.PEM"), "PEM_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, ".ssh"), "SSH_FILE_SECRET_BASELINE\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", ".aws"), "AWS_FILE_SECRET_BASELINE\n", "utf8");
     await fs.writeFile(path.join(workspace, "node_modules", "fixture", "secret.js"), "MODULE_SECRET_BASELINE\n", "utf8");
     await git(executable, workspace, ["add", "--all"]);
     await git(executable, workspace, ["commit", "--quiet", "-m", "baseline"]);
@@ -570,6 +729,12 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     await fs.writeFile(path.join(workspace, ".npmrc"), "NPM_SECRET_CHANGED_A4D2\n", "utf8");
     await fs.writeFile(path.join(workspace, "nested", ".Env.Local"), "NESTED_SECRET_CHANGED_72BB\n", "utf8");
     await fs.writeFile(path.join(workspace, "nested", ".Pypirc"), "PYPI_SECRET_CHANGED_C6E3\n", "utf8");
+    await fs.writeFile(path.join(workspace, "Credentials.Production.JSON"), "CREDENTIAL_SECRET_CHANGED_3B6F\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", "Secrets.YML"), "YAML_SECRET_CHANGED_7F20\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", "service-account-prod.json"), "SERVICE_SECRET_CHANGED_8C31\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", "private.PEM"), "PEM_SECRET_CHANGED_A913\n", "utf8");
+    await fs.writeFile(path.join(workspace, ".ssh"), "SSH_FILE_SECRET_CHANGED_E715\n", "utf8");
+    await fs.writeFile(path.join(workspace, "nested", ".aws"), "AWS_FILE_SECRET_CHANGED_8D04\n", "utf8");
     await fs.writeFile(path.join(workspace, "node_modules", "fixture", "secret.js"), "MODULE_SECRET_CHANGED_53CC\n", "utf8");
 
     await git(executable, workspace, ["config", "filter.evil.clean", "node filter-marker.mjs"]);
@@ -596,9 +761,10 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     assert.deepEqual(indexAfterWorkingChecks, indexBefore);
     assert.match(status.content, /src\/app\.ts/);
     assert.match(status.content, /src\/new\.ts/);
-    assert.doesNotMatch(status.content, /\.ENV|\.npmrc|nested\/\.Env\.Local|nested\/\.Pypirc|node_modules\/fixture|ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET/);
+    const statusResult = status.content.split("结果：\n", 2)[1] ?? "";
+    assert.doesNotMatch(statusResult, /\.ENV|\.npmrc|nested\/\.Env\.Local|nested\/\.Pypirc|Credentials\.Production\.JSON|nested\/Secrets\.YML|service-account-prod|private\.PEM|\.ssh|nested\/\.aws|node_modules\/fixture|ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|CREDENTIAL_SECRET|YAML_SECRET|SERVICE_SECRET|PEM_SECRET|SSH_FILE_SECRET|AWS_FILE_SECRET/i);
     assert.match(diff.content, /VISIBLE_CHANGE/);
-    assert.doesNotMatch(diff.content, /ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|\.npmrc|nested\/\.env\.local|nested\/\.pypirc|node_modules\/fixture/);
+    assert.doesNotMatch(diff.content, /ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|CREDENTIAL_SECRET|YAML_SECRET|SERVICE_SECRET|PEM_SECRET|SSH_FILE_SECRET|AWS_FILE_SECRET|\.npmrc|nested\/\.env\.local|nested\/\.pypirc|credentials\.production\.json|secrets\.yml|service-account-prod|private\.pem|\.ssh|nested\/\.aws|node_modules\/fixture/i);
 
     await git(executable, workspace, ["add", "--all"]);
     const indexBeforeStagedCheck = await fs.readFile(path.join(workspace, ".git", "index"));
@@ -606,7 +772,7 @@ test("真实 Git 检查排除受保护内容，且不改变 HEAD、分支或 ind
     const indexAfterStagedCheck = await fs.readFile(path.join(workspace, ".git", "index"));
     assert.deepEqual(indexAfterStagedCheck, indexBeforeStagedCheck);
     assert.match(stagedDiff.content, /VISIBLE_CHANGE/);
-    assert.doesNotMatch(stagedDiff.content, /ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|\.npmrc|nested\/\.env\.local|nested\/\.pypirc|node_modules\/fixture/);
+    assert.doesNotMatch(stagedDiff.content, /ROOT_SECRET|NPM_SECRET|NESTED_SECRET|PYPI_SECRET|MODULE_SECRET|CREDENTIAL_SECRET|YAML_SECRET|SERVICE_SECRET|PEM_SECRET|SSH_FILE_SECRET|AWS_FILE_SECRET|\.npmrc|nested\/\.env\.local|nested\/\.pypirc|credentials\.production\.json|secrets\.yml|service-account-prod|private\.pem|\.ssh|nested\/\.aws|node_modules\/fixture/i);
 
     assert.equal((await git(executable, workspace, ["rev-parse", "HEAD"])).trim(), headBefore);
     assert.equal((await git(executable, workspace, ["branch", "--show-current"])).trim(), branchBefore);

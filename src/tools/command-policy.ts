@@ -87,7 +87,10 @@ function isNodeInlineCodeArgument(argument: string): boolean {
 
 function isNpmLocationOverride(argument: string): boolean {
   return /^-g(?:=|$)/u.test(argument)
+    || /^-w/u.test(argument)
     || /^--global(?:=|$)/u.test(argument)
+    || /^--workspace(?:=|$)/u.test(argument)
+    || /^--workspaces(?:=|$)/u.test(argument)
     || argument === "--prefix"
     || argument.startsWith("--prefix=")
     || argument === "--location"

@@ -89,6 +89,7 @@ test("DeepSeekModel 发送 OpenAI 兼容请求，并显式关闭思考模式", a
 
   assert.deepEqual(result, { kind: "final", content: "已确认。" });
   assert.equal(capturedUrl, "https://api.deepseek.com/chat/completions");
+  assert.equal(capturedInit?.redirect, "error");
   assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer test-key");
   assert.equal(typeof capturedInit?.body, "string");
   const body = JSON.parse(capturedInit?.body as string) as Record<string, unknown>;
@@ -454,16 +455,22 @@ test("DeepSeekModel 拒绝空 API Key", () => {
 });
 
 test("OpenAiCompatibleModel 构造器本身也拒绝不安全的 baseUrl", () => {
-  const create = (baseUrl: string) => new OpenAiCompatibleModel({
+  const create = (baseUrl: string, allowInsecureHttp = false) => new OpenAiCompatibleModel({
     apiKey: "test-key",
     baseUrl,
     model: "test-model",
     providerName: "Test provider",
+    allowInsecureHttp,
   });
   assert.throws(() => create("file:///tmp/v1"), /http 或 https/);
   assert.throws(() => create("https://user:secret@example.test/v1"), /用户名或密码/);
   assert.throws(() => create("https://example.test/v1?"), /查询参数/);
   assert.throws(() => create("https://example.test/v1#"), /URL 片段/);
+  assert.throws(() => create("http://gateway.example/v1"), /非本机 HTTP/);
+  assert.doesNotThrow(() => create("http://localhost:8080/v1"));
+  assert.doesNotThrow(() => create("http://127.0.0.1:8080/v1"));
+  assert.doesNotThrow(() => create("http://[::1]:8080/v1"));
+  assert.doesNotThrow(() => create("http://gateway.example/v1", true));
 });
 
 test("OpenAiCompatibleModel 严格校验 finish_reason、最终文本和工具调用标识", async () => {

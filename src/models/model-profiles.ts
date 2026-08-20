@@ -28,6 +28,7 @@ export type ModelProfile = FakeModelProfile | OpenAiCompatibleProfile;
 export interface ResolvedOpenAiCompatibleProfile {
   profile: OpenAiCompatibleProfile;
   apiKey: string;
+  allowInsecureHttp: boolean;
 }
 
 export interface ModelProfileReadiness {
@@ -37,6 +38,10 @@ export interface ModelProfileReadiness {
 
 function valueFrom(environment: NodeJS.ProcessEnv, name: string): string {
   return environment[name]?.trim() ?? "";
+}
+
+function allowInsecureHttpFrom(environment: NodeJS.ProcessEnv): boolean {
+  return valueFrom(environment, "MINICODE_ALLOW_INSECURE_HTTP") === "1";
 }
 
 export function parseModelProfileId(value: string): ModelProfileId | undefined {
@@ -77,7 +82,7 @@ export function getModelProfiles(environment: NodeJS.ProcessEnv = process.env): 
       id: "openai-compatible",
       kind: "openai-compatible",
       label: "OpenAI-compatible",
-      description: "从环境变量读取任意兼容服务的地址、模型和 Key。",
+      description: "从环境变量读取使用 Bearer Key 与 Chat Completions 工具调用的兼容服务。",
       baseUrl: valueFrom(environment, "MINICODE_OPENAI_BASE_URL"),
       model: valueFrom(environment, "MINICODE_OPENAI_MODEL"),
       apiKeyEnvironmentVariable: "MINICODE_OPENAI_API_KEY",
@@ -101,7 +106,9 @@ export function getModelProfileReadiness(
 ): ModelProfileReadiness {
   if (profile.kind === "fake") return { ready: true };
   if (profile.baseUrl === "") return { ready: false, reason: "缺少 baseUrl 环境变量" };
-  const baseUrlProblem = validateOpenAiCompatibleBaseUrl(profile.baseUrl);
+  const baseUrlProblem = validateOpenAiCompatibleBaseUrl(profile.baseUrl, {
+    allowInsecureHttp: allowInsecureHttpFrom(environment),
+  });
   if (baseUrlProblem) return { ready: false, reason: baseUrlProblem };
   if (profile.model === "") return { ready: false, reason: "缺少 model 环境变量" };
   if (valueFrom(environment, profile.apiKeyEnvironmentVariable) === "") {
@@ -122,5 +129,9 @@ export function resolveOpenAiCompatibleProfile(
   if (!readiness.ready) {
     throw new Error(`${profile.label} Profile 尚未配置：${readiness.reason ?? "配置不完整"}。`);
   }
-  return { profile, apiKey: valueFrom(environment, profile.apiKeyEnvironmentVariable) };
+  return {
+    profile,
+    apiKey: valueFrom(environment, profile.apiKeyEnvironmentVariable),
+    allowInsecureHttp: allowInsecureHttpFrom(environment),
+  };
 }

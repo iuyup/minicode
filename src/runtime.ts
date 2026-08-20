@@ -51,10 +51,10 @@ export interface CliArguments {
 export interface CreateAgentOptions {
   model?: ChatModel;
   onEvent?: (event: AgentEvent) => void;
-  requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
-  requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
-  requestRepairApproval?: (request: RepairApprovalRequest) => Promise<boolean>;
-  requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
+  requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  requestPlanApproval?: (request: PlanApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  requestRepairApproval?: (request: RepairApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  requestCommandApproval?: (request: CommandApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
 }
 
 const readOnlyTools = [getProjectOverview, listFiles, searchText, readFile, inspectGit] as const;
@@ -235,7 +235,7 @@ function usesRemoteModel(argumentsValue: CliArguments): boolean {
 
 function createModel(argumentsValue: CliArguments): ChatModel {
   if (!usesRemoteModel(argumentsValue)) return new FakeModel();
-  const { profile, apiKey } = resolveOpenAiCompatibleProfile(argumentsValue.modelProfile);
+  const { profile, apiKey, allowInsecureHttp } = resolveOpenAiCompatibleProfile(argumentsValue.modelProfile);
   const activeProfile = currentModelProfile(argumentsValue);
   if (activeProfile.kind === "fake") return new FakeModel();
   return new OpenAiCompatibleModel({
@@ -245,6 +245,7 @@ function createModel(argumentsValue: CliArguments): ChatModel {
     providerName: profile.label,
     apiKeyEnvironmentVariable: profile.apiKeyEnvironmentVariable,
     disableThinking: profile.disableThinking,
+    allowInsecureHttp,
   });
 }
 
@@ -270,7 +271,7 @@ export function modelProfileReadiness(profile: ModelProfile): string {
   return readiness.ready ? "就绪" : readiness.reason ?? "未就绪";
 }
 
-async function requestTerminalApproval(request: EditApprovalRequest): Promise<boolean> {
+async function requestTerminalApproval(request: EditApprovalRequest, signal?: AbortSignal): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("--apply 只能在交互式终端中使用，以便人工确认补丁。");
   }
@@ -280,14 +281,14 @@ async function requestTerminalApproval(request: EditApprovalRequest): Promise<bo
     process.stdout.write(
       `\n待写入文件：${escapeTerminalText(request.path)}\n${escapeMultilineTerminalText(request.preview)}\n`,
     );
-    const answer = await terminal.question("输入 APPLY 确认写入，输入其他内容取消：");
+    const answer = await terminal.question("输入 APPLY 确认写入，输入其他内容取消：", { signal });
     return answer.trim() === "APPLY";
   } finally {
     terminal.close();
   }
 }
 
-async function requestTerminalPlanApproval(request: PlanApprovalRequest): Promise<boolean> {
+async function requestTerminalPlanApproval(request: PlanApprovalRequest, signal?: AbortSignal): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("--guided 只能在交互式终端中使用，以便人工确认计划。");
   }
@@ -295,14 +296,14 @@ async function requestTerminalPlanApproval(request: PlanApprovalRequest): Promis
   const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     process.stdout.write(`\n待确认计划：\n${escapeMultilineTerminalText(request.plan)}\n`);
-    const answer = await terminal.question("输入 CONTINUE 开始执行，输入 CANCEL 取消：");
+    const answer = await terminal.question("输入 CONTINUE 开始执行，输入 CANCEL 取消：", { signal });
     return answer.trim() === "CONTINUE";
   } finally {
     terminal.close();
   }
 }
 
-async function requestTerminalRepairApproval(request: RepairApprovalRequest): Promise<boolean> {
+async function requestTerminalRepairApproval(request: RepairApprovalRequest, signal?: AbortSignal): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("失败修复只能在交互式终端中使用，以便人工确认修复方向。");
   }
@@ -312,14 +313,14 @@ async function requestTerminalRepairApproval(request: RepairApprovalRequest): Pr
     process.stdout.write(
       `\n待确认修复方向（失败动作：${escapeTerminalText(request.failedAction)}，尝试 ${request.attempt}/${request.maximumAttempts}）：\n${escapeMultilineTerminalText(request.direction)}\n`,
     );
-    const answer = await terminal.question("输入 CONTINUE 允许一次修复，输入 CANCEL 停止：");
+    const answer = await terminal.question("输入 CONTINUE 允许一次修复，输入 CANCEL 停止：", { signal });
     return answer.trim() === "CONTINUE";
   } finally {
     terminal.close();
   }
 }
 
-async function requestTerminalCommandApproval(request: CommandApprovalRequest): Promise<boolean> {
+async function requestTerminalCommandApproval(request: CommandApprovalRequest, signal?: AbortSignal): Promise<boolean> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     throw new Error("本地命令只能在交互式终端中使用，以便人工确认。");
   }
@@ -331,7 +332,7 @@ async function requestTerminalCommandApproval(request: CommandApprovalRequest): 
     process.stdout.write(
       `\n${title}：${escapeTerminalText(request.action)}\n${commandLabel}：${escapeTerminalText(request.command)}\n工作目录：${escapeTerminalText(request.workingDirectory)}\n风险等级：${request.riskLevel}\n风险：${escapeTerminalText(request.risk)}\n`,
     );
-    const answer = await terminal.question("输入 RUN 确认执行，输入 CANCEL 取消：");
+    const answer = await terminal.question("输入 RUN 确认执行，输入 CANCEL 取消：", { signal });
     return answer.trim() === "RUN";
   } finally {
     terminal.close();

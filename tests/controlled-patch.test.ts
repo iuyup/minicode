@@ -80,6 +80,37 @@ function finalStatus(audit: Array<Record<string, unknown>>): unknown {
   return audit.findLast((event) => event.type === "tool_finalized" && event.toolCallId === "patch-1")?.status;
 }
 
+async function assertIncompletePreviewIsBlocked(options: {
+  source: string;
+  oldText: string;
+  newText: string;
+}): Promise<void> {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  try {
+    await fs.writeFile(targetPath, options.source, "utf8");
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: options.oldText, newText: options.newText },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 0);
+    assert.equal(await fs.readFile(targetPath, "utf8"), options.source);
+    const toolResult = attempt.result.messages.find((message) => message.role === "tool");
+    assert.equal(toolResult?.status, "error");
+    assert.match(toolResult?.content ?? "", /无法无损展示并确认.*拆成更小的补丁/);
+    assert.deepEqual(lifecycle(attempt.audit), ["tool_call", "tool_execution_started", "policy_decision", "tool_finalized"]);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+}
+
 test("propose 模式只返回预览，不写入文件", async () => {
   const workspace = await createWorkspace();
   try {
@@ -125,6 +156,142 @@ test("apply 模式只有确认后才原子写入，并且审计不保存补丁�
       "tool_finalized",
     ]);
     assert.equal(finalStatus(attempt.audit), "success");
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("oldText 单行超过 200 字符时禁止进入审批", async () => {
+  const oldText = "a".repeat(201);
+  await assertIncompletePreviewIsBlocked({
+    source: `${oldText}\n`,
+    oldText,
+    newText: "short",
+  });
+});
+
+test("newText 单行超过 200 字符时禁止进入审批", async () => {
+  await assertIncompletePreviewIsBlocked({
+    source: ORIGINAL_SOURCE,
+    oldText: "before-value",
+    newText: "n".repeat(201),
+  });
+});
+
+test("oldText 超过 40 个 CR 分隔行时禁止进入审批", async () => {
+  const oldText = Array.from({ length: 41 }, (_, index) => `old-${index}`).join("\r");
+  await assertIncompletePreviewIsBlocked({
+    source: `${oldText}\n`,
+    oldText,
+    newText: "short",
+  });
+});
+
+test("newText 超过 40 个 CRLF 分隔行时禁止进入审批", async () => {
+  await assertIncompletePreviewIsBlocked({
+    source: ORIGINAL_SOURCE,
+    oldText: "before-value",
+    newText: Array.from({ length: 41 }, (_, index) => `new-${index}`).join("\r\n"),
+  });
+});
+
+test("预览恰好 200 字符和 40 行时仍可确认应用", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  const oldText = "o".repeat(200);
+  const newText = Array.from({ length: 40 }, (_, index) => `new-${index}`).join("\n");
+  try {
+    await fs.writeFile(targetPath, oldText, "utf8");
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText, newText },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 1);
+    assert.equal(finalStatus(attempt.audit), "success");
+    assert.equal(await fs.readFile(targetPath, "utf8"), newText);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("oldText 的重叠候选会被视为多次匹配", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  try {
+    await fs.writeFile(targetPath, "aaa", "utf8");
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "aa", newText: "b" },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 0);
+    assert.equal(await fs.readFile(targetPath, "utf8"), "aaa");
+    assert.equal(finalStatus(attempt.audit), "error");
+    assert.match(
+      attempt.result.messages.find((message) => message.role === "tool")?.content ?? "",
+      /oldText 在目标文件中出现多次/,
+    );
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("oldText 的非重叠多次匹配仍会被拒绝", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  try {
+    await fs.writeFile(targetPath, "aa--aa", "utf8");
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "aa", newText: "b" },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 0);
+    assert.equal(await fs.readFile(targetPath, "utf8"), "aa--aa");
+    assert.equal(finalStatus(attempt.audit), "error");
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("唯一 oldText 匹配仍可确认应用", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  try {
+    await fs.writeFile(targetPath, "baab", "utf8");
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "aa", newText: "zz" },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 1);
+    assert.equal(finalStatus(attempt.audit), "success");
+    assert.equal(await fs.readFile(targetPath, "utf8"), "bzzb");
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }
@@ -276,6 +443,93 @@ test("APPLY 返回后若任务已取消，原子写入不会开始", async () =>
       /补丁写入已取消/,
     );
     assert.equal(await fs.readFile(path.join(workspace, TARGET_PATH), "utf8"), ORIGINAL_SOURCE);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("确认期间新增 .minicodeignore 保护目标时保持零写入", async () => {
+  const workspace = await createWorkspace();
+  try {
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "before-value", newText: "after-value" },
+      "apply",
+      async () => {
+        await fs.writeFile(path.join(workspace, ".minicodeignore"), "src/**\n", "utf8");
+        return true;
+      },
+    );
+
+    assert.equal(await fs.readFile(path.join(workspace, TARGET_PATH), "utf8"), ORIGINAL_SOURCE);
+    assert.equal(finalStatus(attempt.audit), "error");
+    assert.match(
+      attempt.result.messages.find((message) => message.role === "tool")?.content ?? "",
+      /文件或父目录在确认期间发生变化/,
+    );
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("确认期间同路径同内容换成另一文件对象时保持零写入", async () => {
+  const workspace = await createWorkspace();
+  const targetPath = path.join(workspace, TARGET_PATH);
+  const replacementPath = path.join(workspace, "same-content-replacement.ts");
+  try {
+    await fs.writeFile(replacementPath, ORIGINAL_SOURCE, "utf8");
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "before-value", newText: "after-value" },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        await fs.rm(targetPath);
+        await fs.rename(replacementPath, targetPath);
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 1);
+    assert.equal(await fs.readFile(targetPath, "utf8"), ORIGINAL_SOURCE);
+    assert.equal(finalStatus(attempt.audit), "error");
+    assert.match(
+      attempt.result.messages.find((message) => message.role === "tool")?.content ?? "",
+      /文件或父目录在确认期间发生变化/,
+    );
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("确认期间保留目标文件但更换父目录对象时保持零写入", async () => {
+  const workspace = await createWorkspace();
+  const sourceDirectory = path.join(workspace, "src");
+  const movedDirectory = path.join(workspace, "src-before-approval");
+  const targetPath = path.join(workspace, TARGET_PATH);
+  try {
+    let approvalCount = 0;
+    const attempt = await runPatchAttempt(
+      workspace,
+      { path: TARGET_PATH, oldText: "before-value", newText: "after-value" },
+      "apply",
+      async () => {
+        approvalCount += 1;
+        await fs.rename(sourceDirectory, movedDirectory);
+        await fs.mkdir(sourceDirectory);
+        await fs.rename(path.join(movedDirectory, "example.ts"), targetPath);
+        return true;
+      },
+    );
+
+    assert.equal(approvalCount, 1);
+    assert.equal(await fs.readFile(targetPath, "utf8"), ORIGINAL_SOURCE);
+    assert.equal(finalStatus(attempt.audit), "error");
+    assert.match(
+      attempt.result.messages.find((message) => message.role === "tool")?.content ?? "",
+      /文件或父目录在确认期间发生变化/,
+    );
   } finally {
     await fs.rm(workspace, { recursive: true, force: true });
   }

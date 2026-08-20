@@ -280,6 +280,57 @@ test("本地确认回调异常时默认闭锁且不泄露异常正文", async ()
   }
 });
 
+test("RUN 等待期间 package.json 原地修改或同路径替换都会保持零执行", async (t) => {
+  for (const replacement of [false, true]) {
+    await t.test(replacement ? "same-path replacement" : "in-place modification", async () => {
+      const workspace = await createWorkspace({ test: "node -e \"console.log('ORIGINAL')\"" });
+      const packagePath = path.join(workspace, "package.json");
+      let runnerCalls = 0;
+      const runner: ProjectCheckRunner = {
+        async run(): Promise<ProjectCheckRunResult> {
+          runnerCalls += 1;
+          return {
+            exitCode: 0,
+            durationMs: 1,
+            output: "SHOULD_NOT_RUN",
+            outputLength: 14,
+            outputTruncated: false,
+            timedOut: false,
+          };
+        },
+      };
+      try {
+        const attempt = await runCheckAttempt(
+          workspace,
+          createRunProjectCheckTool(runner),
+          { action: "test" },
+          async () => {
+            if (replacement) await fs.rm(packagePath);
+            await fs.writeFile(
+              packagePath,
+              JSON.stringify({ scripts: { test: "node -e \"console.log('SENSITIVE_CHANGED_SCRIPT')\"" } }),
+              "utf8",
+            );
+            return true;
+          },
+        );
+
+        assert.equal(runnerCalls, 0);
+        assert.equal(toolResult(attempt)?.status, "error");
+        assert.match(toolResult(attempt)?.content ?? "", /审批期间.*package\.json/u);
+        assert.equal(
+          attempt.audit.find((event) => event.type === "policy_decision")?.decision,
+          "blocked",
+        );
+        assert.equal(attempt.audit.some((event) => event.type === "tool_execution_started"), true);
+        assert.doesNotMatch(attempt.rawAudit, /SENSITIVE_CHANGED_SCRIPT|SHOULD_NOT_RUN/);
+      } finally {
+        await fs.rm(workspace, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("超时与截断作为受限执行结果处理，审计不保存输出", async () => {
   const workspace = await createWorkspace({ test: "node -e \"console.log('unused')\"" });
   try {

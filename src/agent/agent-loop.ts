@@ -6,10 +6,12 @@ import type {
   ConversationMessage,
   EditApprovalRequest,
   PlanApprovalRequest,
+  PreparedCommandExecution,
   RepairApprovalRequest,
   JsonValue,
   ModelResponse,
   ToolCall,
+  ToolExecutionContext,
   ToolExecutionMode,
   ToolExecutionMetadata,
   ToolExecutionOutput,
@@ -52,10 +54,10 @@ export interface AgentLoopOptions {
   enableFailureRepair?: boolean;
   systemPrompt?: string;
   executionMode?: ToolExecutionMode;
-  requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
-  requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
-  requestRepairApproval?: (request: RepairApprovalRequest) => Promise<boolean>;
-  requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
+  requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  requestPlanApproval?: (request: PlanApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  requestRepairApproval?: (request: RepairApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  requestCommandApproval?: (request: CommandApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
   auditLog?: AgentEventAuditLog;
   /**
    * 只读观察者：用于终端界面等展示层实时刷新，不参与工具权限、执行或审计决策。
@@ -132,6 +134,40 @@ interface SourceCitation {
   endLine: number;
 }
 
+function citationIsFullyVisible(citation: SourceCitation, evidence: SourceEvidence): boolean {
+  if (
+    evidence.path !== citation.path
+    || citation.startLine > citation.endLine
+    || citation.startLine < evidence.startLine
+    || citation.endLine > evidence.endLine
+  ) {
+    return false;
+  }
+  return !(evidence.truncatedLines ?? []).some(
+    (line) => line >= citation.startLine && line <= citation.endLine,
+  );
+}
+
+function completeEvidenceRanges(evidence: SourceEvidence): SourceCitation[] {
+  const truncated = new Set(evidence.truncatedLines ?? []);
+  const ranges: SourceCitation[] = [];
+  let rangeStart: number | undefined;
+  for (let line = evidence.startLine; line <= evidence.endLine; line += 1) {
+    if (truncated.has(line)) {
+      if (rangeStart !== undefined) {
+        ranges.push({ path: evidence.path, startLine: rangeStart, endLine: line - 1 });
+        rangeStart = undefined;
+      }
+      continue;
+    }
+    rangeStart ??= line;
+  }
+  if (rangeStart !== undefined) {
+    ranges.push({ path: evidence.path, startLine: rangeStart, endLine: evidence.endLine });
+  }
+  return ranges;
+}
+
 function citationsForEvidence(answer: string, evidence: SourceEvidence): SourceCitation[] {
   const citationPattern = new RegExp(
     `(?<![\\p{L}\\p{N}_.\\-/\\\\])${escapeRegExp(evidence.path)}:(\\d+)(?:-(\\d+))?(?=$|[\\s\`)\\]，,.;:!?；。])`,
@@ -190,11 +226,7 @@ function validateSourceEvidence(answer: string, sourceEvidence: readonly SourceE
 
   const allCitationCandidates = [...citations, ...citationLikeCandidates(answer, sourceEvidence)];
   const areAllCitationsVerified = allCitationCandidates.every((citation) => sourceEvidence.some(
-    (evidence) =>
-      evidence.path === citation.path &&
-      citation.startLine <= citation.endLine &&
-      citation.startLine >= evidence.startLine &&
-      citation.endLine <= evidence.endLine,
+    (evidence) => citationIsFullyVisible(citation, evidence),
   ));
   return areAllCitationsVerified
     ? { ok: true }
@@ -225,13 +257,14 @@ function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal | undefine
 }
 
 function formatSourceEvidence(sourceEvidence: readonly SourceEvidence[]): string {
-  return sourceEvidence
+  return [...new Set(sourceEvidence
+    .flatMap(completeEvidenceRanges)
     .map((evidence) => {
       const citation = evidence.startLine === evidence.endLine
         ? `${evidence.path}:${evidence.startLine}`
         : `${evidence.path}:${evidence.startLine}-${evidence.endLine}`;
       return `\`${citation}\``;
-    })
+    }))]
     .join("、");
 }
 
@@ -244,9 +277,10 @@ function sourceEvidenceRepairMessage(
     missing_source_citation: "最终回答缺少 `path:line` 格式的源码引用。",
     unverified_source_citation: "最终回答包含未在本轮已读取范围内的源码引用。",
   }[reason];
-  const evidenceText = sourceEvidence.length === 0
+  const formattedEvidence = formatSourceEvidence(sourceEvidence);
+  const evidenceText = formattedEvidence === ""
     ? "暂无已验证源码范围。"
-    : `可直接复制的已验证引用：${formatSourceEvidence(sourceEvidence)}。`;
+    : `可直接复制的已验证引用：${formattedEvidence}。`;
   return [
     `你的上一条最终回答未通过本地源码证据校验：${reasonText}`,
     evidenceText,
@@ -261,7 +295,8 @@ function appendSourceEvidence(target: SourceEvidence[], sourceEvidence: readonly
       (existing) =>
         existing.path === evidence.path &&
         existing.startLine === evidence.startLine &&
-        existing.endLine === evidence.endLine,
+        existing.endLine === evidence.endLine &&
+        JSON.stringify(existing.truncatedLines ?? []) === JSON.stringify(evidence.truncatedLines ?? []),
     );
     if (!alreadyRecorded) {
       target.push(evidence);
@@ -309,10 +344,10 @@ export class AgentLoop {
   readonly #enableFailureRepair: boolean;
   readonly #systemPrompt: string;
   readonly #executionMode: ToolExecutionMode;
-  readonly #requestEditApproval?: (request: EditApprovalRequest) => Promise<boolean>;
-  readonly #requestPlanApproval?: (request: PlanApprovalRequest) => Promise<boolean>;
-  readonly #requestRepairApproval?: (request: RepairApprovalRequest) => Promise<boolean>;
-  readonly #requestCommandApproval?: (request: CommandApprovalRequest) => Promise<boolean>;
+  readonly #requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  readonly #requestPlanApproval?: (request: PlanApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  readonly #requestRepairApproval?: (request: RepairApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
+  readonly #requestCommandApproval?: (request: CommandApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
   readonly #auditLog?: AgentEventAuditLog;
   readonly #onEvent?: (event: AgentEvent) => void;
 
@@ -470,12 +505,12 @@ export class AgentLoop {
             rejectionReason = "未配置本地修复方向确认，未继续修改文件或运行验证。";
           } else {
             try {
-              approved = await this.#requestRepairApproval({
+              approved = await awaitWithAbort(this.#requestRepairApproval({
                 failedAction: failedRepairAction,
                 direction: response.content,
                 attempt: 1,
                 maximumAttempts: 1,
-              }) === true;
+              }, options.signal), options.signal) === true;
             } catch {
               rejectionReason = "本地修复方向确认不可用，未继续修改文件或运行验证。";
             }
@@ -568,13 +603,18 @@ export class AgentLoop {
             rejectionReason = "已启用计划确认，但没有可用的本地确认回调，未执行工具或修改文件。";
           } else {
             try {
-              approved = await this.#requestPlanApproval({ plan: response.content }) === true;
+              approved = await awaitWithAbort(
+                this.#requestPlanApproval({ plan: response.content }, options.signal),
+                options.signal,
+              ) === true;
               if (options.signal?.aborted) {
                 approved = false;
                 rejectionReason = cancellationReason();
               }
             } catch {
-              rejectionReason = "本地计划确认不可用，未执行工具或修改文件。";
+              rejectionReason = options.signal?.aborted
+                ? cancellationReason()
+                : "本地计划确认不可用，未执行工具或修改文件。";
             }
           }
           this.recordEvent(events, {
@@ -914,10 +954,19 @@ export class AgentLoop {
       return this.finalizeError(events, step, toolCall, validation.error);
     }
 
-    if (tool.getCommandApprovalRequest) {
+    let preparedCommandExecution: PreparedCommandExecution | undefined;
+    if (tool.prepareCommandExecution || tool.getCommandApprovalRequest) {
       let request: CommandApprovalRequest;
       try {
-        request = await tool.getCommandApprovalRequest(validation.value, this.#workspaceRoot);
+        if (tool.prepareCommandExecution) {
+          preparedCommandExecution = await tool.prepareCommandExecution(
+            validation.value,
+            this.#workspaceRoot,
+          );
+          request = preparedCommandExecution.approvalRequest;
+        } else {
+          request = await tool.getCommandApprovalRequest!(validation.value, this.#workspaceRoot);
+        }
       } catch (error) {
         if (error instanceof ToolPolicyError) {
           this.recordEvent(events, {
@@ -957,7 +1006,10 @@ export class AgentLoop {
         rejectionReason = `未配置本地命令确认，${approvalTarget}未执行。`;
       } else {
         try {
-          approved = await this.#requestCommandApproval(request) === true;
+          approved = await awaitWithAbort(
+            this.#requestCommandApproval(request, signal),
+            signal,
+          ) === true;
         } catch {
           rejectionReason = `本地命令确认不可用，${approvalTarget}未执行。`;
         }
@@ -999,7 +1051,7 @@ export class AgentLoop {
     await this.#auditLog?.flush();
 
     try {
-      const execution = await tool.execute(validation.value, {
+      const executionContext: ToolExecutionContext = {
         task,
         step,
         workspaceRoot: this.#workspaceRoot,
@@ -1020,7 +1072,10 @@ export class AgentLoop {
               let approved = false;
               if (!signal?.aborted) {
                 try {
-                  approved = await this.#requestEditApproval!(request) === true;
+                  approved = await awaitWithAbort(
+                    this.#requestEditApproval!(request, signal),
+                    signal,
+                  ) === true;
                 } catch {
                   approved = false;
                 }
@@ -1047,7 +1102,10 @@ export class AgentLoop {
             ...decision,
           });
         },
-      });
+      };
+      const execution = preparedCommandExecution
+        ? await preparedCommandExecution.execute(executionContext)
+        : await tool.execute(validation.value, executionContext);
       const output: ToolExecutionOutput = typeof execution === "string" ? { content: execution } : execution;
       this.recordEvent(events, {
         type: "tool_finalized",

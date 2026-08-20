@@ -85,7 +85,12 @@ interface RepairTuiHarness {
   readonly runnerCalls: number;
 }
 
-function createRepairTuiHarness(workspace: string): RepairTuiHarness {
+async function createRepairTuiHarness(workspace: string): Promise<RepairTuiHarness> {
+  await fs.writeFile(
+    path.join(workspace, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+    "utf8",
+  );
   const terminal = new FakeTerminal();
   const modelRequests: ModelRequest[] = [];
   let runnerCalls = 0;
@@ -582,6 +587,11 @@ test("mini TUI lists configured Profiles and switches model without sending a re
     await waitFor(() => stripAnsi(terminal.output).includes("已切换到 OpenAI-compatible / test-coder"));
     assert.equal(app.contextTurns, 0);
     assert.match(stripAnsi(terminal.output), /后续发送给模型的会话已清空/);
+    assert.match(stripAnsi(terminal.output), /远程数据提示/);
+    assert.match(stripAnsi(terminal.output), /目录\/搜索结果、源码片段、Git/);
+    assert.match(stripAnsi(terminal.output), /状态或差异/);
+    assert.match(stripAnsi(terminal.output), /编辑参数和获准进程输出/);
+    assert.match(stripAnsi(terminal.output), /MINICODE_ALLOW_INSECURE_HTTP=1/);
   } finally {
     app?.stop();
     if (originalBaseUrl === undefined) delete process.env.MINICODE_OPENAI_BASE_URL;
@@ -623,11 +633,12 @@ test("mini TUI never sends reserved approval words to the model without a pendin
 
 test("修复方向面板只接受精确 CONTINUE，错误输入保持等待且控制词不进入模型", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-repair-continue-"));
-  const harness = createRepairTuiHarness(workspace);
+  const harness = await createRepairTuiHarness(workspace);
   try {
     harness.app.start();
     const task = harness.app.submit("运行测试，并在真实失败后提出一次有界修复方向");
     await waitFor(() => harness.app.awaitingRepairApproval);
+    await waitFor(() => stripAnsi(harness.terminal.output).includes("待确认修复方向"));
 
     const pendingOutput = stripAnsi(harness.terminal.output);
     assert.equal(harness.runnerCalls, 1);
@@ -669,7 +680,7 @@ test("修复方向面板只接受精确 CONTINUE，错误输入保持等待且�
 
 test("CANCEL 会闭锁后续修复，且不会把取消词发送给模型", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-repair-cancel-"));
-  const harness = createRepairTuiHarness(workspace);
+  const harness = await createRepairTuiHarness(workspace);
   try {
     harness.app.start();
     const task = harness.app.submit("运行测试，并在失败后等待我决定是否修复");
@@ -695,7 +706,7 @@ test("CANCEL 会闭锁后续修复，且不会把取消词发送给模型", asyn
 
 test("stop 会把待确认修复按拒绝收口且不再请求模型", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-repair-stop-"));
-  const harness = createRepairTuiHarness(workspace);
+  const harness = await createRepairTuiHarness(workspace);
   try {
     harness.app.start();
     const task = harness.app.submit("运行测试，并在失败后等待修复确认");
@@ -772,7 +783,7 @@ test("运行中 Ctrl+C 会取消忽略 signal 的模型请求且不追加晚回�
 
 test("运行中 Ctrl+C 会同时关闭待确认修复", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-cancel-approval-"));
-  const harness = createRepairTuiHarness(workspace);
+  const harness = await createRepairTuiHarness(workspace);
   try {
     harness.app.start();
     const task = harness.app.submit("运行测试，并在修复确认处等待取消");
@@ -796,6 +807,11 @@ test("运行中 Ctrl+C 会同时关闭待确认修复", async () => {
 
 test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-command-run-"));
+  await fs.writeFile(
+    path.join(workspace, "package.json"),
+    JSON.stringify({ scripts: { test: "node --test" } }),
+    "utf8",
+  );
   const terminal = new FakeTerminal();
   let runnerCalls = 0;
   let modelCalls = 0;
@@ -843,6 +859,7 @@ test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", asyn
     app.start();
     const task = app.submit("运行测试验证修改");
     await waitFor(() => app?.awaitingCommandApproval === true);
+    await waitFor(() => stripAnsi(terminal.output).includes("待确认验证"));
 
     const pendingOutput = stripAnsi(terminal.output);
     assert.equal(runnerCalls, 0);
@@ -873,6 +890,11 @@ test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", asyn
 
 test("TUI 中取消验证不会启动 runner，也不会把 CANCEL 写入模型上下文", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-command-cancel-"));
+  await fs.writeFile(
+    path.join(workspace, "package.json"),
+    JSON.stringify({ scripts: { check: "tsc -p tsconfig.json" } }),
+    "utf8",
+  );
   const terminal = new FakeTerminal();
   let runnerCalls = 0;
   let modelCalls = 0;
@@ -929,6 +951,11 @@ test("TUI 中取消验证不会启动 runner，也不会把 CANCEL 写入模型�
 
 test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-run-command-"));
+  await fs.writeFile(
+    path.join(workspace, "package.json"),
+    JSON.stringify({ scripts: { check: "tsc -p tsconfig.json" } }),
+    "utf8",
+  );
   const terminal = new FakeTerminal();
   let runnerCalls = 0;
   let modelCalls = 0;

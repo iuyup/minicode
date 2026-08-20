@@ -1,3 +1,4 @@
+import { constants as fsConstants, type BigIntStats } from "node:fs";
 import fs from "node:fs/promises";
 
 import type { AgentTool, JsonValue, ToolExecutionOutput, ValidationResult } from "../agent/contracts.ts";
@@ -14,6 +15,102 @@ interface ReadFileInput {
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_READ_LINES = 80;
 const MAX_LINE_CHARS = 240;
+
+const PATH_CHANGED_MESSAGE = "目标文件在读取期间发生变化，已拒绝返回内容，请重新读取。";
+
+function readOnlyOpenFlags(): number {
+  const noFollow = process.platform === "win32" ? 0 : fsConstants.O_NOFOLLOW;
+  return fsConstants.O_RDONLY | noFollow;
+}
+
+function isSameSnapshot(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+  );
+}
+
+async function statPathIdentity(absolutePath: string): Promise<BigIntStats> {
+  try {
+    return await fs.stat(absolutePath, { bigint: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") {
+      throw new WorkspaceAccessError(PATH_CHANGED_MESSAGE);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Best-effort TOCTOU protection for a single read. Pure Node does not expose a
+ * portable openat2-style API, so a hostile parent directory can still race by
+ * changing away and back between checks. No content is returned until the
+ * opened handle and the re-resolved path have matching bigint identity and
+ * content-related stat values.
+ */
+async function readVerifiedFile(
+  policy: WorkspacePolicy,
+  inputPath: string,
+  initialAbsolutePath: string,
+  initialRelativePath: string,
+): Promise<Buffer> {
+  const initialIdentity = await statPathIdentity(initialAbsolutePath);
+
+  let handle;
+  try {
+    handle = await fs.open(initialAbsolutePath, readOnlyOpenFlags());
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") {
+      throw new WorkspaceAccessError(PATH_CHANGED_MESSAGE);
+    }
+    throw error;
+  }
+
+  try {
+    const openedIdentity = await handle.stat({ bigint: true });
+    if (!openedIdentity.isFile()) {
+      throw new WorkspaceAccessError(`read_file 只能读取普通文件：${initialRelativePath}`);
+    }
+    if (openedIdentity.size > BigInt(MAX_FILE_BYTES)) {
+      throw new WorkspaceAccessError(`文件超过 ${MAX_FILE_BYTES} 字节限制，请先使用 search_text。`);
+    }
+    if (!isSameSnapshot(initialIdentity, openedIdentity)) {
+      throw new WorkspaceAccessError(PATH_CHANGED_MESSAGE);
+    }
+
+    const content = await handle.readFile();
+    if (content.byteLength > MAX_FILE_BYTES) {
+      throw new WorkspaceAccessError(`文件超过 ${MAX_FILE_BYTES} 字节限制，请先使用 search_text。`);
+    }
+    const afterReadIdentity = await handle.stat({ bigint: true });
+    if (
+      !isSameSnapshot(openedIdentity, afterReadIdentity)
+      || BigInt(content.byteLength) !== afterReadIdentity.size
+    ) {
+      throw new WorkspaceAccessError(PATH_CHANGED_MESSAGE);
+    }
+
+    const current = await policy.resolveReadPath(inputPath);
+    const currentIdentity = await statPathIdentity(current.absolutePath);
+    if (
+      current.absolutePath !== initialAbsolutePath ||
+      current.relativePath !== initialRelativePath ||
+      !isSameSnapshot(afterReadIdentity, currentIdentity)
+    ) {
+      throw new WorkspaceAccessError(PATH_CHANGED_MESSAGE);
+    }
+
+    return content;
+  } finally {
+    await handle.close();
+  }
+}
 
 function isSourcePath(relativePath: string): boolean {
   return relativePath === "src" || relativePath.startsWith("src/");
@@ -70,15 +167,12 @@ export const readFile: AgentTool<ReadFileInput, ToolExecutionOutput> = {
     if (context.requireSourceEvidence && !isSourcePath(file.relativePath)) {
       throw new WorkspaceAccessError("源码证据模式只允许读取 src 目录内的文件。");
     }
-    const stat = await fs.stat(file.absolutePath);
-    if (!stat.isFile()) {
-      throw new WorkspaceAccessError(`read_file 只能读取普通文件：${file.relativePath}`);
-    }
-    if (stat.size > MAX_FILE_BYTES) {
-      throw new WorkspaceAccessError(`文件超过 ${MAX_FILE_BYTES} 字节限制，请先使用 search_text。`);
-    }
-
-    const content = await fs.readFile(file.absolutePath);
+    const content = await readVerifiedFile(
+      policy,
+      input.path,
+      file.absolutePath,
+      file.relativePath,
+    );
     if (content.includes(0)) {
       throw new WorkspaceAccessError("拒绝读取可能是二进制的文件。");
     }
@@ -100,9 +194,11 @@ export const readFile: AgentTool<ReadFileInput, ToolExecutionOutput> = {
 
     const requestedEndLine = Math.min(input.endLine ?? startLine + MAX_READ_LINES - 1, lines.length);
     const actualEndLine = Math.min(requestedEndLine, startLine + MAX_READ_LINES - 1);
+    const truncatedLines: number[] = [];
     const renderedLines = lines.slice(startLine - 1, actualEndLine).map((line, index) => {
       const number = startLine + index;
       const truncated = line.length > MAX_LINE_CHARS;
+      if (truncated) truncatedLines.push(number);
       return `${file.relativePath}:${number} | ${line.slice(0, MAX_LINE_CHARS)}${truncated ? " [行内容已截断]" : ""}`;
     });
 
@@ -115,7 +211,12 @@ export const readFile: AgentTool<ReadFileInput, ToolExecutionOutput> = {
           ? [`[已截断：单次最多读取 ${MAX_READ_LINES} 行，请从第 ${actualEndLine + 1} 行继续读取]`]
           : []),
       ].join("\n"),
-      sourceEvidence: [{ path: file.relativePath, startLine, endLine: actualEndLine }],
+      sourceEvidence: [{
+        path: file.relativePath,
+        startLine,
+        endLine: actualEndLine,
+        ...(truncatedLines.length > 0 ? { truncatedLines } : {}),
+      }],
     };
   },
 };
