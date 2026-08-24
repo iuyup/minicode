@@ -5,12 +5,14 @@ import type {
   CommandApprovalRequest,
   ConversationMessage,
   EditApprovalRequest,
+  ForcedFunctionToolChoice,
   PlanApprovalRequest,
   PreparedCommandExecution,
   RepairApprovalRequest,
   JsonValue,
   ModelResponse,
   ToolCall,
+  ToolDescription,
   ToolExecutionContext,
   ToolExecutionMode,
   ToolExecutionMetadata,
@@ -19,6 +21,10 @@ import type {
   SourceEvidence,
 } from "./contracts.ts";
 import path from "node:path";
+import {
+  EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS,
+  EDIT_HARD_MAX_MODEL_REQUESTS,
+} from "./budget-limits.ts";
 import { InMemoryEventLog, type AgentEvent, type AgentEventAuditLog } from "./events.ts";
 import { ToolRegistry } from "./tool-registry.ts";
 import { WorkingLedger } from "./working-ledger.ts";
@@ -41,11 +47,17 @@ export interface AgentLoopOptions {
   maxSteps?: number;
   maxToolCallsPerStep?: number;
   maxToolCalls?: number;
+  /** 包含 planning/final-only 在内的绝对模型请求硬帽。 */
+  hardMaxModelRequests?: number;
+  /** 动态修复与验证扩容也不可超过的绝对工具受理硬帽。 */
+  hardMaxToolCalls?: number;
   /** 工具总预算耗尽后的下一轮只允许最终回答，不再暴露工具。 */
   finalOnlyAfterToolBudget?: boolean;
   requireSourceEvidence?: boolean;
   /** 编辑模式下，补丁目标必须已由本轮成功的 read_file 读取。 */
   requireReadBeforeEdit?: boolean;
+  /** apply 模式下，成功补丁必须由后续成功的固定 test 验证后才能完成。 */
+  requirePostPatchTest?: boolean;
   /** 在工具执行前要求模型先给出计划，并等待本地人工确认。 */
   requirePlanApproval?: boolean;
   /** 仅在 planning 模型请求中附加，不写入后续消息历史。 */
@@ -78,6 +90,7 @@ const MAX_FAILURE_REPAIR_TOOL_CALLS = 3;
 const MAX_POST_REPAIR_GIT_TOOL_CALLS = 2;
 
 type FailureRepairState = "idle" | "planning" | "executing" | "post_repair" | "completed" | "final_only";
+type ProjectCheckAction = "test" | "check";
 
 const FAILURE_REPAIR_DIRECTION_PROMPT = [
   "固定验证已真实执行并失败。下一轮是无工具的修复方向阶段。",
@@ -316,6 +329,14 @@ function patchTargetPath(toolCall: ToolCall): string | undefined {
   return typeof value === "string" ? normalizeWorkspacePath(value) : undefined;
 }
 
+function projectCheckAction(toolCall: ToolCall): string | undefined {
+  if (!toolCall.input || typeof toolCall.input !== "object" || Array.isArray(toolCall.input)) {
+    return undefined;
+  }
+  const value = (toolCall.input as Record<string, JsonValue>).action;
+  return typeof value === "string" ? value : undefined;
+}
+
 function isExecutedProjectCheckFailure(result: ToolResultMessage): boolean {
   if (result.name !== "run_project_check" || result.status !== "error") return false;
   return result.metadata?.timedOut === true ||
@@ -329,6 +350,17 @@ function isExecutedProjectCheckSuccess(result: ToolResultMessage): boolean {
     result.metadata.exitCode === 0;
 }
 
+function isExecutedProjectTestSuccess(result: ToolResultMessage): boolean {
+  return isExecutedProjectCheckSuccess(result) && result.metadata?.action === "test";
+}
+
+function isExecutedProjectActionSuccess(
+  result: ToolResultMessage,
+  action: ProjectCheckAction,
+): boolean {
+  return isExecutedProjectCheckSuccess(result) && result.metadata?.action === action;
+}
+
 export class AgentLoop {
   private readonly model: ChatModel;
   private readonly tools: ToolRegistry;
@@ -336,9 +368,12 @@ export class AgentLoop {
   readonly #maxSteps: number;
   readonly #maxToolCallsPerStep: number;
   readonly #maxToolCalls: number;
+  readonly #hardMaxModelRequests: number;
+  readonly #hardMaxToolCalls: number;
   readonly #finalOnlyAfterToolBudget: boolean;
   readonly #requireSourceEvidence: boolean;
   readonly #requireReadBeforeEdit: boolean;
+  readonly #requirePostPatchTest: boolean;
   readonly #requirePlanApproval: boolean;
   readonly #planningPrompt?: string;
   readonly #enableFailureRepair: boolean;
@@ -361,10 +396,26 @@ export class AgentLoop {
     this.#workspaceRoot = path.resolve(options.workspaceRoot);
     this.#maxSteps = normalizePositiveLimit(options.maxSteps ?? 6, "maxSteps");
     this.#maxToolCallsPerStep = normalizePositiveLimit(options.maxToolCallsPerStep, "maxToolCallsPerStep");
-    this.#maxToolCalls = normalizePositiveLimit(options.maxToolCalls, "maxToolCalls");
+    const configuredMaxToolCalls = normalizePositiveLimit(options.maxToolCalls, "maxToolCalls");
+    this.#hardMaxModelRequests = normalizePositiveLimit(
+      options.hardMaxModelRequests ?? (options.requirePostPatchTest ? EDIT_HARD_MAX_MODEL_REQUESTS : undefined),
+      "hardMaxModelRequests",
+    );
+    this.#hardMaxToolCalls = normalizePositiveLimit(
+      options.hardMaxToolCalls ?? (options.requirePostPatchTest ? EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS : undefined),
+      "hardMaxToolCalls",
+    );
+    this.#maxToolCalls = Math.min(configuredMaxToolCalls, this.#hardMaxToolCalls);
+    if (this.#hardMaxModelRequests < this.#maxSteps) {
+      throw new Error("hardMaxModelRequests 不得小于 maxSteps。");
+    }
+    if (options.maxToolCalls !== undefined && this.#hardMaxToolCalls < configuredMaxToolCalls) {
+      throw new Error("hardMaxToolCalls 不得小于 maxToolCalls。");
+    }
     this.#finalOnlyAfterToolBudget = options.finalOnlyAfterToolBudget ?? false;
     this.#requireSourceEvidence = options.requireSourceEvidence ?? false;
     this.#requireReadBeforeEdit = options.requireReadBeforeEdit ?? false;
+    this.#requirePostPatchTest = options.requirePostPatchTest ?? false;
     this.#requirePlanApproval = options.requirePlanApproval ?? false;
     this.#planningPrompt = options.planningPrompt;
     this.#enableFailureRepair = options.enableFailureRepair ?? false;
@@ -400,9 +451,16 @@ export class AgentLoop {
     let repairPatchUsed = false;
     let repairPatchSucceeded = false;
     let postRepairGitToolCalls = 0;
-    let failedRepairAction = "test";
+    let failedRepairAction: ProjectCheckAction = "test";
+    let repairOriginalCheckRequired = false;
+    let postPatchTestRequired = false;
+    let sameTurnRecoveryStepGranted = false;
     let maximumStep = this.#maxSteps;
     let maximumToolCalls = this.#maxToolCalls;
+    const extendModelRequestLimit = (value: number, increment: number): number =>
+      Math.min(this.#hardMaxModelRequests, addToLimit(value, increment));
+    const extendToolCallLimit = (value: number, increment: number): number =>
+      Math.min(this.#hardMaxToolCalls, addToLimit(value, increment));
     const sourceEvidence: SourceEvidence[] = [];
     const readPaths = new Set<string>();
 
@@ -423,7 +481,16 @@ export class AgentLoop {
         const isRepairFinalTurn = repairState === "final_only";
         const isRepairCompletedTurn = repairState === "completed";
         const isToolBudgetFinalTurn = this.#finalOnlyAfterToolBudget && acceptedToolCalls >= maximumToolCalls;
-        const baseAvailableTools = isPlanningTurn || isRepairPlanningTurn || isRepairFinalTurn || isRepairCompletedTurn ||
+        const mustVerifyPatchNow = this.#requirePostPatchTest && postPatchTestRequired && (
+          repairState === "idle" || (repairState === "executing" && repairPatchSucceeded)
+        );
+        const requiredProjectCheckAction: ProjectCheckAction | undefined = mustVerifyPatchNow
+          ? "test"
+          : repairState === "executing" && repairOriginalCheckRequired
+            ? failedRepairAction
+            : undefined;
+        const baseAvailableTools: ToolDescription[] = isPlanningTurn || isRepairPlanningTurn ||
+          isRepairFinalTurn || isRepairCompletedTurn ||
           isSourceEvidenceFinalTurn || isToolBudgetFinalTurn
           ? []
           : this.getAvailableToolDescriptions(
@@ -431,7 +498,7 @@ export class AgentLoop {
               sourceSearchCallsBeforeEvidence,
               supplementalSourceSearchUsed,
             );
-        const availableTools = repairState === "executing"
+        const stateAvailableTools: ToolDescription[] = repairState === "executing"
           ? baseAvailableTools.filter((tool) =>
               tool.name === "read_file" ||
               (tool.name === "apply_patch" && !repairPatchUsed) ||
@@ -440,11 +507,16 @@ export class AgentLoop {
           : repairState === "post_repair"
             ? baseAvailableTools.filter((tool) => tool.name === "inspect_git")
             : baseAvailableTools;
-        const toolChoice = this.#requireSourceEvidence && availableTools.length === 1
+        const availableTools: ToolDescription[] = requiredProjectCheckAction
+          ? stateAvailableTools.filter((tool) => tool.name === "run_project_check")
+          : stateAvailableTools;
+        const toolChoice: ForcedFunctionToolChoice | undefined =
+          (this.#requireSourceEvidence || requiredProjectCheckAction !== undefined) &&
+            availableTools.length === 1
           ? { type: "function" as const, name: availableTools[0].name }
           : undefined;
-        const allowedToolNames = this.#requireSourceEvidence ||
-            repairState === "executing" || repairState === "post_repair"
+        const allowedToolNames: ReadonlySet<string> | undefined = this.#requireSourceEvidence ||
+            requiredProjectCheckAction !== undefined || repairState === "executing" || repairState === "post_repair"
           ? new Set(availableTools.map((tool) => tool.name))
           : undefined;
         this.recordEvent(events, {
@@ -637,12 +709,25 @@ export class AgentLoop {
 
           messages.push({ role: "user", content: "计划已由用户确认。现在开始执行；仅在必要时调用已注册工具。" });
           planApprovalPending = false;
-          maximumStep = addToLimit(maximumStep, 1);
+          maximumStep = extendModelRequestLimit(maximumStep, 1);
           continue;
         }
 
         if (repairState === "executing" && response.kind === "final") {
           const reason = "修复尚未完成成功复验，任务以未完成状态停止。";
+          messages.push({ role: "assistant", content: response.content });
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          return {
+            answer: reason,
+            messages,
+            events: events.events,
+            workingState: ledger.render(),
+            sourceEvidence,
+          };
+        }
+
+        if (response.kind === "final" && postPatchTestRequired) {
+          const reason = "补丁尚未通过后续 run_project_check(test) 验证，任务以未完成状态停止。";
           messages.push({ role: "assistant", content: response.content });
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           return {
@@ -685,7 +770,7 @@ export class AgentLoop {
             sourceEvidenceRepairPending = true;
             if (step === maximumStep) {
               extraFinalOnlyTurnUsed = true;
-              maximumStep = addToLimit(maximumStep, 1);
+              maximumStep = extendModelRequestLimit(maximumStep, 1);
             }
             messages.push({
               role: "user",
@@ -714,7 +799,7 @@ export class AgentLoop {
         const deferredRuntimeMessages: string[] = [];
         for (const [toolCallIndex, toolCall] of response.toolCalls.entries()) {
           const rejectedForCancellation = options.signal?.aborted === true;
-          const rejectionReason = remainingToolCallBlockReason ?? (
+          const rejectionReason: string | undefined = remainingToolCallBlockReason ?? (
             rejectedForCancellation
               ? cancellationReason()
               : this.getToolCallRejectionReason(
@@ -724,9 +809,10 @@ export class AgentLoop {
                   maximumToolCalls,
                   allowedToolNames,
                   readPaths,
+                  requiredProjectCheckAction,
                 )
           );
-          const result = rejectionReason
+          const result: ToolResultMessage = rejectionReason
             ? this.rejectToolCall(
                 toolCall,
                 step,
@@ -746,6 +832,39 @@ export class AgentLoop {
             } else if (repairState === "post_repair") {
               postRepairGitToolCalls += 1;
             }
+          }
+          if (
+            rejectionReason?.includes("maxToolCallsPerStep=") &&
+            step === maximumStep &&
+            !sameTurnRecoveryStepGranted &&
+            acceptedToolCalls < maximumToolCalls
+          ) {
+            sameTurnRecoveryStepGranted = true;
+            maximumStep = extendModelRequestLimit(maximumStep, 1);
+          }
+          if (
+            !rejectionReason &&
+            this.#requirePostPatchTest &&
+            result.name === "apply_patch" &&
+            result.status === "success"
+          ) {
+            postPatchTestRequired = true;
+            remainingToolCallBlockReason ??=
+              "补丁已成功应用；必须在下一模型轮执行固定 test，本轮其余工具调用不会执行。";
+            const postPatchExtraToolCalls = repairState === "executing"
+              ? 1
+              : MAX_POST_REPAIR_GIT_TOOL_CALLS + 1;
+            const postPatchExtraModelRequests = repairState === "executing"
+              ? 1
+              : MAX_POST_REPAIR_GIT_TOOL_CALLS + 2;
+            maximumToolCalls = Math.min(
+              this.#hardMaxToolCalls,
+              Math.max(maximumToolCalls, addToLimit(acceptedToolCalls, postPatchExtraToolCalls)),
+            );
+            maximumStep = Math.min(
+              this.#hardMaxModelRequests,
+              Math.max(maximumStep, addToLimit(step, postPatchExtraModelRequests)),
+            );
           }
           const hadSourceEvidence = sourceEvidence.length > 0;
           messages.push(result);
@@ -773,7 +892,7 @@ export class AgentLoop {
               sourceEvidenceCompletionPending = true;
               if (step === maximumStep && !extraFinalOnlyTurnUsed) {
                 extraFinalOnlyTurnUsed = true;
-                maximumStep = addToLimit(maximumStep, 1);
+                maximumStep = extendModelRequestLimit(maximumStep, 1);
               }
             }
           }
@@ -784,47 +903,87 @@ export class AgentLoop {
           });
           if (this.#enableFailureRepair && !rejectionReason) {
             if (repairState === "idle" && isExecutedProjectCheckFailure(result)) {
-              failedRepairAction = result.metadata?.action ?? "test";
+              failedRepairAction = result.metadata?.action === "check" ? "check" : "test";
+              repairOriginalCheckRequired = false;
               repairState = "planning";
-              maximumToolCalls = addToLimit(
+              maximumToolCalls = extendToolCallLimit(
                 maximumToolCalls,
                 MAX_FAILURE_REPAIR_TOOL_CALLS + MAX_POST_REPAIR_GIT_TOOL_CALLS,
               );
-              maximumStep = Math.max(
-                addToLimit(maximumStep, 1),
-                addToLimit(
-                  step,
-                  MAX_FAILURE_REPAIR_TOOL_CALLS + MAX_POST_REPAIR_GIT_TOOL_CALLS + 2,
+              maximumStep = Math.min(
+                this.#hardMaxModelRequests,
+                Math.max(
+                  addToLimit(maximumStep, 1),
+                  addToLimit(
+                    step,
+                    MAX_FAILURE_REPAIR_TOOL_CALLS + MAX_POST_REPAIR_GIT_TOOL_CALLS + 2,
+                  ),
                 ),
               );
               deferredRuntimeMessages.push(FAILURE_REPAIR_DIRECTION_PROMPT);
               remainingToolCallBlockReason = "验证失败后必须先确认修复方向；本轮其余工具调用不会执行。";
             } else if (repairState === "executing" && result.name === "run_project_check") {
-              if (isExecutedProjectCheckSuccess(result)) {
-                if (repairPatchSucceeded) {
+              if (!repairPatchSucceeded && isExecutedProjectCheckSuccess(result)) {
+                repairState = "final_only";
+                deferredRuntimeMessages.push(FAILURE_REPAIR_MISSING_PATCH_PROMPT);
+                remainingToolCallBlockReason = "没有成功应用修复补丁，不能把重跑通过视为修复完成。";
+              } else if (
+                repairPatchSucceeded &&
+                postPatchTestRequired &&
+                isExecutedProjectTestSuccess(result) &&
+                failedRepairAction === "check"
+              ) {
+                repairOriginalCheckRequired = true;
+                remainingToolCallBlockReason =
+                  "修复补丁的固定 test 已通过；还必须在下一模型轮重跑原失败的 check。";
+              } else {
+                const successfulRepairVerification = repairPatchSucceeded && (
+                  postPatchTestRequired
+                    ? isExecutedProjectTestSuccess(result)
+                    : repairOriginalCheckRequired
+                      ? isExecutedProjectActionSuccess(result, failedRepairAction)
+                      : isExecutedProjectCheckSuccess(result)
+                );
+                if (successfulRepairVerification) {
+                  repairOriginalCheckRequired = false;
                   repairState = "post_repair";
+                  maximumToolCalls = Math.min(
+                    this.#hardMaxToolCalls,
+                    Math.max(maximumToolCalls, addToLimit(acceptedToolCalls, MAX_POST_REPAIR_GIT_TOOL_CALLS)),
+                  );
+                  maximumStep = Math.min(
+                    this.#hardMaxModelRequests,
+                    Math.max(maximumStep, addToLimit(step, MAX_POST_REPAIR_GIT_TOOL_CALLS + 1)),
+                  );
                   remainingToolCallBlockReason = "修复补丁已成功复验；本轮其余工具调用不会执行。";
                 } else {
                   repairState = "final_only";
-                  deferredRuntimeMessages.push(FAILURE_REPAIR_MISSING_PATCH_PROMPT);
-                  remainingToolCallBlockReason = "没有成功应用修复补丁，不能把重跑通过视为修复完成。";
+                  deferredRuntimeMessages.push(
+                    isExecutedProjectCheckFailure(result)
+                      ? FAILURE_REPAIR_EXHAUSTED_PROMPT
+                      : FAILURE_REPAIR_INCOMPLETE_PROMPT,
+                  );
+                  remainingToolCallBlockReason = "一次修复的复验未成功；本轮其余工具调用不会执行。";
                 }
-              } else {
-                repairState = "final_only";
-                deferredRuntimeMessages.push(
-                  isExecutedProjectCheckFailure(result)
-                    ? FAILURE_REPAIR_EXHAUSTED_PROMPT
-                    : FAILURE_REPAIR_INCOMPLETE_PROMPT,
-                );
-                remainingToolCallBlockReason = "一次修复的复验未成功；本轮其余工具调用不会执行。";
               }
-              if (step === maximumStep) maximumStep = addToLimit(maximumStep, 1);
-            } else if (repairState === "executing" && repairToolCalls >= MAX_FAILURE_REPAIR_TOOL_CALLS) {
+              if (step === maximumStep) maximumStep = extendModelRequestLimit(maximumStep, 1);
+            } else if (
+              repairState === "executing" &&
+              repairToolCalls >= MAX_FAILURE_REPAIR_TOOL_CALLS &&
+              !(
+                this.#requirePostPatchTest &&
+                repairPatchSucceeded &&
+                (postPatchTestRequired || repairOriginalCheckRequired)
+              )
+            ) {
               repairState = "final_only";
-              if (step === maximumStep) maximumStep = addToLimit(maximumStep, 1);
+              if (step === maximumStep) maximumStep = extendModelRequestLimit(maximumStep, 1);
               deferredRuntimeMessages.push(FAILURE_REPAIR_INCOMPLETE_PROMPT);
               remainingToolCallBlockReason = "一次修复的工具上限已用尽；本轮其余工具调用不会执行。";
             }
+          }
+          if (!rejectionReason && postPatchTestRequired && isExecutedProjectTestSuccess(result)) {
+            postPatchTestRequired = false;
           }
           if (repairState === "post_repair" && postRepairGitToolCalls >= MAX_POST_REPAIR_GIT_TOOL_CALLS) {
             repairState = "completed";
@@ -882,14 +1041,25 @@ export class AgentLoop {
     maximumToolCalls: number,
     allowedToolNames: ReadonlySet<string> | undefined,
     readPaths: ReadonlySet<string>,
+    requiredProjectCheckAction: ProjectCheckAction | undefined,
   ): string | undefined {
+    if (requiredProjectCheckAction) {
+      if (toolCall.name !== "run_project_check") {
+        return `当前阶段必须先执行固定 run_project_check(${requiredProjectCheckAction})，当前工具不会执行。`;
+      }
+      if (projectCheckAction(toolCall) !== requiredProjectCheckAction) {
+        return requiredProjectCheckAction === "test"
+          ? "补丁成功后的固定验证只接受 run_project_check 的 test 动作；当前调用不会执行。"
+          : "原失败动作的复验只接受 run_project_check 的 check 动作；当前调用不会执行。";
+      }
+    }
     if (allowedToolNames && !allowedToolNames.has(toolCall.name)) {
       return this.#requireSourceEvidence
         ? "源码取证状态不允许该工具；请按当前阶段继续定位、读取或给出最终回答。"
         : "当前有界失败修复阶段不允许该工具；请完成一次最小修复、复验、Git 收尾或给出最终回答。";
     }
     if (toolCallIndex >= this.#maxToolCallsPerStep) {
-      return `本轮工具调用超过上限 maxToolCallsPerStep=${this.#maxToolCallsPerStep}；请基于本轮其余工具结果给出最终回答。`;
+      return `本轮工具调用超过上限 maxToolCallsPerStep=${this.#maxToolCallsPerStep}；该调用未执行，请在下一模型轮只重新请求一个仍然必要的工具，不要据此声称任务完成。`;
     }
     if (acceptedToolCalls >= maximumToolCalls) {
       return `本次任务已达到工具调用上限 maxToolCalls=${maximumToolCalls}；请基于已有结果给出最终回答。`;

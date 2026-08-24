@@ -8,7 +8,7 @@ import {
   type EvaluationTrialResult,
 } from "../src/evals/eval-runner.ts";
 import { createEvaluationSuitePlan } from "../src/evals/eval-suite-runner.ts";
-import { getEvaluationTask } from "../src/evals/task-definitions.ts";
+import { EVALUATION_SUITE_VERSION, getEvaluationTask } from "../src/evals/task-definitions.ts";
 
 function trial(overrides: Partial<EvaluationTrialResult> & Pick<EvaluationTrialResult, "taskId" | "category" | "flow" | "arm" | "trial">): EvaluationTrialResult {
   const task = getEvaluationTask(overrides.taskId);
@@ -18,7 +18,7 @@ function trial(overrides: Partial<EvaluationTrialResult> & Pick<EvaluationTrialR
   const profileId = overrides.profileId ?? "deepseek";
   return {
     schemaVersion: 1,
-    suite: { id: "minicode-js-v1", version: 2 },
+    suite: { id: "minicode-js-v1", version: EVALUATION_SUITE_VERSION },
     fixtureSha256: "f".repeat(64),
     taskSpecSha256: evaluationTaskSpecSha256(task),
     status: "passed",

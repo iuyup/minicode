@@ -79,6 +79,49 @@ class OutOfAllowlistModel implements ChatModel {
   }
 }
 
+class PatchWithoutTestModel implements ChatModel {
+  readonly #brokenSource: string;
+  readonly #expectedSource: string;
+  #callIndex = 0;
+
+  constructor(brokenSource: string, expectedSource: string) {
+    this.#brokenSource = brokenSource;
+    this.#expectedSource = expectedSource;
+  }
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    if (request.phase === "planning") {
+      return { kind: "final", content: "读取目标并应用最小补丁。" };
+    }
+    this.#callIndex += 1;
+    if (this.#callIndex === 1) {
+      return {
+        kind: "tool_calls",
+        content: "",
+        toolCalls: [{ id: "unverified-read", name: "read_file", input: { path: "src/implementation.js" } }],
+      };
+    }
+    if (this.#callIndex === 2) {
+      return {
+        kind: "tool_calls",
+        content: "",
+        toolCalls: [{
+          id: "unverified-patch",
+          name: "apply_patch",
+          input: {
+            path: "src/implementation.js",
+            oldText: this.#brokenSource,
+            newText: this.#expectedSource,
+          },
+        }],
+      };
+    }
+    assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+    assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+    return { kind: "final", content: "补丁已经完成。" };
+  }
+}
+
 test("all evaluation arms use the generated fixture and complete the same three-tool repair", async (context) => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-eval-arms-"));
   try {
@@ -104,6 +147,15 @@ test("all evaluation arms use the generated fixture and complete the same three-
           fixture.task.expectedSource,
         );
         assert.equal(result.events.at(-1)?.type, "agent_completed");
+        const patchIndex = result.events.findIndex(
+          (event) => event.type === "tool_finalized" && event.toolCallId === "eval-patch" && event.status === "success",
+        );
+        const testIndex = result.events.findIndex(
+          (event) => event.type === "tool_finalized" && event.toolCallId === "eval-test" && event.status === "success",
+        );
+        const completedIndex = result.events.findIndex((event) => event.type === "agent_completed");
+        assert.ok(patchIndex >= 0 && patchIndex < testIndex);
+        assert.ok(testIndex < completedIndex);
         assert.equal(
           result.events.some((event) =>
             event.type === "command_approval_decision" && event.decision === "approved"),
@@ -111,6 +163,32 @@ test("all evaluation arms use the generated fixture and complete the same three-
         );
       });
     }
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("the product evaluation arm stops when a successful patch skips its required test", async () => {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-eval-post-patch-test-"));
+  try {
+    const fixture = await prepareEvaluationFixture({
+      taskId: "greeting-punctuation",
+      runRoot: path.join(tempRoot, "run"),
+    });
+    if (fixture.task.category !== "functional") throw new Error("测试任务必须是功能题。");
+    const brokenSource = fixture.task.workspaceFiles[fixture.task.targetPath];
+    if (brokenSource === undefined) throw new Error("缺少初始源码。");
+    const result = await (await createEvaluationArmAgent({
+      arm: "minicode-product",
+      fixture,
+      auditPath: path.join(fixture.runRoot, "audit.jsonl"),
+      profileId: "deepseek",
+      model: new PatchWithoutTestModel(brokenSource, fixture.task.expectedSource),
+    })).run(fixture.task.prompt);
+
+    assert.match(result.answer, /补丁尚未通过后续 run_project_check\(test\) 验证/);
+    assert.equal(result.events.some((event) => event.type === "agent_completed"), false);
+    assert.equal(result.events.at(-1)?.type, "agent_stopped");
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }

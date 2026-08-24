@@ -47,17 +47,23 @@ function createProjectCheckTool(outcomes: readonly ProjectCheckOutcome[]) {
     description: "Run a scripted fixed project check.",
     parameters: { type: "object", properties: {}, additionalProperties: false },
     validate: validateObject,
-    getCommandApprovalRequest() {
+    getCommandApprovalRequest(input) {
+      const action = input && typeof input === "object" && !Array.isArray(input) && input.action === "check"
+        ? "check"
+        : "test";
       return {
         kind: "verification",
-        action: "test",
-        command: "npm test",
+        action,
+        command: action === "check" ? "npm run check" : "npm test",
         workingDirectory: process.cwd(),
         riskLevel: "medium",
         risk: "Scripted test command.",
       };
     },
-    async execute() {
+    async execute(input) {
+      const action = input && typeof input === "object" && !Array.isArray(input) && input.action === "check"
+        ? "check"
+        : "test";
       const outcome = outcomes[executionCount];
       executionCount += 1;
       if (!outcome) {
@@ -65,24 +71,24 @@ function createProjectCheckTool(outcomes: readonly ProjectCheckOutcome[]) {
       }
       if (outcome === "nonzero") {
         throw new ToolExecutionError("scripted check failed", {
-          action: "test",
+          action,
           exitCode: 1,
           timedOut: false,
         });
       }
       if (outcome === "timeout") {
         throw new ToolExecutionError("scripted check timed out", {
-          action: "test",
+          action,
           exitCode: null,
           timedOut: true,
         });
       }
       if (outcome === "start_failure") {
-        throw new ToolExecutionError("scripted check could not start", { action: "test" });
+        throw new ToolExecutionError("scripted check could not start", { action });
       }
       return {
         content: "scripted check passed",
-        metadata: { action: "test", exitCode: 0, timedOut: false },
+        metadata: { action, exitCode: 0, timedOut: false },
       };
     },
   };
@@ -114,6 +120,14 @@ function createCountingTool(
     get executionCount() {
       return executionCount;
     },
+  };
+}
+
+function toolCallResponse(id: string, name: string, input: JsonValue): ModelResponse {
+  return {
+    kind: "tool_calls",
+    content: "",
+    toolCalls: [{ id, name, input }],
   };
 }
 
@@ -408,9 +422,293 @@ test("a per-step tool-call budget gives overflow calls an error terminal event",
       toolCallId: "budget-3",
       toolName: "inspect",
       status: "error",
-      detail: "本轮工具调用超过上限 maxToolCallsPerStep=2；请基于本轮其余工具结果给出最终回答。",
+      detail: "本轮工具调用超过上限 maxToolCallsPerStep=2；该调用未执行，请在下一模型轮只重新请求一个仍然必要的工具，不要据此声称任务完成。",
     },
   );
+});
+
+test("a successful patch cannot complete before a later successful project test", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Apply the patch.",
+          toolCalls: [{ id: "unverified-patch", name: "apply_patch", input: {} }],
+        };
+      }
+
+      assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+      assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+      return { kind: "final", content: "Claim completion without running the required test." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+    workspaceRoot: process.cwd(),
+    requirePostPatchTest: true,
+  }).run("Patch and verify the project.");
+
+  assert.equal(modelCallCount, 2);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 0);
+  assert.match(result.answer, /补丁尚未通过后续 run_project_check\(test\) 验证/);
+  assert.equal(result.events.some((event) => event.type === "agent_completed"), false);
+  assert.equal(result.events.at(-1)?.type, "agent_stopped");
+  assert.ok(result.messages.some(
+    (message) => message.role === "assistant" && /Claim completion/.test(message.content),
+  ));
+});
+
+test("a late successful patch reserves one test call and a final turn", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Use the final original tool slot for the patch.",
+          toolCalls: [{ id: "late-patch", name: "apply_patch", input: {} }],
+        };
+      }
+      if (modelCallCount === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return {
+          kind: "tool_calls",
+          content: "Run the required fixed test.",
+          toolCalls: [{ id: "late-test", name: "run_project_check", input: { action: "test" } }],
+        };
+      }
+
+      assert.equal(modelCallCount, 3);
+      assert.equal(request.toolChoice, undefined);
+      return { kind: "final", content: "Patch and later fixed test both succeeded." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 1,
+    maxToolCalls: 1,
+    finalOnlyAfterToolBudget: true,
+    requirePostPatchTest: true,
+    requestCommandApproval: async () => true,
+  }).run("Patch on the last slot, then prove it works.");
+
+  assert.equal(result.answer, "Patch and later fixed test both succeeded.");
+  assert.equal(modelCallCount, 3);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 1);
+  const patchFinalizedIndex = result.events.findIndex(
+    (event) => event.type === "tool_finalized" && event.toolCallId === "late-patch" && event.status === "success",
+  );
+  const testFinalizedIndex = result.events.findIndex(
+    (event) => event.type === "tool_finalized" && event.toolCallId === "late-test" && event.status === "success",
+  );
+  const completedIndex = result.events.findIndex((event) => event.type === "agent_completed");
+  assert.ok(patchFinalizedIndex >= 0 && patchFinalizedIndex < testFinalizedIndex);
+  assert.ok(testFinalizedIndex < completedIndex);
+});
+
+test("a post-patch check action cannot discharge the required test", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Apply the patch.",
+          toolCalls: [{ id: "test-debt-patch", name: "apply_patch", input: {} }],
+        };
+      }
+      if (modelCallCount === 2) {
+        return {
+          kind: "tool_calls",
+          content: "Try check instead of the required test.",
+          toolCalls: [{ id: "wrong-check", name: "run_project_check", input: { action: "check" } }],
+        };
+      }
+      return { kind: "final", content: "Pretend that check discharged the test debt." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 1,
+    requirePostPatchTest: true,
+  }).run("Require the fixed test action after patching.");
+
+  assert.equal(projectCheck.executionCount, 0);
+  assert.ok(result.events.some(
+    (event) => event.type === "tool_finalized" &&
+      event.toolCallId === "wrong-check" &&
+      event.status === "error" &&
+      /只接受 run_project_check 的 test 动作/.test(event.detail),
+  ));
+  assert.equal(result.events.some((event) => event.type === "agent_completed"), false);
+  assert.equal(result.events.at(-1)?.type, "agent_stopped");
+});
+
+test("a late patch leaves room for test, two Git reads, and the final answer", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  const inspectGit = createCountingTool("inspect_git");
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCallCount += 1;
+      const responses: ModelResponse[] = [
+        toolCallResponse("late-git-patch", "apply_patch", {}),
+        toolCallResponse("late-git-test", "run_project_check", { action: "test" }),
+        toolCallResponse("late-git-status", "inspect_git", { action: "status" }),
+        toolCallResponse("late-git-diff", "inspect_git", { action: "diff" }),
+        { kind: "final", content: "Patch, test, status, and diff all completed within the cap." },
+      ];
+      const response = responses[modelCallCount - 1];
+      if (!response) throw new Error("Unexpected late Git closeout model call.");
+      return response;
+    },
+  };
+
+  const result = await new AgentLoop(
+    model,
+    new ToolRegistry([patch.tool, projectCheck.tool, inspectGit.tool]),
+    {
+      workspaceRoot: process.cwd(),
+      maxSteps: 1,
+      maxToolCalls: 1,
+      hardMaxModelRequests: 5,
+      hardMaxToolCalls: 4,
+      finalOnlyAfterToolBudget: true,
+      requirePostPatchTest: true,
+      requestCommandApproval: async () => true,
+    },
+  ).run("Keep the bounded read-only Git closeout after a late patch.");
+
+  assert.equal(modelCallCount, 5);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 1);
+  assert.equal(inspectGit.executionCount, 2);
+  assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("a rejected same-turn test is retried only after the patch result is observed", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Request a patch and test too early in one response.",
+          toolCalls: [
+            { id: "same-turn-patch", name: "apply_patch", input: {} },
+            { id: "same-turn-test", name: "run_project_check", input: { action: "test" } },
+          ],
+        };
+      }
+      if (modelCallCount === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        return {
+          kind: "tool_calls",
+          content: "Retry the test after observing the patch result.",
+          toolCalls: [{ id: "next-turn-test", name: "run_project_check", input: { action: "test" } }],
+        };
+      }
+      return { kind: "final", content: "Verified after the required later test." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 1,
+    maxToolCalls: 1,
+    maxToolCallsPerStep: 1,
+    finalOnlyAfterToolBudget: true,
+    requirePostPatchTest: true,
+    requestCommandApproval: async () => true,
+  }).run("Do not treat a same-response test request as post-patch evidence.");
+
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 1);
+  assert.deepEqual(
+    result.events
+      .filter((event) => "toolCallId" in event && event.toolCallId === "same-turn-test")
+      .map((event) => event.type),
+    ["tool_call", "tool_finalized"],
+  );
+  assert.equal(result.events.some(
+    (event) => event.type === "tool_execution_started" && event.toolCallId === "same-turn-test",
+  ), false);
+  assert.ok(result.events.some(
+    (event) => event.type === "tool_finalized" &&
+      event.toolCallId === "same-turn-test" &&
+      event.status === "error" &&
+      /下一模型轮执行固定 test/.test(event.detail),
+  ));
+  assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("a failed required post-patch test enters bounded repair planning", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["nonzero"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Apply the patch.",
+          toolCalls: [{ id: "repair-entry-patch", name: "apply_patch", input: {} }],
+        };
+      }
+      if (modelCallCount === 2) {
+        return {
+          kind: "tool_calls",
+          content: "Run the required test.",
+          toolCalls: [{ id: "repair-entry-test", name: "run_project_check", input: { action: "test" } }],
+        };
+      }
+
+      assert.equal(request.phase, "repair_planning");
+      assert.deepEqual(request.tools, []);
+      return { kind: "final", content: "Inspect the failure and make one minimal repair." };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 1,
+    maxToolCalls: 1,
+    finalOnlyAfterToolBudget: true,
+    requirePostPatchTest: true,
+    enableFailureRepair: true,
+    requestCommandApproval: async () => true,
+    requestRepairApproval: async () => false,
+  }).run("Enter one bounded repair only after a real failed test.");
+
+  assert.equal(modelCallCount, 3);
+  assert.equal(projectCheck.executionCount, 1);
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "repair_decision"),
+    [{ type: "repair_decision", step: 3, decision: "rejected" }],
+  );
+  assert.equal(result.events.some((event) => event.type === "agent_completed"), false);
+  assert.equal(result.events.at(-1)?.type, "agent_stopped");
 });
 
 test("a total tool-call budget rejects calls after the budget is consumed", async () => {
@@ -869,10 +1167,12 @@ test("a late real failure receives a bounded three-call repair budget and two-ca
         };
       }
       if (modelCallCount === 5) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
         return {
           kind: "tool_calls",
           content: "Rerun the fixed check.",
-          toolCalls: [{ id: "budget-recheck", name: "run_project_check", input: {} }],
+          toolCalls: [{ id: "budget-recheck", name: "run_project_check", input: { action: "test" } }],
         };
       }
       if (modelCallCount === 6 || modelCallCount === 7) {
@@ -900,6 +1200,7 @@ test("a late real failure receives a bounded three-call repair budget and two-ca
     maxToolCalls: 1,
     finalOnlyAfterToolBudget: true,
     enableFailureRepair: true,
+    requirePostPatchTest: true,
     requestCommandApproval: async () => true,
     requestRepairApproval: async () => {
       repairApprovalCount += 1;
@@ -916,6 +1217,174 @@ test("a late real failure receives a bounded three-call repair budget and two-ca
   assert.equal(repairApprovalCount, 1);
   assert.equal(result.events.filter((event) => event.type === "tool_execution_started").length, 6);
   assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("a repaired check reruns test, then check, before the two-call Git closeout", async () => {
+  const projectCheck = createProjectCheckTool(["nonzero", "success", "success"]);
+  const firstRead = createCountingTool("read_file");
+  const patch = createCountingTool("apply_patch");
+  const inspectGit = createCountingTool("inspect_git");
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        return {
+          kind: "tool_calls",
+          content: "Run the original check.",
+          toolCalls: [{ id: "check-flow-initial", name: "run_project_check", input: { action: "check" } }],
+        };
+      }
+      if (modelCallCount === 2) {
+        assert.equal(request.phase, "repair_planning");
+        return { kind: "final", content: "Read the evidence, patch once, then rerun test and check." };
+      }
+      if (modelCallCount === 3 || modelCallCount === 4) {
+        return {
+          kind: "tool_calls",
+          content: "Read one repair input.",
+          toolCalls: [{ id: `check-flow-read-${modelCallCount}`, name: "read_file", input: {} }],
+        };
+      }
+      if (modelCallCount === 5) {
+        return {
+          kind: "tool_calls",
+          content: "Apply the repair as the third free repair tool.",
+          toolCalls: [{ id: "check-flow-patch", name: "apply_patch", input: {} }],
+        };
+      }
+      if (modelCallCount === 6) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return {
+          kind: "tool_calls",
+          content: "First prove the patch with test.",
+          toolCalls: [{ id: "check-flow-test", name: "run_project_check", input: { action: "test" } }],
+        };
+      }
+      if (modelCallCount === 7) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return {
+          kind: "tool_calls",
+          content: "Now rerun the original check.",
+          toolCalls: [{ id: "check-flow-recheck", name: "run_project_check", input: { action: "check" } }],
+        };
+      }
+      if (modelCallCount === 8 || modelCallCount === 9) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["inspect_git"]);
+        return {
+          kind: "tool_calls",
+          content: "Collect bounded Git closeout evidence.",
+          toolCalls: [{ id: `check-flow-git-${modelCallCount}`, name: "inspect_git", input: {} }],
+        };
+      }
+      assert.equal(modelCallCount, 10);
+      assert.deepEqual(request.tools, []);
+      return { kind: "final", content: "Test and the original check both passed after the repair." };
+    },
+  };
+
+  const result = await new AgentLoop(
+    model,
+    new ToolRegistry([projectCheck.tool, firstRead.tool, patch.tool, inspectGit.tool]),
+    {
+      workspaceRoot: process.cwd(),
+      maxSteps: 1,
+      maxToolCalls: 1,
+      finalOnlyAfterToolBudget: true,
+      enableFailureRepair: true,
+      requirePostPatchTest: true,
+      requestCommandApproval: async () => true,
+      requestRepairApproval: async () => true,
+    },
+  ).run("Repair a failed check without substituting a different verification action.");
+
+  assert.equal(result.answer, "Test and the original check both passed after the repair.");
+  assert.equal(projectCheck.executionCount, 3);
+  assert.equal(firstRead.executionCount, 2);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(inspectGit.executionCount, 2);
+  assert.equal(result.events.at(-1)?.type, "agent_completed");
+  assert.deepEqual(
+    result.events
+      .filter((event) => event.type === "tool_finalized" && event.toolName === "run_project_check")
+      .map((event) => event.type === "tool_finalized" ? event.metadata?.action : undefined),
+    ["check", "test", "check"],
+  );
+});
+
+test("each later successful patch reserves its own required test within the hard caps", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success", "success"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCallCount += 1;
+      const responses: ModelResponse[] = [
+        toolCallResponse("multi-patch-1", "apply_patch", {}),
+        toolCallResponse("multi-test-1", "run_project_check", { action: "test" }),
+        toolCallResponse("multi-patch-2", "apply_patch", {}),
+        toolCallResponse("multi-test-2", "run_project_check", { action: "test" }),
+        { kind: "final", content: "Both patches received a later successful test." },
+      ];
+      const response = responses[modelCallCount - 1];
+      if (!response) throw new Error("Unexpected multi-patch model call.");
+      return response;
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 3,
+    maxToolCalls: 3,
+    hardMaxModelRequests: 5,
+    hardMaxToolCalls: 4,
+    finalOnlyAfterToolBudget: true,
+    requirePostPatchTest: true,
+    requestCommandApproval: async () => true,
+  }).run("Apply and verify two bounded patches.");
+
+  assert.equal(modelCallCount, 5);
+  assert.equal(patch.executionCount, 2);
+  assert.equal(projectCheck.executionCount, 2);
+  assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("dynamic validation and repair growth cannot exceed absolute hard caps", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["nonzero"]);
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) return toolCallResponse("hard-cap-patch", "apply_patch", {});
+      if (modelCallCount === 2) {
+        return toolCallResponse("hard-cap-wrong-action", "run_project_check", { action: "check" });
+      }
+      return toolCallResponse("hard-cap-test", "run_project_check", { action: "test" });
+    },
+  };
+
+  await assert.rejects(
+    new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool]), {
+      workspaceRoot: process.cwd(),
+      maxSteps: 1,
+      maxToolCalls: 1,
+      hardMaxModelRequests: 3,
+      hardMaxToolCalls: 2,
+      finalOnlyAfterToolBudget: true,
+      requirePostPatchTest: true,
+      enableFailureRepair: true,
+      requestCommandApproval: async () => true,
+      requestRepairApproval: async () => true,
+    }).run("Never exceed the absolute request or tool cap."),
+    /达到最大步数 maxSteps=3/,
+  );
+
+  assert.equal(modelCallCount, 3);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 1);
 });
 
 test("a late real failure reserves enough model steps for one complete repair", async () => {

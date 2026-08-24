@@ -120,6 +120,8 @@ export async function createEvaluationArmAgent(options: CreateEvaluationArmOptio
         : EVALUATION_BUDGET.baselineMaxModelRequests,
       maxToolCallsPerStep: EVALUATION_BUDGET.maxToolCallsPerTurn,
       maxToolCalls: EVALUATION_BUDGET.baseMaxAcceptedToolCalls,
+      hardMaxModelRequests: EVALUATION_BUDGET.hardMaxModelRequests,
+      hardMaxToolCalls: EVALUATION_BUDGET.hardMaxAcceptedToolCalls,
       finalOnlyAfterToolBudget: true,
       executionMode: "apply",
       requireReadBeforeEdit: true,

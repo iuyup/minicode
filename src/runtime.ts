@@ -5,6 +5,10 @@ import process from "node:process";
 import readline from "node:readline/promises";
 
 import { AgentLoop, type AgentRunResult } from "./agent/agent-loop.ts";
+import {
+  EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS,
+  EDIT_HARD_MAX_MODEL_REQUESTS,
+} from "./agent/budget-limits.ts";
 import type {
   ChatModel,
   CommandApprovalRequest,
@@ -73,11 +77,11 @@ export const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
   "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁、固定验证、结构化 Node/npm 和固定 Git 只读工具完成小范围代码任务。",
   "先定位并用 read_file 成功读取目标文件，再提出最小的 apply_patch；运行时会拒绝未读取目标的补丁。",
   "补丁会在终端界面展示给用户；只有用户输入精确的 APPLY 才会写入。用户拒绝后，不得重复尝试同一补丁，应说明原因并给出后续建议。",
-  "补丁成功后，只在能验证本次修改时运行命令；优先调用更窄的 run_project_check test/check，固定验证无法覆盖时才调用 run_command。",
+  "补丁成功后必须在后续模型轮调用 run_project_check 的 test 动作；该固定验证成功前，运行时不会接受完成回答，也不会接受其他工具。",
   "run_command 必须把程序、参数数组和工作区相对目录分开提供；第一版只支持 node/npm，不接受直接 Shell、管道、重定向、Git、提权、后台任务或环境变量注入。npm/工作区脚本自身仍可能启动 Shell 或子进程。",
   "Git 只能通过 inspect_git 的 status、diff、staged_diff 固定动作读取；不得要求暂存、提交、切换分支、重置或推送。完成修改和验证后，在工具预算允许时读取 Git 状态与相关差异，并明确提交仍由用户手动完成。",
   "终端会完整展示命令、工作目录和风险等级；只有用户精确输入 RUN 才会执行。RUN 是本地确认词，不能作为用户消息处理或要求模型等待。",
-  "在 guided 编辑模式中，固定验证真实失败后会进入一次无工具修复方向阶段；只给出失败判断、拟修改文件和复验动作，等待本地 CONTINUE 确认后再继续。一次修复复验仍失败时必须停止修复并总结未完成状态。",
+  "在 guided 编辑模式中，固定验证真实失败后会进入一次无工具修复方向阶段；只给出失败判断、拟修改文件和复验动作，等待本地 CONTINUE 确认后再继续。修复补丁必须先通过 test；若原失败动作是 check，还必须再重跑 check。任一复验仍失败时必须停止修复并总结未完成状态。",
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
 
@@ -354,12 +358,15 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
   return new AgentLoop(options.model ?? createModel(argumentsValue), registry, {
     workspaceRoot: argumentsValue.workspaceRoot,
     maxSteps: argumentsValue.agentMode === "edit" ? 7 : undefined,
+    hardMaxModelRequests: argumentsValue.agentMode === "edit" ? EDIT_HARD_MAX_MODEL_REQUESTS : undefined,
+    hardMaxToolCalls: argumentsValue.agentMode === "edit" ? EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS : undefined,
     executionMode: argumentsValue.executionMode,
     requireSourceEvidence: argumentsValue.requireSourceEvidence,
     requirePlanApproval: argumentsValue.guided,
     planningPrompt: argumentsValue.guided ? GUIDED_PLAN_PROMPT : undefined,
     enableFailureRepair: argumentsValue.guided && argumentsValue.agentMode === "edit",
     requireReadBeforeEdit: usesRemoteModel(argumentsValue) && argumentsValue.agentMode === "edit",
+    requirePostPatchTest: argumentsValue.agentMode === "edit" && argumentsValue.executionMode === "apply",
     ...(usesRemoteModel(argumentsValue)
       ? {
           systemPrompt: [

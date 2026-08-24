@@ -253,8 +253,8 @@ class FailureRepairChainModel implements ChatModel {
         assertSuccessfulTool(lastMessage, "apply_patch", /补丁已应用/);
         assert.deepEqual(
           request.tools.map((tool) => tool.name),
-          ["read_file", "run_project_check"],
-          "一次补丁获批后不得再开放第二次补丁",
+          ["run_project_check"],
+          "一次补丁获批后必须先完成固定 test",
         );
         return toolCall("repair-retest", "run_project_check", { action: "test" });
       case 7:

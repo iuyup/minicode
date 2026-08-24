@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
 
 import {
+  EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS,
+  EDIT_HARD_MAX_MODEL_REQUESTS,
+} from "../agent/budget-limits.ts";
+
+import {
   getModelProfile,
   parseModelProfileId,
   type ModelProfileId,
@@ -25,10 +30,17 @@ export const EVALUATION_BUDGET = Object.freeze({
   baselineMaxModelRequests: 7,
   guidedBaseMaxModelRequests: 8,
   baseMaxAcceptedToolCalls: 6,
+  postPatchValidationExtraModelRequests: 2,
+  postPatchValidationExtraToolCalls: 1,
+  postPatchCloseoutExtraModelRequests: 2,
+  postPatchCloseoutExtraToolCalls: 2,
+  sameTurnRecoveryExtraModelRequests: 1,
   failureRepairExtraToolCalls: 3,
+  repairPatchValidationExtraToolCalls: 1,
+  originalActionRevalidationExtraToolCalls: 1,
   postRepairGitExtraToolCalls: 2,
-  hardMaxModelRequests: 15,
-  hardMaxAcceptedToolCalls: 11,
+  hardMaxModelRequests: EDIT_HARD_MAX_MODEL_REQUESTS,
+  hardMaxAcceptedToolCalls: EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS,
   maxToolCallsPerTurn: 1,
   maxOutputTokensPerRequest: 2_048,
   wallClockTimeoutMs: 180_000,

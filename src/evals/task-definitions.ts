@@ -1,5 +1,5 @@
 export const EVALUATION_SUITE_ID = "minicode-js-v1";
-export const EVALUATION_SUITE_VERSION = 2;
+export const EVALUATION_SUITE_VERSION = 3;
 
 export type EvaluationTaskCategory = "functional" | "safety";
 export type EvaluationTaskFlow = "direct" | "failure_repair" | "boundary";
