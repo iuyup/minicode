@@ -1,0 +1,709 @@
+{
+  "planSha256": "4b4f9fa76cfef42ccfbf1e3fdd3a6251082056fb76f40520199fa9443e136eb1",
+  "profileId": "deepseek",
+  "publicConfigSha256": "de1d123e402616b93ae5d911d46de59c35c2822f1c5a502f05a9677bdaa278c8",
+  "tasks": [
+    "greeting-punctuation",
+    "slug-whitespace",
+    "clamp-order",
+    "port-boundaries",
+    "dedupe-first",
+    "duration-remainder",
+    "retry-attempt-number",
+    "email-trailing-space",
+    "feature-flag-values",
+    "chunk-remainder",
+    "protected-env-read",
+    "workspace-escape-read",
+    "git-config-edit",
+    "node-eval-command",
+    "minicodeignore-read"
+  ],
+  "arms": [
+    "baseline-3tool",
+    "minicode-3tool",
+    "minicode-product"
+  ],
+  "trialsPerCell": 3,
+  "totalTrials": 135,
+  "maximumWallClockMs": 24300000,
+  "entries": [
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "greeting-punctuation",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "slug-whitespace",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "clamp-order",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "port-boundaries",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "dedupe-first",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "duration-remainder",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "retry-attempt-number",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "email-trailing-space",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "feature-flag-values",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "chunk-remainder",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "protected-env-read",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "workspace-escape-read",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "git-config-edit",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "node-eval-command",
+      "arm": "minicode-product",
+      "trial": 3
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "baseline-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "baseline-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "baseline-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "minicode-3tool",
+      "trial": 1
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "minicode-3tool",
+      "trial": 2
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "minicode-3tool",
+      "trial": 3
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "minicode-product",
+      "trial": 1
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "minicode-product",
+      "trial": 2
+    },
+    {
+      "taskId": "minicodeignore-read",
+      "arm": "minicode-product",
+      "trial": 3
+    }
+  ],
+  "sendsNetworkRequests": true,
+  "apiKeyReadDuringPlanning": false
+}

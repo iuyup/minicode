@@ -1,0 +1,69 @@
+{
+  "arms": [
+    "baseline-3tool",
+    "minicode-3tool",
+    "minicode-product"
+  ],
+  "budget": {
+    "baselineMaxModelRequests": 7,
+    "baseMaxAcceptedToolCalls": 6,
+    "failureRepairExtraToolCalls": 3,
+    "guidedBaseMaxModelRequests": 8,
+    "hardMaxAcceptedToolCalls": 11,
+    "hardMaxModelRequests": 15,
+    "maxOutputTokensPerRequest": 2048,
+    "maxToolCallsPerTurn": 1,
+    "postRepairGitExtraToolCalls": 2,
+    "wallClockTimeoutMs": 180000
+  },
+  "cost": {
+    "pricing": {
+      "cachedInputUsdPerMillionTokens": 0.0028,
+      "currency": "USD",
+      "effectiveAt": "2026-08-23T16:00:00.000Z",
+      "inputUsdPerMillionTokens": 0.14,
+      "model": "deepseek-v4-flash",
+      "outputUsdPerMillionTokens": 0.28,
+      "profileId": "deepseek",
+      "snapshotId": "deepseek-v4-flash-2026-08-24-official",
+      "source": "https://api-docs.deepseek.com/quick_start/pricing"
+    },
+    "status": "configured"
+  },
+  "model": {
+    "allowInsecureHttp": false,
+    "disableThinking": true,
+    "endpointSha256": "a34e2a4708ed1c61008a151688838dcf1c44d4e7f08054633e72ba7c0b16cfc1",
+    "kind": "openai-compatible",
+    "model": "deepseek-v4-flash",
+    "profileId": "deepseek"
+  },
+  "prompts": {
+    "baseline-3tool": {
+      "planningSha256": null,
+      "systemSha256": "9cf07a635a122f700b9998a74b5e2e6517bcbcf1b170f515c4626a12b56fe09d"
+    },
+    "minicode-3tool": {
+      "planningSha256": "f306db47cd7085717c0eb66a8dc94406006a1a9b6eb5bb6f3f588f4357962cba",
+      "systemSha256": "9cf07a635a122f700b9998a74b5e2e6517bcbcf1b170f515c4626a12b56fe09d"
+    },
+    "minicode-product": {
+      "planningSha256": "f306db47cd7085717c0eb66a8dc94406006a1a9b6eb5bb6f3f588f4357962cba",
+      "systemSha256": "ddab9beffb2290ba13195f7a0f47ee4cc0a1d79bc8232834fc0537d890763cf5"
+    }
+  },
+  "runtime": {
+    "approvalMode": "fixture-auto-approve-allowlist",
+    "architecture": "x64",
+    "nodeVersion": "v24.18.0",
+    "platform": "win32",
+    "seed": null,
+    "temperature": null
+  },
+  "schemaVersion": 1,
+  "suite": {
+    "id": "minicode-js-v1",
+    "trials": 3,
+    "version": 2
+  }
+}

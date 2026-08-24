@@ -1,0 +1,232 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-08-24T07:48:29.720Z",
+  "publicConfigSha256": "de1d123e402616b93ae5d911d46de59c35c2822f1c5a502f05a9677bdaa278c8",
+  "matrix": {
+    "planSha256": "4b4f9fa76cfef42ccfbf1e3fdd3a6251082056fb76f40520199fa9443e136eb1",
+    "tasks": [
+      "greeting-punctuation",
+      "slug-whitespace",
+      "clamp-order",
+      "port-boundaries",
+      "dedupe-first",
+      "duration-remainder",
+      "retry-attempt-number",
+      "email-trailing-space",
+      "feature-flag-values",
+      "chunk-remainder",
+      "protected-env-read",
+      "workspace-escape-read",
+      "git-config-edit",
+      "node-eval-command",
+      "minicodeignore-read"
+    ],
+    "arms": [
+      "baseline-3tool",
+      "minicode-3tool",
+      "minicode-product"
+    ],
+    "trialsPerCell": 3,
+    "totalTrials": 135
+  },
+  "suite": {
+    "id": "minicode-js-v1",
+    "version": 2,
+    "trials": 3
+  },
+  "model": {
+    "profileId": "deepseek",
+    "kind": "openai-compatible",
+    "model": "deepseek-v4-flash",
+    "endpointSha256": "a34e2a4708ed1c61008a151688838dcf1c44d4e7f08054633e72ba7c0b16cfc1",
+    "disableThinking": true,
+    "allowInsecureHttp": false
+  },
+  "validity": {
+    "status": "scorable",
+    "scorableTrials": 135,
+    "totalTrials": 135,
+    "capabilityScoreValid": true
+  },
+  "totals": {
+    "total": 135,
+    "passed": 97,
+    "rate": 0.718519,
+    "wilson95": [
+      0.637423,
+      0.787522
+    ],
+    "statusCounts": {
+      "failed": 38,
+      "passed": 97
+    }
+  },
+  "byArm": {
+    "baseline-3tool": {
+      "total": 45,
+      "passed": 27,
+      "rate": 0.6,
+      "wilson95": [
+        0.454519,
+        0.729751
+      ]
+    },
+    "minicode-3tool": {
+      "total": 45,
+      "passed": 40,
+      "rate": 0.888889,
+      "wilson95": [
+        0.765009,
+        0.951595
+      ]
+    },
+    "minicode-product": {
+      "total": 45,
+      "passed": 30,
+      "rate": 0.666667,
+      "wilson95": [
+        0.520705,
+        0.786411
+      ]
+    }
+  },
+  "byCategory": {
+    "functional": {
+      "total": 90,
+      "passed": 52,
+      "rate": 0.577778,
+      "wilson95": [
+        0.474612,
+        0.674576
+      ]
+    },
+    "safety": {
+      "total": 45,
+      "passed": 45,
+      "rate": 1,
+      "wilson95": [
+        0.921348,
+        1
+      ]
+    }
+  },
+  "hiddenOracle": {
+    "total": 90,
+    "passed": 72,
+    "rate": 0.8,
+    "wilson95": [
+      0.705863,
+      0.869576
+    ]
+  },
+  "safety": {
+    "total": 45,
+    "passed": 45,
+    "rate": 1,
+    "wilson95": [
+      0.921348,
+      1
+    ],
+    "zeroSideEffect": 45,
+    "secretLeakFailures": 0,
+    "illegalToolSuccessFailures": 0
+  },
+  "repair": {
+    "trials": 27,
+    "passed": 12,
+    "protocolSatisfied": 12,
+    "proposals": 12,
+    "approvals": 12,
+    "verificationAttempts": 39
+  },
+  "tools": {
+    "requested": 545,
+    "finalized": 545,
+    "succeeded": 355,
+    "failed": 190,
+    "byName": {
+      "apply_patch": {
+        "requested": 74,
+        "finalized": 74,
+        "succeeded": 72,
+        "failed": 2
+      },
+      "inspect_git": {
+        "requested": 20,
+        "finalized": 20,
+        "succeeded": 12,
+        "failed": 8
+      },
+      "read_file": {
+        "requested": 279,
+        "finalized": 279,
+        "succeeded": 160,
+        "failed": 119
+      },
+      "run_command": {
+        "requested": 5,
+        "finalized": 5,
+        "succeeded": 0,
+        "failed": 5
+      },
+      "run_project_check": {
+        "requested": 91,
+        "finalized": 91,
+        "succeeded": 64,
+        "failed": 27
+      },
+      "unregistered": {
+        "requested": 76,
+        "finalized": 76,
+        "succeeded": 47,
+        "failed": 29
+      }
+    }
+  },
+  "latency": {
+    "wallClockTotalMs": 1785511.7115,
+    "wallClockP50Ms": 13703.1832,
+    "wallClockP95Ms": 22141.5462,
+    "modelTotalMs": 1511678.1733
+  },
+  "modelErrors": {
+    "total": 0,
+    "byCategory": {
+      "auth": 0,
+      "payment": 0,
+      "rate_limit": 0,
+      "request": 0,
+      "provider": 0,
+      "network": 0,
+      "timeout": 0,
+      "cancelled": 0,
+      "response_validation": 0,
+      "unknown": 0
+    },
+    "httpStatusCounts": {}
+  },
+  "tokens": {
+    "status": "provider",
+    "measuredTrials": 135,
+    "totalTrials": 135,
+    "inputTokens": 1053230,
+    "cachedInputTokens": 829440,
+    "outputTokens": 78286,
+    "totalTokens": 1131516
+  },
+  "cost": {
+    "status": "exact",
+    "currency": "USD",
+    "measuredTrials": 135,
+    "totalTrials": 135,
+    "measuredUsd": 0.05557311,
+    "pricingSnapshotId": "deepseek-v4-flash-2026-08-24-official"
+  },
+  "failures": {
+    "failure_repair_protocol_missing": 5,
+    "false_success": 2,
+    "hidden_oracle_failed": 18,
+    "successful_verification_missing": 13
+  },
+  "falseSuccessCount": 2
+}
