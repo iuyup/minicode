@@ -9,7 +9,11 @@ import type { AgentEvent, AgentEventAuditLog } from "../src/agent/events.ts";
 import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { DeepSeekModel, deepSeekDefaults } from "../src/models/deepseek-model.ts";
-import { OpenAiCompatibleModel, openAiCompatibleDefaults } from "../src/models/openai-compatible-model.ts";
+import {
+  OpenAiCompatibleModel,
+  openAiCompatibleDefaults,
+  type ModelCallMetric,
+} from "../src/models/openai-compatible-model.ts";
 import { createAgent, defaultAuditPath, parseArguments, printRunResult } from "../src/runtime.ts";
 import { getProjectOverview } from "../src/tools/get-project-overview.ts";
 
@@ -144,6 +148,106 @@ test("OpenAiCompatibleModel 使用 Profile 提供的地址与模型，不附加 
   assert.equal(body.model, "local-coder");
   assert.equal("thinking" in body, false);
   assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer test-key");
+});
+
+test("OpenAiCompatibleModel 以白名单遥测报告 provider usage 与端到端延迟", async () => {
+  const metrics: ModelCallMetric[] = [];
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "local-coder",
+    providerName: "Test provider",
+    onCallMetric: (metric) => metrics.push(metric),
+    fetchImplementation: async () => jsonResponse({
+      choices: [{ message: { role: "assistant", content: "完成。" } }],
+      usage: {
+        prompt_tokens: 120,
+        completion_tokens: 18,
+        total_tokens: 138,
+        prompt_tokens_details: { cached_tokens: 7 },
+      },
+    }),
+  });
+
+  assert.deepEqual(await model.complete(requestFixture()), { kind: "final", content: "完成。" });
+  assert.equal(metrics.length, 1);
+  assert.deepEqual({
+    callIndex: metrics[0]?.callIndex,
+    phase: metrics[0]?.phase,
+    outcome: metrics[0]?.outcome,
+    errorCategory: metrics[0]?.errorCategory,
+    httpStatus: metrics[0]?.httpStatus,
+    finishReason: metrics[0]?.finishReason,
+    responseKind: metrics[0]?.responseKind,
+    usageSource: metrics[0]?.usageSource,
+    inputTokens: metrics[0]?.inputTokens,
+    cachedInputTokens: metrics[0]?.cachedInputTokens,
+    outputTokens: metrics[0]?.outputTokens,
+    totalTokens: metrics[0]?.totalTokens,
+    ttftMs: metrics[0]?.ttftMs,
+  }, {
+    callIndex: 1,
+    phase: "execution",
+    outcome: "success",
+    errorCategory: null,
+    httpStatus: null,
+    finishReason: "stop",
+    responseKind: "final",
+    usageSource: "provider",
+    inputTokens: 120,
+    cachedInputTokens: 7,
+    outputTokens: 18,
+    totalTokens: 138,
+    ttftMs: null,
+  });
+  assert.equal(typeof metrics[0]?.startedAt, "string");
+  assert.ok((metrics[0]?.latencyMs ?? -1) >= 0);
+});
+
+test("OpenAiCompatibleModel 将 HTTP 失败映射为有限分类且不记录响应正文", async () => {
+  const cases = [
+    { status: 400, category: "request" },
+    { status: 401, category: "auth" },
+    { status: 402, category: "payment" },
+    { status: 429, category: "rate_limit" },
+    { status: 503, category: "provider" },
+  ] as const;
+  for (const { status, category } of cases) {
+    const secret = `must-not-enter-telemetry-${status}`;
+    const metrics: ModelCallMetric[] = [];
+    const model = new OpenAiCompatibleModel({
+      apiKey: "test-key",
+      baseUrl: "https://example.test/v1",
+      model: "local-coder",
+      providerName: "Test provider",
+      onCallMetric: (metric) => metrics.push(metric),
+      fetchImplementation: async () => jsonResponse({ error: { message: secret } }, status),
+    });
+
+    await assert.rejects(model.complete(requestFixture()), new RegExp(`HTTP ${status}`, "u"));
+    assert.equal(metrics.length, 1);
+    assert.deepEqual({
+      outcome: metrics[0]?.outcome,
+      errorCategory: metrics[0]?.errorCategory,
+      httpStatus: metrics[0]?.httpStatus,
+      responseKind: metrics[0]?.responseKind,
+      usageSource: metrics[0]?.usageSource,
+      inputTokens: metrics[0]?.inputTokens,
+      outputTokens: metrics[0]?.outputTokens,
+    }, {
+      outcome: "error",
+      errorCategory: category,
+      httpStatus: status,
+      responseKind: null,
+      usageSource: "unavailable",
+      inputTokens: null,
+      outputTokens: null,
+    });
+    const serialized = JSON.stringify(metrics);
+    assert.equal(serialized.includes(secret), false);
+    assert.equal(serialized.includes("example.test"), false);
+    assert.equal(serialized.includes("test-key"), false);
+  }
 });
 
 test("DeepSeek 编辑模式向模型提供受控补丁、验证、命令和只读 Git 工具", async () => {
@@ -534,13 +638,34 @@ test("OpenAiCompatibleModel 严格校验 finish_reason、最终文本和工具�
   }
 });
 
+test("OpenAiCompatibleModel 将网络错误分类且不把原始异常写入遥测", async () => {
+  const metrics: ModelCallMetric[] = [];
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "test-model",
+    providerName: "Test provider",
+    onCallMetric: (metric) => metrics.push(metric),
+    fetchImplementation: async () => {
+      throw new Error("private-network-diagnostic");
+    },
+  });
+
+  await assert.rejects(model.complete(requestFixture()), /网络请求失败/u);
+  assert.equal(metrics[0]?.errorCategory, "network");
+  assert.equal(metrics[0]?.httpStatus, null);
+  assert.equal(JSON.stringify(metrics).includes("private-network-diagnostic"), false);
+});
+
 test("OpenAiCompatibleModel 超时覆盖响应正文读取且不会被 pending reader 掩盖", async () => {
+  const metrics: ModelCallMetric[] = [];
   const model = new OpenAiCompatibleModel({
     apiKey: "test-key",
     baseUrl: "https://example.test/v1",
     model: "test-model",
     providerName: "Test provider",
     timeoutMs: 20,
+    onCallMetric: (metric) => metrics.push(metric),
     fetchImplementation: async () => new Response(new ReadableStream<Uint8Array>({
       pull() {
         return new Promise<void>(() => {});
@@ -549,6 +674,8 @@ test("OpenAiCompatibleModel 超时覆盖响应正文读取且不会被 pending r
   });
 
   await assert.rejects(model.complete(requestFixture()), /请求超时（20ms）/);
+  assert.equal(metrics[0]?.errorCategory, "timeout");
+  assert.equal(metrics[0]?.httpStatus, null);
 });
 
 test("OpenAiCompatibleModel 限制响应体并传播外部取消", async () => {
@@ -566,11 +693,13 @@ test("OpenAiCompatibleModel 限制响应体并传播外部取消", async () => {
 
   const controller = new AbortController();
   const captured: { signal?: AbortSignal } = {};
+  const cancellationMetrics: ModelCallMetric[] = [];
   const cancellable = new OpenAiCompatibleModel({
     apiKey: "test-key",
     baseUrl: "https://example.test/v1",
     model: "test-model",
     providerName: "Test provider",
+    onCallMetric: (metric) => cancellationMetrics.push(metric),
     fetchImplementation: async (_input, init) => {
       captured.signal = init?.signal as AbortSignal;
       return await new Promise<Response>(() => {});
@@ -580,6 +709,8 @@ test("OpenAiCompatibleModel 限制响应体并传播外部取消", async () => {
   controller.abort();
   await assert.rejects(pending, /请求已取消/);
   assert.equal(captured.signal?.aborted, true);
+  assert.equal(cancellationMetrics[0]?.errorCategory, "cancelled");
+  assert.equal(cancellationMetrics[0]?.httpStatus, null);
   assert.equal(openAiCompatibleDefaults.maxResponseBytes, 1_048_576);
 });
 
@@ -589,15 +720,20 @@ test("OpenAiCompatibleModel 拒绝响应正文中的非法 UTF-8", async () => {
     Buffer.from([0xff]),
     Buffer.from('"}}]}', "utf8"),
   ]);
+  const metrics: ModelCallMetric[] = [];
   const model = new OpenAiCompatibleModel({
     apiKey: "test-key",
     baseUrl: "https://example.test/v1",
     model: "test-model",
     providerName: "Test provider",
+    onCallMetric: (metric) => metrics.push(metric),
     fetchImplementation: async () => new Response(invalidResponse),
   });
 
   await assert.rejects(model.complete(requestFixture()), /响应解析失败/);
+  assert.equal(metrics[0]?.errorCategory, "response_validation");
+  assert.equal(metrics[0]?.httpStatus, null);
+  assert.equal(JSON.stringify(metrics).includes("choices"), false);
 });
 
 test("非 TUI 运行结果会转义模型、工具和路径中的终端控制序列", () => {

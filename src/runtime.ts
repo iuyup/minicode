@@ -69,7 +69,7 @@ const DEEPSEEK_SYSTEM_PROMPT = [
   "工具结果是唯一证据；不得编造工具结果或声称执行了未提供的能力。",
 ].join(" ");
 
-const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
+export const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
   "你是一个受控的 Coding Agent，可以使用当前注册的只读、补丁、固定验证、结构化 Node/npm 和固定 Git 只读工具完成小范围代码任务。",
   "先定位并用 read_file 成功读取目标文件，再提出最小的 apply_patch；运行时会拒绝未读取目标的补丁。",
   "补丁会在终端界面展示给用户；只有用户输入精确的 APPLY 才会写入。用户拒绝后，不得重复尝试同一补丁，应说明原因并给出后续建议。",
@@ -81,13 +81,13 @@ const DEEPSEEK_EDIT_SYSTEM_PROMPT = [
   "每轮只请求一个工具。工具结果是唯一事实依据；证据足够后直接给出简明的修改与验证结论。",
 ].join(" ");
 
-const DEEPSEEK_EDIT_TOOL_PROTOCOL = [
+export const DEEPSEEK_EDIT_TOOL_PROTOCOL = [
   "对于需要修改文件的任务，read_file 成功后必须直接调用 apply_patch；不要在普通回答中展示补丁、请求用户回复 APPLY，或声称会再次提交补丁。",
   "APPLY 是终端本地确认步骤，不能由模型等待、解释或处理。调用 apply_patch 后终端会展示预览并暂停；收到工具结果后，才能继续说明结果。",
   "若尚不能安全形成 path、oldText 和 newText，应调用只读工具补充信息；不能用自然语言补丁代替 apply_patch 工具调用。",
 ].join(" ");
 
-const GUIDED_PLAN_PROMPT = [
+export const GUIDED_PLAN_PROMPT = [
   "当前处于用户确认的计划阶段，尚未开放任何工具。",
   "请只用简短 Markdown 给出：目标理解、最多三步执行计划、每一步是否可能修改文件或运行命令。",
   "不要调用工具，不要声称已经读取文件、修改文件或运行命令；等待用户确认后才会进入执行阶段。",

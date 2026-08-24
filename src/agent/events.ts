@@ -90,7 +90,7 @@ export interface AgentEventAuditLog {
   flush(): Promise<void>;
 }
 
-interface SanitizedAuditEvent {
+export interface SanitizedAuditEvent {
   timestamp: string;
   type: AgentEvent["type"];
   step: number;
@@ -138,8 +138,11 @@ function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExec
   return sanitized;
 }
 
-function sanitize(event: AgentEvent): SanitizedAuditEvent {
-  const base = { timestamp: new Date().toISOString(), type: event.type, step: event.step };
+export function sanitizeAgentEvent(
+  event: AgentEvent,
+  timestamp = new Date().toISOString(),
+): SanitizedAuditEvent {
+  const base = { timestamp, type: event.type, step: event.step };
   switch (event.type) {
     case "tool_call":
     case "tool_execution_started":
@@ -240,7 +243,7 @@ export class JsonlAuditLog implements AgentEventAuditLog {
       if (this.#pending.length === 0) return;
 
       const events = this.#pending.splice(0, this.#pending.length);
-      const output = `${events.map((event) => JSON.stringify(sanitize(event))).join("\n")}\n`;
+      const output = `${events.map((event) => JSON.stringify(sanitizeAgentEvent(event))).join("\n")}\n`;
       try {
         await fs.mkdir(path.dirname(this.filePath), { recursive: true });
         await fs.appendFile(this.filePath, output, "utf8");

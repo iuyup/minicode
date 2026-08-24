@@ -76,15 +76,102 @@ export interface OpenAiCompatibleModelOptions {
   maxResponseBytes?: number;
   allowInsecureHttp?: boolean;
   fetchImplementation?: typeof fetch;
+  onCallMetric?: (metric: ModelCallMetric) => void;
 }
 
-class ProviderHttpError extends Error {}
+export const MODEL_ERROR_CATEGORIES = [
+  "auth",
+  "payment",
+  "rate_limit",
+  "request",
+  "provider",
+  "network",
+  "timeout",
+  "cancelled",
+  "response_validation",
+  "unknown",
+] as const;
+
+export type ModelErrorCategory = typeof MODEL_ERROR_CATEGORIES[number];
+
+export interface ModelCallMetric {
+  callIndex: number;
+  phase: "planning" | "repair_planning" | "execution";
+  startedAt: string;
+  latencyMs: number;
+  outcome: "success" | "error";
+  /** A bounded, content-free failure class. Successful calls always use null. */
+  errorCategory: ModelErrorCategory | null;
+  /** Numeric provider status only; response body, headers and URL are never telemetry. */
+  httpStatus: number | null;
+  finishReason: string | null;
+  responseKind: ModelResponse["kind"] | null;
+  usageSource: "provider" | "unavailable";
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  ttftMs: null;
+}
+
+class ProviderHttpError extends Error {
+  readonly status: number;
+
+  constructor(providerName: string, status: number) {
+    super(`${providerName} 请求失败：HTTP ${status}。`);
+    this.status = status;
+  }
+}
 class RequestAbortedError extends Error {}
+
+function categoryForHttpStatus(status: number): ModelErrorCategory {
+  if (status === 401 || status === 403) return "auth";
+  if (status === 402) return "payment";
+  if (status === 429) return "rate_limit";
+  if (status >= 400 && status < 500) return "request";
+  if (status >= 500 && status < 600) return "provider";
+  return "unknown";
+}
 
 function asObject(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function nonNegativeInteger(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null;
+}
+
+function providerUsage(payload: unknown): Pick<
+  ModelCallMetric,
+  "usageSource" | "inputTokens" | "cachedInputTokens" | "outputTokens" | "totalTokens"
+> {
+  const usage = asObject(asObject(payload)?.usage);
+  if (!usage) {
+    return {
+      usageSource: "unavailable",
+      inputTokens: null,
+      cachedInputTokens: null,
+      outputTokens: null,
+      totalTokens: null,
+    };
+  }
+  const inputTokens = nonNegativeInteger(usage.prompt_tokens);
+  const outputTokens = nonNegativeInteger(usage.completion_tokens);
+  const totalTokens = nonNegativeInteger(usage.total_tokens);
+  const promptDetails = asObject(usage.prompt_tokens_details);
+  const cachedInputTokens = nonNegativeInteger(promptDetails?.cached_tokens)
+    ?? nonNegativeInteger(usage.prompt_cache_hit_tokens);
+  const hasProviderValue = [inputTokens, cachedInputTokens, outputTokens, totalTokens]
+    .some((value) => value !== null);
+  return {
+    usageSource: hasProviderValue ? "provider" : "unavailable",
+    inputTokens,
+    cachedInputTokens,
+    outputTokens,
+    totalTokens,
+  };
 }
 
 function toApiMessage(message: AgentMessage): ApiMessage {
@@ -275,6 +362,8 @@ export class OpenAiCompatibleModel implements ChatModel {
   readonly #maxTokens: number;
   readonly #maxResponseBytes: number;
   readonly #fetch: typeof fetch;
+  readonly #onCallMetric?: (metric: ModelCallMetric) => void;
+  #callIndex = 0;
 
   constructor(options: OpenAiCompatibleModelOptions) {
     this.#providerName = options.providerName ?? "OpenAI-compatible provider";
@@ -318,9 +407,20 @@ export class OpenAiCompatibleModel implements ChatModel {
     this.#maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
     this.#maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     this.#fetch = options.fetchImplementation ?? fetch;
+    this.#onCallMetric = options.onCallMetric;
   }
 
   async complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse> {
+    this.#callIndex += 1;
+    const callIndex = this.#callIndex;
+    const startedAt = new Date().toISOString();
+    const monotonicStart = performance.now();
+    let outcome: ModelCallMetric["outcome"] = "error";
+    let errorCategory: ModelErrorCategory | null = null;
+    let httpStatus: number | null = null;
+    let finishReason: string | null = null;
+    let responseKind: ModelResponse["kind"] | null = null;
+    let usage = providerUsage(undefined);
     const controller = new AbortController();
     let timedOut = false;
     const onExternalAbort = () => controller.abort(signal?.reason);
@@ -330,8 +430,29 @@ export class OpenAiCompatibleModel implements ChatModel {
       timedOut = true;
       controller.abort();
     }, this.#timeoutMs);
-    let phase: "fetch" | "body" | "parse" = "fetch";
+    let phase: "request" | "fetch" | "body" | "parse" = "request";
     try {
+      const requestBody = JSON.stringify({
+        model: this.#model,
+        messages: request.messages.map(toApiMessage),
+        ...(request.tools.length > 0
+          ? {
+              tools: request.tools.map((tool) => ({
+                type: "function",
+                function: {
+                  name: tool.name,
+                  description: tool.description,
+                  parameters: tool.parameters,
+                },
+              })),
+              tool_choice: toApiToolChoice(request, this.#providerName),
+            }
+          : {}),
+        ...(this.#disableThinking ? { thinking: { type: "disabled" } } : {}),
+        max_tokens: this.#maxTokens,
+        stream: false,
+      });
+      phase = "fetch";
       const response = await abortable(this.#fetch(this.#endpoint, {
         method: "POST",
         redirect: "error",
@@ -339,30 +460,11 @@ export class OpenAiCompatibleModel implements ChatModel {
           "content-type": "application/json",
           authorization: `Bearer ${this.#apiKey}`,
         },
-        body: JSON.stringify({
-          model: this.#model,
-          messages: request.messages.map(toApiMessage),
-          ...(request.tools.length > 0
-            ? {
-                tools: request.tools.map((tool) => ({
-                  type: "function",
-                  function: {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.parameters,
-                  },
-                })),
-                tool_choice: toApiToolChoice(request, this.#providerName),
-              }
-            : {}),
-          ...(this.#disableThinking ? { thinking: { type: "disabled" } } : {}),
-          max_tokens: this.#maxTokens,
-          stream: false,
-        }),
+        body: requestBody,
         signal: controller.signal,
       }), controller.signal);
       if (!response.ok) {
-        throw new ProviderHttpError(`${this.#providerName} 请求失败：HTTP ${response.status}。`);
+        throw new ProviderHttpError(this.#providerName, response.status);
       }
       phase = "body";
       const body = await readResponseBody(response, this.#maxResponseBytes, controller.signal);
@@ -374,23 +476,62 @@ export class OpenAiCompatibleModel implements ChatModel {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`JSON 无效：${message}`);
       }
-      return parseResponse(payload, this.#providerName);
+      const result = parseResponse(payload, this.#providerName);
+      const choices = asObject(payload)?.choices;
+      const firstChoice = Array.isArray(choices) ? asObject(choices[0]) : undefined;
+      finishReason = typeof firstChoice?.finish_reason === "string" ? firstChoice.finish_reason : null;
+      responseKind = result.kind;
+      usage = providerUsage(payload);
+      outcome = "success";
+      return result;
     } catch (error) {
       if (signal?.aborted) {
+        errorCategory = "cancelled";
         throw new Error(`${this.#providerName} 请求已取消。`);
       }
       if (timedOut) {
+        errorCategory = "timeout";
         throw new Error(`${this.#providerName} 请求超时（${this.#timeoutMs}ms）。`);
       }
-      if (error instanceof ProviderHttpError) throw error;
+      if (error instanceof ProviderHttpError) {
+        errorCategory = categoryForHttpStatus(error.status);
+        httpStatus = error.status;
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
+      if (phase === "request") {
+        errorCategory = "request";
+        throw new Error(`${this.#providerName} 请求构造失败：${message}`);
+      }
       if (phase === "fetch") {
+        errorCategory = "network";
         throw new Error(`${this.#providerName} 网络请求失败：${message}`);
       }
+      if (phase === "body" || phase === "parse") errorCategory = "response_validation";
+      else errorCategory = "unknown";
       throw new Error(`${this.#providerName} 响应解析失败：${message}`);
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", onExternalAbort);
+      if (this.#onCallMetric) {
+        try {
+          this.#onCallMetric({
+            callIndex,
+            phase: request.phase ?? "execution",
+            startedAt,
+            latencyMs: performance.now() - monotonicStart,
+            outcome,
+            errorCategory: outcome === "success" ? null : errorCategory ?? "unknown",
+            httpStatus: outcome === "success" ? null : httpStatus,
+            finishReason,
+            responseKind,
+            ...usage,
+            ttftMs: null,
+          });
+        } catch {
+          // Telemetry is observational and must not change model behavior.
+        }
+      }
     }
   }
 }
