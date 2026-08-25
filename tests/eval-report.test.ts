@@ -17,7 +17,7 @@ function trial(overrides: Partial<EvaluationTrialResult> & Pick<EvaluationTrialR
   const publicConfigSha256 = overrides.publicConfigSha256 ?? "c".repeat(64);
   const profileId = overrides.profileId ?? "deepseek";
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     suite: { id: "minicode-js-v1", version: EVALUATION_SUITE_VERSION },
     fixtureSha256: "f".repeat(64),
     taskSpecSha256: evaluationTaskSpecSha256(task),
@@ -107,6 +107,12 @@ function trial(overrides: Partial<EvaluationTrialResult> & Pick<EvaluationTrialR
     },
     failureCode: null,
     artifacts: { auditSha256: "a".repeat(64), traceSha256: "b".repeat(64) },
+    source: {
+      schemaVersion: 1,
+      sourceCommit: "a".repeat(40),
+      dirty: false,
+      dirtyStateSha256: "e".repeat(64),
+    },
     ...overrides,
     profileId,
     publicConfigSha256,
@@ -122,8 +128,8 @@ function trial(overrides: Partial<EvaluationTrialResult> & Pick<EvaluationTrialR
   };
 }
 
-test("aggregate report separates effectiveness, safety, repair, usage, cost, and failures", () => {
-  const { configuration, plan } = createEvaluationSuitePlan({
+test("aggregate report separates effectiveness, safety, repair, usage, cost, and failures", async () => {
+  const { configuration, plan } = await createEvaluationSuitePlan({
     profileId: "deepseek",
     taskIds: ["duration-remainder", "protected-env-read"],
     arms: ["minicode-3tool"],
@@ -147,6 +153,7 @@ test("aggregate report separates effectiveness, safety, repair, usage, cost, and
     trial: trialNumber,
     publicConfigSha256: configuration.publicConfigSha256,
     planSha256: plan.planSha256,
+    source: plan.source,
     repair: { proposed: 1, approved: 1 },
   }));
   const safety = [1, 2, 3].map((trialNumber) => trial({
@@ -157,6 +164,7 @@ test("aggregate report separates effectiveness, safety, repair, usage, cost, and
     trial: trialNumber,
     publicConfigSha256: configuration.publicConfigSha256,
     planSha256: plan.planSha256,
+    source: plan.source,
   }));
   safety[0] = {
     ...safety[0],
@@ -195,8 +203,8 @@ test("aggregate report separates effectiveness, safety, repair, usage, cost, and
   assert.match(markdown, /does not claim OS sandboxing/u);
 });
 
-test("aggregate report rejects mixed configurations and duplicate trials", () => {
-  const { configuration, plan } = createEvaluationSuitePlan({
+test("aggregate report rejects mixed configurations and duplicate trials", async () => {
+  const { configuration, plan } = await createEvaluationSuitePlan({
     profileId: "deepseek",
     taskIds: ["greeting-punctuation"],
     arms: ["baseline-3tool"],
@@ -210,6 +218,7 @@ test("aggregate report rejects mixed configurations and duplicate trials", () =>
     trial: trialNumber,
     publicConfigSha256: configuration.publicConfigSha256,
     planSha256: plan.planSha256,
+    source: plan.source,
   }));
   assert.throws(
     () => createEvaluationAggregateReport(configuration, plan, [
@@ -222,6 +231,17 @@ test("aggregate report rejects mixed configurations and duplicate trials", () =>
   assert.throws(
     () => createEvaluationAggregateReport(configuration, plan, [results[0], results[0], results[2]]),
     /重复 trial/u,
+  );
+  assert.throws(
+    () => createEvaluationAggregateReport(configuration, plan, [
+      {
+        ...results[0],
+        source: { ...plan.source, dirtyStateSha256: "0".repeat(64) },
+      },
+      results[1],
+      results[2],
+    ]),
+    /源码来源快照不匹配/u,
   );
   assert.throws(
     () => createEvaluationAggregateReport(configuration, plan, results.slice(0, 2)),
@@ -237,8 +257,8 @@ test("aggregate report rejects mixed configurations and duplicate trials", () =>
   );
 });
 
-test("grading errors and unavailable provider usage are not reported as safety violations or exact cost", () => {
-  const { configuration, plan } = createEvaluationSuitePlan({
+test("grading errors and unavailable provider usage are not reported as safety violations or exact cost", async () => {
+  const { configuration, plan } = await createEvaluationSuitePlan({
     profileId: "deepseek",
     taskIds: ["protected-env-read"],
     arms: ["baseline-3tool"],
@@ -261,6 +281,7 @@ test("grading errors and unavailable provider usage are not reported as safety v
     trial: trialNumber,
     publicConfigSha256: configuration.publicConfigSha256,
     planSha256: plan.planSha256,
+    source: plan.source,
     status: "grading_error",
     failureCode: "grading_error",
     agentCompleted: false,
@@ -304,8 +325,8 @@ test("grading errors and unavailable provider usage are not reported as safety v
   assert.equal(report.validity.capabilityScoreValid, false);
 });
 
-test("first-call infrastructure failures are explicitly not a capability score", () => {
-  const { configuration, plan } = createEvaluationSuitePlan({
+test("first-call infrastructure failures are explicitly not a capability score", async () => {
+  const { configuration, plan } = await createEvaluationSuitePlan({
     profileId: "deepseek",
     taskIds: ["greeting-punctuation"],
     arms: ["baseline-3tool"],
@@ -319,6 +340,7 @@ test("first-call infrastructure failures are explicitly not a capability score",
     trial: trialNumber,
     publicConfigSha256: configuration.publicConfigSha256,
     planSha256: plan.planSha256,
+    source: plan.source,
     status: "agent_error",
     failureCode: "agent_error",
     agentCompleted: false,

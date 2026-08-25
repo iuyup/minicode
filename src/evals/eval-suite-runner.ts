@@ -32,6 +32,11 @@ import {
   runEvaluationTrial,
   type EvaluationTrialResult,
 } from "./eval-runner.ts";
+import {
+  captureEvaluationSourceProvenance,
+  sameEvaluationSourceProvenance,
+  type EvaluationSourceProvenance,
+} from "./eval-provenance.ts";
 import { evaluationTasks, getEvaluationTask } from "./task-definitions.ts";
 
 type EvaluationProfileId = "deepseek" | "openai-compatible";
@@ -46,6 +51,7 @@ export interface EvaluationSuitePlan {
   planSha256: string;
   profileId: EvaluationProfileId;
   publicConfigSha256: string;
+  source: EvaluationSourceProvenance;
   tasks: readonly string[];
   arms: readonly EvaluationArm[];
   trialsPerCell: typeof EVALUATION_TRIALS;
@@ -125,11 +131,12 @@ function selectedArms(arms: readonly EvaluationArm[] | undefined): EvaluationArm
   return selected;
 }
 
-export function createEvaluationSuitePlan(
+export async function createEvaluationSuitePlan(
   options: CreateEvaluationSuitePlanOptions,
-): { plan: EvaluationSuitePlan; configuration: EvaluationConfig } {
+): Promise<{ plan: EvaluationSuitePlan; configuration: EvaluationConfig }> {
   const tasks = selectedTasks(options.taskIds);
   const arms = selectedArms(options.arms);
+  const source = await captureEvaluationSourceProvenance();
   const configuration = createEvaluationConfig({
     profileId: options.profileId,
     environment: options.environment,
@@ -146,6 +153,7 @@ export function createEvaluationSuitePlan(
   const planWithoutHash = {
     profileId: options.profileId,
     publicConfigSha256: configuration.publicConfigSha256,
+    source,
     tasks,
     arms,
     trialsPerCell: EVALUATION_TRIALS,
@@ -219,6 +227,7 @@ function publicTrialIndex(
     arm: result.arm,
     trial: result.trial,
     planSha256: result.planSha256,
+    source: result.source,
     trialConfirmationSha256: result.trialConfirmationSha256,
     status: result.status,
     failureCode: result.failureCode,
@@ -236,10 +245,14 @@ function publicTrialIndex(
 export async function runEvaluationSuite(
   options: RunEvaluationSuiteOptions,
 ): Promise<EvaluationSuiteRunResult> {
-  const { plan, configuration } = createEvaluationSuitePlan(options);
+  const { plan, configuration } = await createEvaluationSuitePlan(options);
   const confirmedPlanSha256 = options.confirmRealModel;
   if (confirmedPlanSha256 !== plan.planSha256) {
     throw new Error("真实模型评测确认摘要与当前矩阵不一致；尚未读取 API Key，也未发送网络请求。");
+  }
+  const currentSource = await captureEvaluationSourceProvenance();
+  if (!sameEvaluationSourceProvenance(plan.source, currentSource)) {
+    throw new Error("评测源码来源快照已改变；尚未读取 API Key，也未发送网络请求。");
   }
   const factory = options.modelFactory ?? builtInModelFactory(
     options.profileId,
@@ -279,6 +292,7 @@ export async function runEvaluationSuite(
       const result = await runEvaluationTrial({
         ...entry,
         profileId: options.profileId,
+        source: plan.source,
         publicConfigSha256: configuration.publicConfigSha256,
         confirmation: {
           planSha256: plan.planSha256,

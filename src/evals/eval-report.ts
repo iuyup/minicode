@@ -17,6 +17,11 @@ import {
   hashEvaluationTrialConfirmation,
   type EvaluationTrialResult,
 } from "./eval-runner.ts";
+import {
+  assertEvaluationSourceProvenance,
+  sameEvaluationSourceProvenance,
+  type EvaluationSourceProvenance,
+} from "./eval-provenance.ts";
 import { getEvaluationTask } from "./task-definitions.ts";
 
 export interface EvaluationRateSummary {
@@ -30,6 +35,7 @@ export interface EvaluationReportPlan {
   planSha256: string;
   profileId: "deepseek" | "openai-compatible";
   publicConfigSha256: string;
+  source: EvaluationSourceProvenance;
   tasks: readonly string[];
   arms: readonly string[];
   trialsPerCell: number;
@@ -46,6 +52,7 @@ export function hashEvaluationReportPlan(
   const material = {
     profileId: plan.profileId,
     publicConfigSha256: plan.publicConfigSha256,
+    source: plan.source,
     tasks: plan.tasks,
     arms: plan.arms,
     trialsPerCell: plan.trialsPerCell,
@@ -59,9 +66,10 @@ export function hashEvaluationReportPlan(
 }
 
 export interface EvaluationAggregateReport {
-  schemaVersion: 1;
+  schemaVersion: 2;
   generatedAt: string;
   publicConfigSha256: string;
+  source: EvaluationSourceProvenance;
   matrix: {
     planSha256: string;
     tasks: readonly string[];
@@ -318,6 +326,7 @@ export function createEvaluationAggregateReport(
   if (plan.publicConfigSha256 !== configuration.publicConfigSha256) {
     throw new Error("评测 plan 与 public config 摘要不匹配。");
   }
+  assertEvaluationSourceProvenance(plan.source);
   const { planSha256: _claimedPlanHash, ...planWithoutHash } = plan;
   if (plan.planSha256 !== hashEvaluationReportPlan(planWithoutHash)) {
     throw new Error("评测 plan SHA-256 与矩阵内容不匹配。");
@@ -365,6 +374,9 @@ export function createEvaluationAggregateReport(
     }
     if (result.planSha256 !== plan.planSha256) {
       throw new Error(`trial ${result.taskId}/${result.arm}/${result.trial} 的计划摘要不匹配。`);
+    }
+    if (!sameEvaluationSourceProvenance(result.source, plan.source)) {
+      throw new Error(`trial ${result.taskId}/${result.arm}/${result.trial} 的源码来源快照不匹配。`);
     }
     const expectedTrialConfirmation = hashEvaluationTrialConfirmation({
       planSha256: plan.planSha256,
@@ -444,9 +456,10 @@ export function createEvaluationAggregateReport(
   }).length;
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt: new Date(generatedAt).toISOString(),
     publicConfigSha256: configuration.publicConfigSha256,
+    source: plan.source,
     matrix: {
       planSha256: plan.planSha256,
       tasks: [...plan.tasks],
@@ -562,6 +575,9 @@ export function renderEvaluationReportMarkdown(report: EvaluationAggregateReport
     `- Model: ${report.model.model} (${report.model.profileId})`,
     `- Config SHA-256: \`${report.publicConfigSha256}\``,
     `- Plan SHA-256: \`${report.matrix.planSha256}\``,
+    `- Source commit: \`${report.source.sourceCommit}\``,
+    `- Source dirty: \`${report.source.dirty}\``,
+    `- Dirty-state SHA-256: \`${report.source.dirtyStateSha256}\``,
     `- Matrix: ${report.matrix.tasks.length} task(s) × ${report.matrix.arms.length} arm(s) × ${report.matrix.trialsPerCell} trials = ${report.matrix.totalTrials}`,
     `- Tasks: ${report.matrix.tasks.join(", ")}`,
     `- Arms: ${report.matrix.arms.join(", ")}`,

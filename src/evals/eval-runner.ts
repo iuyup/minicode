@@ -26,6 +26,10 @@ import {
   type EvaluationGradeResult,
 } from "./eval-grader.ts";
 import {
+  assertEvaluationSourceProvenance,
+  type EvaluationSourceProvenance,
+} from "./eval-provenance.ts";
+import {
   EVALUATION_SUITE_ID,
   EVALUATION_SUITE_VERSION,
 } from "./task-definitions.ts";
@@ -40,6 +44,15 @@ const PUBLIC_TOOL_NAMES = new Set([
 ]);
 const PUBLIC_ACTIONS = new Set(["check", "diff", "staged_diff", "status", "test"]);
 const PUBLIC_FINISH_REASONS = new Set(["stop", "tool_calls", "length", "content_filter"]);
+const PUBLIC_STOP_REASON_CODES = new Set([
+  "cancelled",
+  "model_request_failed",
+  "post_patch_verification_missing",
+  "repair_incomplete",
+  "max_model_requests_without_final",
+  "policy_or_phase_stop",
+  "other",
+]);
 const MODEL_ERROR_CATEGORY_SET = new Set<string>(MODEL_ERROR_CATEGORIES);
 const TRIAL_STATUSES = new Set([
   "passed", "failed", "agent_error", "timed_out", "cancelled", "grading_error",
@@ -113,7 +126,7 @@ export interface EvaluationTrialModelMetrics {
 type PublicGradeResult = Omit<EvaluationGradeResult, "graderArtifactsDirectory">;
 
 export interface EvaluationTrialResult {
-  schemaVersion: 1;
+  schemaVersion: 2;
   suite: {
     id: typeof EVALUATION_SUITE_ID;
     version: typeof EVALUATION_SUITE_VERSION;
@@ -126,6 +139,7 @@ export interface EvaluationTrialResult {
   profileId: EvaluationProfileId;
   planSha256: string;
   publicConfigSha256: string;
+  source: EvaluationSourceProvenance;
   trialConfirmationSha256: string;
   fixtureSha256: string;
   taskSpecSha256: string;
@@ -152,6 +166,7 @@ export interface RunEvaluationTrialOptions {
   arm: EvaluationArm;
   trial: number;
   profileId: EvaluationProfileId;
+  source: EvaluationSourceProvenance;
   publicConfigSha256: string;
   confirmation: EvaluationTrialConfirmation;
   runRoot: string;
@@ -204,6 +219,7 @@ function validateOptions(options: RunEvaluationTrialOptions): void {
   if (!SHA256_PATTERN.test(options.publicConfigSha256)) {
     throw new Error("publicConfigSha256 必须是 64 位小写 SHA-256。");
   }
+  assertEvaluationSourceProvenance(options.source);
   if (!(EVALUATION_ARMS as readonly string[]).includes(options.arm)) {
     throw new Error("未知评测 arm。");
   }
@@ -434,13 +450,15 @@ function publicAuditEvent(
   if (typeof record.toolName === "string") output.toolName = publicToolName(record.toolName);
   for (const key of [
     "decision", "planDecision", "repairDecision", "editDecision", "commandDecision",
-    "commandKind", "riskLevel", "status", "action", "forcedToolName",
+    "commandKind", "riskLevel", "status", "action", "forcedToolName", "stopReasonCode",
   ]) {
     if (typeof record[key] === "string") {
       output[key] = key === "forcedToolName"
         ? publicToolName(record[key] as string)
         : key === "action"
           ? PUBLIC_ACTIONS.has(record[key] as string) ? record[key] : "other"
+          : key === "stopReasonCode"
+            ? PUBLIC_STOP_REASON_CODES.has(record[key] as string) ? record[key] : "other"
           : record[key];
     }
   }
@@ -573,7 +591,7 @@ function parseTrialResult(value: unknown): EvaluationTrialResult {
     throw new Error("trial-result.json 不是对象。");
   }
   const candidate = value as Partial<EvaluationTrialResult>;
-  if (candidate.schemaVersion !== 1 || typeof candidate.taskId !== "string" ||
+  if (candidate.schemaVersion !== 2 || typeof candidate.taskId !== "string" ||
       typeof candidate.planSha256 !== "string" || !SHA256_PATTERN.test(candidate.planSha256) ||
       typeof candidate.publicConfigSha256 !== "string" ||
       !SHA256_PATTERN.test(candidate.publicConfigSha256) ||
@@ -588,6 +606,7 @@ function parseTrialResult(value: unknown): EvaluationTrialResult {
     throw new Error("trial-result.json 格式无效。");
   }
   const result = candidate as EvaluationTrialResult;
+  assertEvaluationSourceProvenance(result.source);
   if (result.trialConfirmationSha256 !== hashEvaluationTrialConfirmation({
     planSha256: result.planSha256,
     publicConfigSha256: result.publicConfigSha256,
@@ -824,7 +843,7 @@ export async function runEvaluationTrial(
       ? publicGradeResult(grade, preparedFixture.task.allowedChangedFiles)
       : null;
     return {
-      schemaVersion: 1,
+      schemaVersion: 2,
       suite: { id: EVALUATION_SUITE_ID, version: EVALUATION_SUITE_VERSION },
       taskId: preparedFixture.task.id,
       category: preparedFixture.task.category,
@@ -834,6 +853,7 @@ export async function runEvaluationTrial(
       profileId: options.profileId,
       planSha256: options.confirmation.planSha256,
       publicConfigSha256: options.publicConfigSha256,
+      source: options.source,
       trialConfirmationSha256: options.confirmation.trialSha256,
       fixtureSha256: preparedFixture.marker.fixtureSha256,
       taskSpecSha256: preparedFixture.marker.taskSpecSha256,

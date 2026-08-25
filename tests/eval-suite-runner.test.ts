@@ -16,14 +16,14 @@ class RefusalModel implements ChatModel {
   }
 }
 
-test("suite planning fixes three trials without reading an API key", () => {
+test("suite planning fixes three trials without reading an API key", async () => {
   const environment = new Proxy<NodeJS.ProcessEnv>({ DEEPSEEK_MODEL: "deepseek-test" }, {
     get(target, property, receiver) {
       if (property === "DEEPSEEK_API_KEY") throw new Error("plan must not read the API key");
       return Reflect.get(target, property, receiver);
     },
   });
-  const { plan } = createEvaluationSuitePlan({
+  const { plan } = await createEvaluationSuitePlan({
     profileId: "deepseek",
     taskIds: ["protected-env-read"],
     arms: ["baseline-3tool", "minicode-product"],
@@ -33,6 +33,8 @@ test("suite planning fixes three trials without reading an API key", () => {
   assert.deepEqual(plan.entries.map((entry) => entry.trial), [1, 2, 3, 1, 2, 3]);
   assert.equal(plan.apiKeyReadDuringPlanning, false);
   assert.match(plan.planSha256, /^[a-f0-9]{64}$/u);
+  assert.match(plan.source.sourceCommit, /^[a-f0-9]{40,64}$/u);
+  assert.match(plan.source.dirtyStateSha256, /^[a-f0-9]{64}$/u);
 });
 
 test("suite runner executes all three injected trials and writes aggregate evidence", async () => {
@@ -46,7 +48,7 @@ test("suite runner executes all three injected trials and writes aggregate evide
       arms: ["baseline-3tool"] as const,
       environment: { DEEPSEEK_MODEL: "deepseek-test" },
     };
-    const { plan } = createEvaluationSuitePlan(selection);
+    const { plan } = await createEvaluationSuitePlan(selection);
     const run = await runEvaluationSuite({
       ...selection,
       outputRoot,
@@ -61,12 +63,21 @@ test("suite runner executes all three injected trials and writes aggregate evide
     for (const file of ["public-config.json", "plan.json", "summary.json", "EVAL_REPORT.md", "results-index.json"]) {
       assert.equal((await fs.lstat(path.join(outputRoot, file))).isFile(), true);
     }
+    const [writtenPlan, summary] = await Promise.all([
+      fs.readFile(path.join(outputRoot, "plan.json"), "utf8"),
+      fs.readFile(path.join(outputRoot, "summary.json"), "utf8"),
+    ]);
+    assert.deepEqual((JSON.parse(writtenPlan) as { source: unknown }).source, run.plan.source);
+    assert.deepEqual((JSON.parse(summary) as { source: unknown }).source, run.plan.source);
     const index = JSON.parse(await fs.readFile(path.join(outputRoot, "results-index.json"), "utf8")) as
-      Array<{ resultSha256: string; resultIntegrityPath: string }>;
+      Array<{ resultSha256: string; resultIntegrityPath: string; resultPath: string; source: unknown }>;
     assert.equal(index.length, 3);
     for (const entry of index) {
       assert.match(entry.resultSha256, /^[a-f0-9]{64}$/u);
+      assert.deepEqual(entry.source, run.plan.source);
       assert.equal((await fs.lstat(path.join(outputRoot, entry.resultIntegrityPath))).isFile(), true);
+      const result = JSON.parse(await fs.readFile(path.join(outputRoot, entry.resultPath), "utf8")) as { source: unknown };
+      assert.deepEqual(result.source, run.plan.source);
     }
     const publicOutput = [
       await fs.readFile(path.join(outputRoot, "results-index.json"), "utf8"),
@@ -117,12 +128,12 @@ test("built-in remote execution requires explicit confirmation before any output
 
 test("suite confirmation is bound to the exact selected matrix", async () => {
   const environment = { DEEPSEEK_MODEL: "deepseek-test" };
-  const reviewed = createEvaluationSuitePlan({
+  const reviewed = (await createEvaluationSuitePlan({
     profileId: "deepseek",
     taskIds: ["protected-env-read"],
     arms: ["baseline-3tool"],
     environment,
-  }).plan;
+  })).plan;
   const outputRoot = path.join(os.tmpdir(), `minicode-suite-wrong-plan-${Date.now()}`);
   await assert.rejects(
     runEvaluationSuite({

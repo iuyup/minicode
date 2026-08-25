@@ -455,6 +455,11 @@ export class AgentLoop {
     let repairOriginalCheckRequired = false;
     let postPatchTestRequired = false;
     let sameTurnRecoveryStepGranted = false;
+    // 受限验证 / Git 收尾阶段的一次本地拒绝，不能让可选收尾挤掉最终回答。
+    // 恢复只跳过可选 Git，不增加任何工具额度，也只允许触发一次。
+    let closeoutRecoveryUsed = false;
+    let closeoutRecoveryAwaitingVerification = false;
+    let closeoutRecoveryFinalOnly = false;
     let maximumStep = this.#maxSteps;
     let maximumToolCalls = this.#maxToolCalls;
     const extendModelRequestLimit = (value: number, increment: number): number =>
@@ -480,6 +485,7 @@ export class AgentLoop {
         const isRepairPlanningTurn = repairState === "planning";
         const isRepairFinalTurn = repairState === "final_only";
         const isRepairCompletedTurn = repairState === "completed";
+        const isCloseoutRecoveryFinalOnlyTurn = closeoutRecoveryFinalOnly;
         const isToolBudgetFinalTurn = this.#finalOnlyAfterToolBudget && acceptedToolCalls >= maximumToolCalls;
         const mustVerifyPatchNow = this.#requirePostPatchTest && postPatchTestRequired && (
           repairState === "idle" || (repairState === "executing" && repairPatchSucceeded)
@@ -490,7 +496,7 @@ export class AgentLoop {
             ? failedRepairAction
             : undefined;
         const baseAvailableTools: ToolDescription[] = isPlanningTurn || isRepairPlanningTurn ||
-          isRepairFinalTurn || isRepairCompletedTurn ||
+          isRepairFinalTurn || isRepairCompletedTurn || isCloseoutRecoveryFinalOnlyTurn ||
           isSourceEvidenceFinalTurn || isToolBudgetFinalTurn
           ? []
           : this.getAvailableToolDescriptions(
@@ -511,12 +517,13 @@ export class AgentLoop {
           ? stateAvailableTools.filter((tool) => tool.name === "run_project_check")
           : stateAvailableTools;
         const toolChoice: ForcedFunctionToolChoice | undefined =
-          (this.#requireSourceEvidence || requiredProjectCheckAction !== undefined) &&
+          (this.#requireSourceEvidence || requiredProjectCheckAction !== undefined || repairState === "post_repair") &&
             availableTools.length === 1
           ? { type: "function" as const, name: availableTools[0].name }
           : undefined;
         const allowedToolNames: ReadonlySet<string> | undefined = this.#requireSourceEvidence ||
-            requiredProjectCheckAction !== undefined || repairState === "executing" || repairState === "post_repair"
+            requiredProjectCheckAction !== undefined || repairState === "executing" || repairState === "post_repair" ||
+            isCloseoutRecoveryFinalOnlyTurn
           ? new Set(availableTools.map((tool) => tool.name))
           : undefined;
         this.recordEvent(events, {
@@ -638,6 +645,13 @@ export class AgentLoop {
 
         if (isRepairCompletedTurn && response.kind === "tool_calls") {
           const reason = "修复复验与 Git 收尾额度已经完成，本轮只能给出最终回答。";
+          rejectToolResponse(reason);
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          throw new Error(reason);
+        }
+
+        if (isCloseoutRecoveryFinalOnlyTurn && response.kind === "tool_calls") {
+          const reason = "受限阶段的本地拒绝后，已跳过可选 Git 收尾；本轮只能给出最终回答。";
           rejectToolResponse(reason);
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
@@ -799,6 +813,7 @@ export class AgentLoop {
         const deferredRuntimeMessages: string[] = [];
         for (const [toolCallIndex, toolCall] of response.toolCalls.entries()) {
           const rejectedForCancellation = options.signal?.aborted === true;
+          const localPolicyCheckBeforeCall = remainingToolCallBlockReason === undefined;
           const rejectionReason: string | undefined = remainingToolCallBlockReason ?? (
             rejectedForCancellation
               ? cancellationReason()
@@ -841,6 +856,34 @@ export class AgentLoop {
           ) {
             sameTurnRecoveryStepGranted = true;
             maximumStep = extendModelRequestLimit(maximumStep, 1);
+          }
+          if (
+            rejectionReason !== undefined &&
+            !rejectedForCancellation &&
+            localPolicyCheckBeforeCall &&
+            !closeoutRecoveryUsed &&
+            (requiredProjectCheckAction !== undefined || repairState === "post_repair")
+          ) {
+            closeoutRecoveryUsed = true;
+            if (requiredProjectCheckAction !== undefined) {
+              closeoutRecoveryAwaitingVerification = true;
+              maximumStep = Math.min(
+                this.#hardMaxModelRequests,
+                Math.max(maximumStep, addToLimit(step, 2)),
+              );
+              deferredRuntimeMessages.push(
+                "上一条工具请求未通过本地阶段校验。下一轮仍只能执行当前固定验证；验证成功后将跳过可选 Git 收尾，并在无工具轮给出最终回答。",
+              );
+            } else {
+              closeoutRecoveryFinalOnly = true;
+              maximumStep = Math.min(
+                this.#hardMaxModelRequests,
+                Math.max(maximumStep, addToLimit(step, 1)),
+              );
+              deferredRuntimeMessages.push(
+                "上一条 Git 收尾工具请求未通过本地阶段校验。修复和验证已完成；将跳过剩余可选 Git 收尾，下一轮只能给出最终回答。",
+              );
+            }
           }
           if (
             !rejectionReason &&
@@ -984,6 +1027,18 @@ export class AgentLoop {
           }
           if (!rejectionReason && postPatchTestRequired && isExecutedProjectTestSuccess(result)) {
             postPatchTestRequired = false;
+          }
+          if (
+            closeoutRecoveryAwaitingVerification &&
+            !postPatchTestRequired &&
+            !repairOriginalCheckRequired
+          ) {
+            closeoutRecoveryAwaitingVerification = false;
+            closeoutRecoveryFinalOnly = true;
+            maximumStep = Math.min(
+              this.#hardMaxModelRequests,
+              Math.max(maximumStep, addToLimit(step, 1)),
+            );
           }
           if (repairState === "post_repair" && postRepairGitToolCalls >= MAX_POST_REPAIR_GIT_TOOL_CALLS) {
             repairState = "completed";

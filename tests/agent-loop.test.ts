@@ -14,7 +14,7 @@ import {
   type ModelResponse,
   type ToolExecutionResult,
 } from "../src/agent/contracts.ts";
-import { JsonlAuditLog, type AgentEvent } from "../src/agent/events.ts";
+import { JsonlAuditLog, sanitizeAgentEvent, type AgentEvent } from "../src/agent/events.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { WorkingLedger } from "../src/agent/working-ledger.ts";
 
@@ -601,6 +601,166 @@ test("a late patch leaves room for test, two Git reads, and the final answer", a
   assert.equal(projectCheck.executionCount, 1);
   assert.equal(inspectGit.executionCount, 2);
   assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("a rejected forced post-patch tool closes out after the required test without optional Git", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  const wrongTool = createCountingTool("read_file");
+  const inspectGit = createCountingTool("inspect_git");
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) return toolCallResponse("recovery-patch", "apply_patch", {});
+      if (modelCallCount === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return toolCallResponse("recovery-wrong", "read_file", {});
+      }
+      if (modelCallCount === 3) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return toolCallResponse("recovery-test", "run_project_check", { action: "test" });
+      }
+      assert.equal(modelCallCount, 4);
+      assert.deepEqual(request.tools, []);
+      return { kind: "final", content: "补丁已通过固定测试。" };
+    },
+  };
+
+  const result = await new AgentLoop(
+    model,
+    new ToolRegistry([patch.tool, projectCheck.tool, wrongTool.tool, inspectGit.tool]),
+    {
+      workspaceRoot: process.cwd(),
+      maxSteps: 1,
+      maxToolCalls: 1,
+      hardMaxModelRequests: 4,
+      hardMaxToolCalls: 2,
+      finalOnlyAfterToolBudget: true,
+      requirePostPatchTest: true,
+      requestCommandApproval: async () => true,
+    },
+  ).run("在错误的强制工具请求后仍必须先测试，再收尾。 ");
+
+  assert.equal(result.answer, "补丁已通过固定测试。");
+  assert.equal(modelCallCount, 4);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 1);
+  assert.equal(wrongTool.executionCount, 0);
+  assert.equal(inspectGit.executionCount, 0);
+  assert.equal(result.events.filter((event) => event.type === "tool_execution_started").length, 2);
+  assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("a rejected post-repair closeout skips Git and preserves the final answer", async () => {
+  const projectCheck = createProjectCheckTool(["nonzero", "success"]);
+  const patch = createCountingTool("apply_patch");
+  const inspectGit = createCountingTool("inspect_git");
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) return toolCallResponse("repair-recovery-initial", "run_project_check", { action: "test" });
+      if (modelCallCount === 2) {
+        assert.equal(request.phase, "repair_planning");
+        assert.deepEqual(request.tools, []);
+        return { kind: "final", content: "应用一次最小补丁并运行固定测试。" };
+      }
+      if (modelCallCount === 3) return toolCallResponse("repair-recovery-patch", "apply_patch", {});
+      if (modelCallCount === 4) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        return toolCallResponse("repair-recovery-test", "run_project_check", { action: "test" });
+      }
+      if (modelCallCount === 5) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["inspect_git"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "inspect_git" });
+        return toolCallResponse("repair-recovery-wrong", "run_project_check", { action: "test" });
+      }
+      assert.equal(modelCallCount, 6);
+      assert.deepEqual(request.tools, []);
+      return { kind: "final", content: "修复后的固定测试已通过。" };
+    },
+  };
+
+  const result = await new AgentLoop(
+    model,
+    new ToolRegistry([projectCheck.tool, patch.tool, inspectGit.tool]),
+    {
+      workspaceRoot: process.cwd(),
+      maxSteps: 1,
+      maxToolCalls: 1,
+      hardMaxModelRequests: 6,
+      hardMaxToolCalls: 5,
+      finalOnlyAfterToolBudget: true,
+      enableFailureRepair: true,
+      requirePostPatchTest: true,
+      requestCommandApproval: async () => true,
+      requestRepairApproval: async () => true,
+    },
+  ).run("一次修复成功后，错误的 Git 收尾请求不应吞掉最终回答。 ");
+
+  assert.equal(result.answer, "修复后的固定测试已通过。");
+  assert.equal(modelCallCount, 6);
+  assert.equal(projectCheck.executionCount, 2);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(inspectGit.executionCount, 0);
+  assert.equal(result.events.at(-1)?.type, "agent_completed");
+});
+
+test("repeated forced-tool violations receive only one closeout recovery and never exceed the cap", async () => {
+  const patch = createCountingTool("apply_patch");
+  const projectCheck = createProjectCheckTool(["success"]);
+  const wrongTool = createCountingTool("read_file");
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) return toolCallResponse("repeat-patch", "apply_patch", {});
+      return toolCallResponse(`repeat-wrong-${modelCallCount}`, "read_file", {});
+    },
+  };
+
+  await assert.rejects(
+    new AgentLoop(model, new ToolRegistry([patch.tool, projectCheck.tool, wrongTool.tool]), {
+      workspaceRoot: process.cwd(),
+      maxSteps: 1,
+      maxToolCalls: 1,
+      hardMaxModelRequests: 4,
+      hardMaxToolCalls: 2,
+      finalOnlyAfterToolBudget: true,
+      requirePostPatchTest: true,
+    }).run("不得为反复违例突破硬上限。"),
+    /达到最大步数 maxSteps=4/u,
+  );
+
+  assert.equal(modelCallCount, 4);
+  assert.equal(patch.executionCount, 1);
+  assert.equal(projectCheck.executionCount, 0);
+  assert.equal(wrongTool.executionCount, 0);
+});
+
+test("sanitized stopped audits retain only a stable reason code", () => {
+  const privateReason = "模型请求失败：provider-private-body-7c1a";
+  const sanitized = sanitizeAgentEvent(
+    { type: "agent_stopped", step: 4, reason: privateReason },
+    "2026-08-25T00:00:00.000Z",
+  );
+  assert.deepEqual(sanitized, {
+    timestamp: "2026-08-25T00:00:00.000Z",
+    type: "agent_stopped",
+    step: 4,
+    stopReasonCode: "model_request_failed",
+  });
+  assert.equal(JSON.stringify(sanitized).includes(privateReason), false);
+  assert.equal(
+    sanitizeAgentEvent(
+      { type: "agent_stopped", step: 5, reason: "达到最大步数 maxSteps=18，但模型尚未给出最终回答。" },
+      "2026-08-25T00:00:00.000Z",
+    ).stopReasonCode,
+    "max_model_requests_without_final",
+  );
 });
 
 test("a rejected same-turn test is retried only after the patch result is observed", async () => {

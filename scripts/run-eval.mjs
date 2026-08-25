@@ -131,7 +131,7 @@ async function main() {
   };
   if (parsed.plan) {
     if (parsed.confirmRealModel) throw new Error("--plan 与 --confirm-real-model 不能同时使用。");
-    const { plan, configuration } = createEvaluationSuitePlan(selection);
+    const { plan, configuration } = await createEvaluationSuitePlan(selection);
     process.stdout.write(`${JSON.stringify({
       ...plan,
       model: configuration.publicConfig.model,

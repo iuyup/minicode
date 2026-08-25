@@ -161,6 +161,12 @@ class PartialUsageThenErrorModel implements ChatModel {
 }
 
 const PLAN_SHA256 = "c".repeat(64);
+const TEST_SOURCE = {
+  schemaVersion: 1 as const,
+  sourceCommit: "a".repeat(40),
+  dirty: false,
+  dirtyStateSha256: "b".repeat(64),
+};
 
 function confirmation(
   taskId: string,
@@ -209,6 +215,7 @@ test("runEvaluationTrial writes a strict grade and content-free public artifacts
       arm: "baseline-3tool",
       trial: 1,
       profileId: "deepseek",
+      source: TEST_SOURCE,
       publicConfigSha256: "a".repeat(64),
       confirmation: confirmation(task.id, "baseline-3tool", 1, "a".repeat(64)),
       runRoot: path.join(tempRoot, "run"),
@@ -223,6 +230,7 @@ test("runEvaluationTrial writes a strict grade and content-free public artifacts
     assert.equal(result.status, "passed");
     assert.equal(result.grade?.passed, true);
     assert.equal(result.planSha256, PLAN_SHA256);
+    assert.deepEqual(result.source, TEST_SOURCE);
     assert.equal(
       result.trialConfirmationSha256,
       confirmation(task.id, "baseline-3tool", 1, "a".repeat(64)).trialSha256,
@@ -298,6 +306,7 @@ test("runEvaluationTrial rejects non-formal trial numbers and oversized timeouts
     taskId: task.id,
     arm: "baseline-3tool" as const,
     profileId: "deepseek" as const,
+    source: TEST_SOURCE,
     publicConfigSha256: "b".repeat(64),
     confirmation: confirmation(task.id, "baseline-3tool", 1, "b".repeat(64)),
     runRoot: path.join(os.tmpdir(), `minicode-invalid-runner-${Date.now()}`),
@@ -329,6 +338,7 @@ test("runEvaluationTrial publishes only bounded model error diagnostics", async 
       arm: "baseline-3tool",
       trial: 1,
       profileId: "deepseek",
+      source: TEST_SOURCE,
       publicConfigSha256,
       confirmation: confirmation(task.id, "baseline-3tool", 1, publicConfigSha256),
       runRoot: path.join(tempRoot, "run"),
@@ -370,6 +380,7 @@ test("runEvaluationTrial publishes only bounded model error diagnostics", async 
     }
     assert.match(trace, /"errorCategory":"auth"/u);
     assert.match(trace, /"httpStatus":401/u);
+    assert.match(trace, /"stopReasonCode":"model_request_failed"/u);
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
@@ -387,6 +398,7 @@ test("partial provider usage never counts an unavailable call as zero tokens", a
       arm: "baseline-3tool",
       trial: 1,
       profileId: "deepseek",
+      source: TEST_SOURCE,
       publicConfigSha256,
       confirmation: confirmation(task.id, "baseline-3tool", 1, publicConfigSha256),
       runRoot: path.join(tempRoot, "run"),
@@ -419,6 +431,7 @@ test("runEvaluationTrial gives timeout and cancellation priority and leaves grad
       arm: "baseline-3tool",
       trial: 1,
       profileId: "deepseek",
+      source: TEST_SOURCE,
       publicConfigSha256: timeoutConfigSha256,
       confirmation: confirmation(task.id, "baseline-3tool", 1, timeoutConfigSha256),
       runRoot: path.join(tempRoot, "timeout"),
@@ -438,6 +451,7 @@ test("runEvaluationTrial gives timeout and cancellation priority and leaves grad
       arm: "baseline-3tool",
       trial: 1,
       profileId: "deepseek",
+      source: TEST_SOURCE,
       publicConfigSha256: cancellationConfigSha256,
       confirmation: confirmation(task.id, "baseline-3tool", 1, cancellationConfigSha256),
       runRoot: path.join(tempRoot, "cancelled"),
@@ -480,6 +494,7 @@ test("runEvaluationTrial rejects an audit replaced after the grader evidence rea
       arm: "baseline-3tool",
       trial: 1,
       profileId: "deepseek",
+      source: TEST_SOURCE,
       publicConfigSha256,
       confirmation: confirmation(task.id, "baseline-3tool", 1, publicConfigSha256),
       runRoot,

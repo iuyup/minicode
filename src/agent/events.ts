@@ -90,6 +90,18 @@ export interface AgentEventAuditLog {
   flush(): Promise<void>;
 }
 
+/**
+ * 公开审计可用的停止分类。原始 reason 可能包含模型或运行时细节，因此绝不写入审计产物。
+ */
+export type SanitizedStopReasonCode =
+  | "cancelled"
+  | "model_request_failed"
+  | "post_patch_verification_missing"
+  | "repair_incomplete"
+  | "max_model_requests_without_final"
+  | "policy_or_phase_stop"
+  | "other";
+
 export interface SanitizedAuditEvent {
   timestamp: string;
   type: AgentEvent["type"];
@@ -119,6 +131,23 @@ export interface SanitizedAuditEvent {
   directionLength?: number;
   previewLength?: number;
   cancelled?: boolean;
+  stopReasonCode?: SanitizedStopReasonCode;
+}
+
+function sanitizedStopReasonCode(reason: string): SanitizedStopReasonCode {
+  if (reason.startsWith("任务已取消")) return "cancelled";
+  if (reason.startsWith("模型请求失败：")) return "model_request_failed";
+  if (reason.startsWith("补丁尚未通过后续 run_project_check")) {
+    return "post_patch_verification_missing";
+  }
+  if (reason.startsWith("修复尚未") || reason.startsWith("一次修复") || reason.startsWith("一次有界修复")) {
+    return "repair_incomplete";
+  }
+  if (reason.startsWith("达到最大步数 maxSteps=")) return "max_model_requests_without_final";
+  if (reason.includes("阶段") || reason.includes("只能") || reason.includes("预算")) {
+    return "policy_or_phase_stop";
+  }
+  return "other";
 }
 
 function sanitizeMetadata(metadata: ToolExecutionMetadata | undefined): ToolExecutionMetadata | undefined {
@@ -217,8 +246,9 @@ export function sanitizeAgentEvent(
     case "repair_decision":
       return { ...base, repairDecision: event.decision };
     case "agent_completed":
-    case "agent_stopped":
       return base;
+    case "agent_stopped":
+      return { ...base, stopReasonCode: sanitizedStopReasonCode(event.reason) };
   }
 }
 
