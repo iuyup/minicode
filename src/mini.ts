@@ -86,6 +86,40 @@ export interface SessionPendingApproval {
   readonly prompt: string;
 }
 
+export type TaskCloseoutOutcome = "completed" | "cancelled" | "stopped" | "failed";
+export type TaskCloseoutVerificationStatus = "passed" | "failed" | "cancelled" | "not_run";
+export type TaskCloseoutGitAction = "status" | "diff" | "staged_diff";
+export type TaskCloseoutExecutionStatus = "completed" | "failed" | "cancelled";
+
+export interface TaskCloseoutVerification {
+  readonly action: string;
+  readonly attempts: number;
+  readonly status: TaskCloseoutVerificationStatus;
+  readonly exitCode?: number | null;
+  readonly timedOut: boolean;
+  readonly cancelled: boolean;
+}
+
+export interface TaskCloseoutGitInspection {
+  readonly action: TaskCloseoutGitAction;
+  readonly status: TaskCloseoutExecutionStatus;
+}
+
+/** 只由已完成的本轮生命周期事件投影出的收口事实，不包含工具正文或停止原因。 */
+export interface TaskCloseoutView {
+  readonly outcome: TaskCloseoutOutcome;
+  readonly eventCount: number;
+  readonly successfulTools: number;
+  readonly failedTools: number;
+  readonly cancelledTools: number;
+  readonly appliedPaths: readonly string[];
+  readonly proposedPatchCount: number;
+  readonly rejectedPatchCount: number;
+  readonly verification?: TaskCloseoutVerification;
+  readonly gitInspections: readonly TaskCloseoutGitInspection[];
+  readonly auditFileName: string;
+}
+
 /** 展示专用快照；审批 Promise 及其 resolve 永远不暴露给展示层。 */
 export interface SessionViewState {
   readonly phase: SessionPhase;
@@ -94,6 +128,7 @@ export interface SessionViewState {
   readonly activityExpanded: boolean;
   readonly plan?: string;
   readonly pendingApproval?: SessionPendingApproval;
+  readonly closeout?: TaskCloseoutView;
 }
 
 const APPROVAL_SPECS = {
@@ -402,6 +437,225 @@ function phaseForAgentEvent(event: AgentEvent): SessionPhase | undefined {
   }
 }
 
+type ToolFinalizedEvent = Extract<AgentEvent, { type: "tool_finalized" }>;
+type TerminalAgentEvent = Extract<AgentEvent, { type: "agent_completed" | "agent_stopped" }>;
+
+function terminalOutcome(event: TerminalAgentEvent): TaskCloseoutOutcome {
+  if (event.type === "agent_completed") return "completed";
+  return /取消/u.test(event.reason) ? "cancelled" : "stopped";
+}
+
+function executionStatus(event: ToolFinalizedEvent): TaskCloseoutExecutionStatus {
+  if (event.metadata?.cancelled === true) return "cancelled";
+  return event.status === "success" ? "completed" : "failed";
+}
+
+function gitActionFromMetadata(action: string | undefined): TaskCloseoutGitAction | undefined {
+  switch (action) {
+    case "git_status":
+      return "status";
+    case "git_diff":
+      return "diff";
+    case "git_staged_diff":
+      return "staged_diff";
+    default:
+      return undefined;
+  }
+}
+
+function deriveTaskCloseout(
+  events: readonly AgentEvent[],
+  auditPath: string,
+  executionMode: CliArguments["executionMode"],
+  fallbackOutcome?: TaskCloseoutOutcome,
+): TaskCloseoutView {
+  const terminalEvent = events.findLast(
+    (event): event is TerminalAgentEvent => event.type === "agent_completed" || event.type === "agent_stopped",
+  );
+  const finalized = events.filter(
+    (event): event is ToolFinalizedEvent => event.type === "tool_finalized",
+  );
+  const successfulPatchIds = new Set(
+    finalized
+      .filter((event) => event.toolName === "apply_patch" && event.status === "success")
+      .map((event) => event.toolCallId),
+  );
+  const approvedPatchPaths = new Map<string, string>();
+  const rejectedPatchIds = new Set<string>();
+  for (const event of events) {
+    if (event.type !== "edit_approval_decision") continue;
+    if (event.decision === "approved") approvedPatchPaths.set(event.toolCallId, event.path);
+    else rejectedPatchIds.add(event.toolCallId);
+  }
+  const appliedPaths = executionMode === "apply"
+    ? [...new Set(
+        [...approvedPatchPaths]
+          .filter(([toolCallId]) => successfulPatchIds.has(toolCallId))
+          .map(([, pathValue]) => pathValue),
+      )]
+    : [];
+  const proposedPatchCount = executionMode === "propose"
+    ? successfulPatchIds.size
+    : 0;
+
+  const verificationEvents = finalized.filter((event) => event.toolName === "run_project_check");
+  const lastVerification = verificationEvents.at(-1);
+  const verificationStartedIds = new Set(
+    events
+      .filter(
+        (event): event is Extract<AgentEvent, { type: "tool_execution_started" }> =>
+          event.type === "tool_execution_started",
+      )
+      .filter((event) => event.toolName === "run_project_check")
+      .map((event) => event.toolCallId),
+  );
+  const rejectedCommandIds = new Set(
+    events
+      .filter(
+        (event): event is Extract<AgentEvent, { type: "command_approval_decision" }> =>
+          event.type === "command_approval_decision",
+      )
+      .filter((event) => event.decision === "rejected")
+      .map((event) => event.toolCallId),
+  );
+  const rejectedVerificationIds = new Set(
+    events
+      .filter(
+        (event): event is Extract<AgentEvent, { type: "command_approval_decision" }> =>
+          event.type === "command_approval_decision",
+      )
+      .filter((event) => event.commandKind === "verification" && event.decision === "rejected")
+      .map((event) => event.toolCallId),
+  );
+  const verification = lastVerification
+    ? (() => {
+        const cancelled = lastVerification.metadata?.cancelled === true ||
+          rejectedVerificationIds.has(lastVerification.toolCallId);
+        return {
+          action: lastVerification.metadata?.action ?? "固定验证",
+          attempts: verificationEvents.length,
+          status: !verificationStartedIds.has(lastVerification.toolCallId)
+            ? "not_run"
+            : cancelled
+              ? "cancelled"
+              : lastVerification.status === "success" && lastVerification.metadata?.exitCode === 0
+                ? "passed"
+                : "failed",
+          ...(lastVerification.metadata?.exitCode !== undefined
+            ? { exitCode: lastVerification.metadata.exitCode }
+            : {}),
+          timedOut: lastVerification.metadata?.timedOut === true,
+          cancelled,
+        } satisfies TaskCloseoutVerification;
+      })()
+    : undefined;
+
+  const gitInspections = new Map<TaskCloseoutGitAction, TaskCloseoutExecutionStatus>();
+  for (const event of finalized) {
+    if (event.toolName !== "inspect_git") continue;
+    const action = gitActionFromMetadata(event.metadata?.action);
+    if (action) gitInspections.set(action, executionStatus(event));
+  }
+
+  const cancelledTools = finalized.filter((event) =>
+    event.status === "error" && (
+      event.metadata?.cancelled === true ||
+      rejectedPatchIds.has(event.toolCallId) ||
+      rejectedCommandIds.has(event.toolCallId)
+    )
+  ).length;
+  const failedTools = finalized.filter(
+    (event) =>
+      event.status === "error" &&
+      event.metadata?.cancelled !== true &&
+      !rejectedPatchIds.has(event.toolCallId) &&
+      !rejectedCommandIds.has(event.toolCallId),
+  ).length;
+  return {
+    outcome: fallbackOutcome ?? (terminalEvent ? terminalOutcome(terminalEvent) : "failed"),
+    eventCount: events.length,
+    successfulTools: finalized.filter((event) => event.status === "success").length,
+    failedTools,
+    cancelledTools,
+    appliedPaths,
+    proposedPatchCount,
+    rejectedPatchCount: rejectedPatchIds.size,
+    ...(verification ? { verification } : {}),
+    gitInspections: [...gitInspections].map(([action, status]) => ({ action, status })),
+    auditFileName: path.basename(auditPath),
+  };
+}
+
+function closeoutOutcomeLabel(outcome: TaskCloseoutOutcome): string {
+  switch (outcome) {
+    case "completed":
+      return green("已完成");
+    case "cancelled":
+      return yellow("已取消");
+    case "stopped":
+      return yellow("未完成");
+    case "failed":
+      return red("失败");
+  }
+}
+
+function closeoutExecutionLabel(status: TaskCloseoutExecutionStatus): string {
+  switch (status) {
+    case "completed":
+      return "已读取";
+    case "cancelled":
+      return "已取消";
+    case "failed":
+      return "失败";
+  }
+}
+
+function closeoutGitActionLabel(action: TaskCloseoutGitAction): string {
+  switch (action) {
+    case "status":
+      return "状态";
+    case "diff":
+      return "差异";
+    case "staged_diff":
+      return "暂存差异";
+  }
+}
+
+function renderCloseoutModification(closeout: TaskCloseoutView): string {
+  if (closeout.appliedPaths.length > 0) {
+    const paths = closeout.appliedPaths.slice(0, 2).map(escapeTerminalText).join("、");
+    const remainder = closeout.appliedPaths.length > 2 ? ` 等 ${closeout.appliedPaths.length - 2} 个文件` : "";
+    return `修改：本任务已写入 ${closeout.appliedPaths.length} 个文件：${paths}${remainder}`;
+  }
+  if (closeout.proposedPatchCount > 0) {
+    return `修改：仅生成 ${closeout.proposedPatchCount} 个补丁预览，未写入`;
+  }
+  if (closeout.rejectedPatchCount > 0) return "修改：补丁未写入（未获确认）";
+  return "修改：未写入补丁";
+}
+
+function renderCloseoutVerification(closeout: TaskCloseoutView): string {
+  const verification = closeout.verification;
+  if (!verification) return "验证：未请求固定验证";
+  const action = escapeTerminalText(verification.action);
+  const attempts = verification.attempts > 1 ? ` · 共 ${verification.attempts} 次` : "";
+  const exitCode = verification.exitCode !== undefined ? ` · 退出码 ${verification.exitCode ?? "未知"}` : "";
+  if (verification.status === "passed") return `验证：${action} 通过${exitCode}${attempts}`;
+  if (verification.status === "not_run") {
+    return `验证：${action} 未执行${verification.cancelled ? "（已取消）" : ""}${attempts}`;
+  }
+  if (verification.status === "cancelled") return `验证：${action} 已取消${attempts}`;
+  return `验证：${action} 未通过${verification.timedOut ? "（超时）" : exitCode}${attempts}`;
+}
+
+function renderCloseoutGit(closeout: TaskCloseoutView): string {
+  if (closeout.gitInspections.length === 0) return "Git 收口：未读取（不代表工作区干净）";
+  const inspections = closeout.gitInspections
+    .map((inspection) => `${closeoutGitActionLabel(inspection.action)}${closeoutExecutionLabel(inspection.status)}`)
+    .join(" · ");
+  return `Git 收口：${inspections}（只读；未暂存或提交）`;
+}
+
 class Header implements Component {
   readonly #options: CliArguments;
   readonly #viewState: () => SessionViewState;
@@ -474,6 +728,38 @@ class ApprovalPresenter implements Component {
       ),
       renderLine(
         `  ${yellow(approval.confirmWord)} ${muted("确认")}  ${muted("·")} ${yellow(approval.cancelWord)} ${muted("取消；控制词仅本地处理")}`,
+        width,
+      ),
+    ];
+  }
+}
+
+class TaskCloseoutPresenter implements Component {
+  readonly #viewState: () => SessionViewState;
+
+  constructor(viewState: () => SessionViewState) {
+    this.#viewState = viewState;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const closeout = this.#viewState().closeout;
+    if (!closeout) return [];
+    const toolSummary = [
+      `${closeout.successfulTools} 成功`,
+      ...(closeout.failedTools > 0 ? [`${closeout.failedTools} 失败`] : []),
+      ...(closeout.cancelledTools > 0 ? [`${closeout.cancelledTools} 已取消`] : []),
+    ].join(" · ");
+    return [
+      renderLine(muted("─".repeat(Math.max(width, 1))), width),
+      renderLine(` ${bold(accent("本次任务收口"))}  ${closeoutOutcomeLabel(closeout.outcome)}`, width),
+      renderLine(`  工具：${toolSummary}`, width),
+      renderLine(`  ${renderCloseoutModification(closeout)}`, width),
+      renderLine(`  ${renderCloseoutVerification(closeout)}`, width),
+      renderLine(`  ${renderCloseoutGit(closeout)}`, width),
+      renderLine(
+        `  ${muted("审计目标")} ${escapeTerminalText(closeout.auditFileName)} ${muted(`· ${closeout.eventCount} 个生命周期事件`)}`,
         width,
       ),
     ];
@@ -597,6 +883,7 @@ export class MiniTuiApp {
   #sessionPhase: SessionPhase = "ready";
   #sessionActivity = "等待任务";
   #currentPlan?: string;
+  #currentCloseout?: TaskCloseoutView;
   #running = false;
   #started = false;
   #stopped = false;
@@ -678,6 +965,7 @@ export class MiniTuiApp {
       contextTurns: this.contextTurns,
       activityExpanded: this.#timeline.expanded,
       ...(this.#currentPlan !== undefined ? { plan: this.#currentPlan } : {}),
+      ...(this.#currentCloseout ? { closeout: this.#currentCloseout } : {}),
       ...(pendingApproval && approvalSpec
         ? {
             pendingApproval: {
@@ -705,6 +993,7 @@ export class MiniTuiApp {
     this.#tui.addChild(new SessionPresenter(viewState));
     this.#tui.addChild(this.#transcript);
     this.#tui.addChild(this.#activity);
+    this.#tui.addChild(new TaskCloseoutPresenter(viewState));
     this.#tui.addChild(new ApprovalPresenter(viewState));
     this.#tui.addChild(new Text(muted("  输入一个代码任务，Enter 发送，Shift+Enter 换行。"), 0, 1));
     this.#tui.addChild(this.#editor);
@@ -766,6 +1055,7 @@ export class MiniTuiApp {
     this.#events.splice(0, this.#events.length);
     this.#timeline.setEvents(this.#events);
     this.#currentPlan = undefined;
+    this.#currentCloseout = undefined;
     this.#sessionPhase = this.#options.guided ? "planning" : "executing";
     this.#sessionActivity = "正在准备任务";
     this.#running = true;
@@ -782,18 +1072,45 @@ export class MiniTuiApp {
         conversationHistory: this.#history,
         signal: abortController.signal,
       });
-      if (this.#stopped || abortController.signal.aborted || taskGeneration !== this.#taskGeneration) return;
+      if (this.#stopped || taskGeneration !== this.#taskGeneration) return;
+      this.replaceTaskEvents(result.events);
+      this.#currentCloseout = deriveTaskCloseout(
+        result.events,
+        this.#options.auditPath,
+        this.#options.executionMode,
+        abortController.signal.aborted ? "cancelled" : undefined,
+      );
+      if (abortController.signal.aborted) {
+        this.#sessionPhase = "stopped";
+        this.#sessionActivity = "任务已取消";
+        this.appendNotice("当前任务已取消，未追加旧回答。", yellow);
+        return;
+      }
       appendConversation(this.#history, input, result.answer);
-      this.#sessionPhase = "completed";
-      this.#sessionActivity = "任务已完成";
+      this.#sessionPhase = this.#currentCloseout.outcome === "completed" ? "completed" : "stopped";
+      this.#sessionActivity = this.#currentCloseout.outcome === "completed" ? "任务已完成" : "任务未完成";
       this.appendAnswer(result.answer);
     } catch (error) {
       if (this.#stopped || taskGeneration !== this.#taskGeneration) return;
       if (abortController.signal.aborted) {
+        this.#currentCloseout = deriveTaskCloseout(
+          this.#events,
+          this.#options.auditPath,
+          this.#options.executionMode,
+          "cancelled",
+        );
+        this.#sessionPhase = "stopped";
+        this.#sessionActivity = "任务已取消";
         this.appendNotice("当前任务已取消，未追加旧回答。", yellow);
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
+      this.#currentCloseout = deriveTaskCloseout(
+        this.#events,
+        this.#options.auditPath,
+        this.#options.executionMode,
+        "failed",
+      );
       this.#sessionPhase = "stopped";
       this.#sessionActivity = "任务未完成";
       this.appendNotice(`任务未完成：${message}`, red);
@@ -1000,6 +1317,11 @@ export class MiniTuiApp {
     this.#tui.requestRender();
   }
 
+  private replaceTaskEvents(events: readonly AgentEvent[]): void {
+    this.#events.splice(0, this.#events.length, ...events);
+    this.#timeline.setEvents(this.#events);
+  }
+
   private async pasteFromClipboard(): Promise<void> {
     if (this.#stopped || this.#editor.disableSubmit) return;
     const inputGeneration = ++this.#inputGeneration;
@@ -1073,6 +1395,7 @@ export class MiniTuiApp {
         this.#events.splice(0, this.#events.length);
         this.#timeline.setEvents(this.#events);
         this.#currentPlan = undefined;
+        this.#currentCloseout = undefined;
         this.#sessionPhase = "ready";
         this.#sessionActivity = "等待任务";
         this.#transcript.clear();
@@ -1122,6 +1445,7 @@ export class MiniTuiApp {
       this.#events.splice(0, this.#events.length);
       this.#timeline.setEvents(this.#events);
       this.#currentPlan = undefined;
+      this.#currentCloseout = undefined;
       this.#sessionPhase = "ready";
       this.#sessionActivity = "等待新任务";
       this.appendNotice(

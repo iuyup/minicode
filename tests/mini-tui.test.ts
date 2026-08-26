@@ -7,7 +7,14 @@ import test from "node:test";
 import type { Terminal } from "@mariozechner/pi-tui";
 
 import { AgentLoop } from "../src/agent/agent-loop.ts";
-import type { ChatModel, ModelRequest, ModelResponse } from "../src/agent/contracts.ts";
+import type {
+  AgentTool,
+  ChatModel,
+  JsonValue,
+  ModelRequest,
+  ModelResponse,
+  ToolExecutionOutput,
+} from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
 import { createMiniTui, MiniTuiApp } from "../src/mini.ts";
 import { parseArguments } from "../src/runtime.ts";
@@ -229,6 +236,7 @@ test("长会话保持原生 scrollback，clear 才显式清除当前终端历史
     assert.match(clearedOutput, /已清空会话上下文/);
     assert.doesNotMatch(clearedOutput, /历史回答 1-|历史回答 2-/);
     assert.equal(app.contextTurns, 0);
+    assert.equal(app.sessionViewState.closeout, undefined);
   } finally {
     app.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
@@ -249,9 +257,16 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
     assert.match(output, /MiniCode/);
     assert.match(output, /会话.*当前活动/);
     assert.match(output, /工具活动已折叠/);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /修改：未写入补丁/);
+    assert.match(output, /验证：未请求固定验证/);
+    assert.match(output, /Git 收口：未读取（不代表工作区干净）/);
+    assert.match(output, /审计目标 audit\.jsonl/);
     assert.match(output, /只读代码侦察闭环已完成/);
     assert.doesNotMatch(output, /任务账本/);
     assert.equal(app.contextTurns, 1);
+    assert.equal(app.sessionViewState.closeout?.outcome, "completed");
+    assert.equal(app.sessionViewState.closeout?.successfulTools, 2);
 
     terminal.send("\u000f");
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -619,6 +634,68 @@ test("TUI 转义用户、模型、审批和未知工具中的 CSI 与 OSC", asyn
   }
 });
 
+test("任务收口卡只渲染结构化元数据，并转义验证与审计文本", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-closeout-safe-"));
+  const terminal = new FakeTerminal();
+  const csi = "\u001B[6n";
+  const osc = "\u001B]9;MINICODE-CLOSEOUT-PWN\u0007";
+  const auditFileName = `audit-${osc}.jsonl`;
+  let modelCalls = 0;
+  const model: ChatModel = {
+    async complete(): Promise<ModelResponse> {
+      modelCalls += 1;
+      if (modelCalls === 1) {
+        return {
+          kind: "tool_calls",
+          content: "运行固定验证。",
+          toolCalls: [{ id: "unsafe-closeout-check", name: "run_project_check", input: {} }],
+        };
+      }
+      return { kind: "final", content: "已完成。" };
+    },
+  };
+  const verificationTool: AgentTool<JsonValue, ToolExecutionOutput> = {
+    name: "run_project_check",
+    description: "测试专用验证工具。",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    validate: () => ({ ok: true, value: {} }),
+    async execute(): Promise<ToolExecutionOutput> {
+      return {
+        content: `CLOSEOUT_DETAIL_SHOULD_NOT_RENDER${csi}${osc}`,
+        metadata: { action: `test${csi}`, exitCode: 0 },
+      };
+    },
+  };
+  const options = parseArguments([
+    "--workspace",
+    process.cwd(),
+    "--audit",
+    path.join(reportDirectory, auditFileName),
+  ]);
+  let app: MiniTuiApp | undefined;
+  const agent = new AgentLoop(model, new ToolRegistry([verificationTool]), {
+    workspaceRoot: process.cwd(),
+    onEvent: (event) => app?.handleAgentEvent(event),
+  });
+  app = new MiniTuiApp(options, terminal, agent);
+
+  try {
+    app.start();
+    await app.submit("运行安全的收口卡验证");
+    await waitFor(() => stripAnsi(terminal.output).includes("本次任务收口"));
+
+    assert.doesNotMatch(terminal.output, /\u001B\[6n/u);
+    assert.doesNotMatch(terminal.output, /\u001B\]9;MINICODE-CLOSEOUT-PWN\u0007/u);
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /验证：test\\u001B\[6n 通过.*退出码 0/u);
+    assert.match(output, /审计目标 audit-\\u001B\]9;MINICODE-CLOSEOUT-PWN\\u0007\.jsonl/u);
+    assert.doesNotMatch(output, /CLOSEOUT_DETAIL_SHOULD_NOT_RENDER/u);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
 test("Windows 剪贴板只启动绝对系统 PowerShell 并限制环境与输出", async () => {
   const source = await fs.readFile(new URL("../src/mini.ts", import.meta.url), "utf8");
 
@@ -765,6 +842,13 @@ test("CANCEL 会闭锁后续修复，且不会把取消词发送给模型", asyn
     const output = stripAnsi(harness.terminal.output);
     assert.match(output, /已停止后续修复，当前工作区保持现状/u);
     assert.match(output, /用户未确认修复方向，未继续修改文件或运行验证/u);
+    assert.match(output, /本次任务收口.*未完成/u);
+    assert.match(output, /修改：未写入补丁/u);
+    const closeout = harness.app.sessionViewState.closeout;
+    assert.ok(closeout);
+    assert.equal(closeout.outcome, "stopped");
+    assert.equal(closeout.appliedPaths.length, 0);
+    assert.equal(closeout.verification?.status, "failed");
     assertNoLocalControlWords(harness.modelRequests);
   } finally {
     harness.app.stop();
@@ -949,7 +1033,14 @@ test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", asyn
     assert.equal(modelCalls, 2);
     assert.equal(app.contextTurns, 1);
     await waitFor(() => stripAnsi(terminal.output).includes("验证已确认并完成"));
-    assert.match(stripAnsi(terminal.output), /验证已确认并完成/);
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /验证已确认并完成/);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /验证：test 通过.*退出码 0/);
+    const closeout = app.sessionViewState.closeout;
+    assert.ok(closeout);
+    assert.equal(closeout.verification?.status, "passed");
+    assert.equal(closeout.verification?.attempts, 1);
   } finally {
     app?.stop();
     await fs.rm(workspace, { recursive: true, force: true });
@@ -1009,8 +1100,16 @@ test("TUI 中取消验证不会启动 runner，也不会把 CANCEL 写入模型�
     assert.equal(modelCalls, 2);
     assert.equal(app.contextTurns, 1);
     await waitFor(() => stripAnsi(terminal.output).includes("验证已由用户取消"));
-    assert.match(stripAnsi(terminal.output), /已取消验证，固定命令未执行/);
-    assert.match(stripAnsi(terminal.output), /验证已由用户取消/);
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /已取消验证，固定命令未执行/);
+    assert.match(output, /验证已由用户取消/);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /验证：check 未执行（已取消）/);
+    const closeout = app.sessionViewState.closeout;
+    assert.ok(closeout);
+    assert.equal(closeout.verification?.status, "not_run");
+    assert.equal(closeout.verification?.cancelled, true);
+    assert.equal(closeout.appliedPaths.length, 0);
   } finally {
     app?.stop();
     await fs.rm(workspace, { recursive: true, force: true });
@@ -1175,6 +1274,12 @@ test("只读 Git 检查在 TUI 中直接执行，不进入 RUN 确认状态", as
     assert.equal(app.awaitingCommandApproval, false);
     const output = stripAnsi(terminal.output);
     assert.match(output, /Git 状态已读取；没有执行暂存或提交/);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /修改：未写入补丁/);
+    assert.match(output, /验证：未请求固定验证/);
+    assert.match(output, /Git 收口：状态已读取（只读；未暂存或提交）/);
+    assert.match(output, /审计目标 audit\.jsonl/);
+    assert.deepEqual(app.sessionViewState.closeout?.gitInspections, [{ action: "status", status: "completed" }]);
     assert.doesNotMatch(output, /待确认命令|等待确认：RUN \/ CANCEL/);
   } finally {
     app.stop();
@@ -1272,6 +1377,10 @@ test("编辑模式在 TUI 展示补丁，并且只有 APPLY 会写入文件", as
     await waitFor(() => stripAnsi(terminal.output).includes("补丁已确认并写入"));
     assert.match(await fs.readFile(targetPath, "utf8"), /after/);
     assert.equal(app.contextTurns, 1);
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /修改：本任务已写入 1 个文件：src\/example\.ts/);
+    assert.deepEqual(app.sessionViewState.closeout?.appliedPaths, ["src/example.ts"]);
   } finally {
     app?.stop();
     await fs.rm(workspace, { recursive: true, force: true });

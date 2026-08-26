@@ -591,6 +591,18 @@ test("生产 guided TUI 在同一任务完成搜索、确认编辑、真实测�
     assert.match(output, /修改摘要：为 src\/greeting\.js/);
     assert.match(output, /验证结果：npm test 已通过/);
     assert.match(output, /未执行暂存或 commit/);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /修改：本任务已写入 1 个文件：src\/greeting\.js/);
+    assert.match(output, /验证：test 通过.*退出码 0/);
+    assert.match(output, /Git 收口：状态已读取 · 差异已读取（只读；未暂存或提交）/);
+    assert.match(output, /审计目标 audit\.jsonl/);
+    assert.deepEqual(app.sessionViewState.closeout?.appliedPaths, ["src/greeting.js"]);
+    assert.equal(app.sessionViewState.closeout?.verification?.status, "passed");
+    assert.equal(app.sessionViewState.closeout?.verification?.attempts, 1);
+    assert.deepEqual(app.sessionViewState.closeout?.gitInspections, [
+      { action: "status", status: "completed" },
+      { action: "diff", status: "completed" },
+    ]);
     assert.equal(app.contextTurns, 1);
     assert.equal(model.requests.length, 8);
 
@@ -858,6 +870,13 @@ test("生产 guided TUI 在六次工具内完成真实失败、修复方向确�
     assert.match(output, /首次 npm test 真实失败/);
     assert.match(output, /第二次 npm test 已通过/);
     assert.match(output, /未执行暂存或 commit/);
+    assert.match(output, /本次任务收口.*已完成/);
+    assert.match(output, /修改：本任务已写入 1 个文件：src\/greeting\.js/);
+    assert.match(output, /验证：test 通过.*退出码 0.*共 2 次/);
+    assert.match(output, /Git 收口：状态已读取 · 差异已读取（只读；未暂存或提交）/);
+    assert.deepEqual(app.sessionViewState.closeout?.appliedPaths, ["src/greeting.js"]);
+    assert.equal(app.sessionViewState.closeout?.verification?.status, "passed");
+    assert.equal(app.sessionViewState.closeout?.verification?.attempts, 2);
     assert.equal(app.contextTurns, 1);
     assert.equal(model.requests.length, 9);
 
