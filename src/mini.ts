@@ -65,7 +65,36 @@ const muted = color(90);
 const bold = (text: string): string => `\u001B[1m${text}${RESET}`;
 const underline = (text: string): string => `\u001B[4m${text}${RESET}`;
 
-type ApprovalKind = "plan" | "repair" | "patch" | "verification" | "command";
+export type ApprovalKind = "plan" | "repair" | "patch" | "verification" | "command";
+
+export type SessionPhase =
+  | "ready"
+  | "planning"
+  | "plan_pending"
+  | "executing"
+  | "patch_pending"
+  | "verification_pending"
+  | "command_pending"
+  | "repair_pending"
+  | "completed"
+  | "stopped";
+
+export interface SessionPendingApproval {
+  readonly kind: ApprovalKind;
+  readonly confirmWord: string;
+  readonly cancelWord: "CANCEL";
+  readonly prompt: string;
+}
+
+/** 展示专用快照；审批 Promise 及其 resolve 永远不暴露给展示层。 */
+export interface SessionViewState {
+  readonly phase: SessionPhase;
+  readonly activity: string;
+  readonly contextTurns: number;
+  readonly activityExpanded: boolean;
+  readonly plan?: string;
+  readonly pendingApproval?: SessionPendingApproval;
+}
 
 const APPROVAL_SPECS = {
   plan: {
@@ -291,26 +320,162 @@ function renderLine(text: string, width: number): string {
   return truncateToWidth(text, Math.max(width, 1));
 }
 
+const SESSION_PHASE_LABELS: Record<SessionPhase, string> = {
+  ready: "等待任务",
+  planning: "整理计划",
+  plan_pending: "等待计划确认",
+  executing: "执行中",
+  patch_pending: "等待补丁确认",
+  verification_pending: "等待验证确认",
+  command_pending: "等待命令确认",
+  repair_pending: "等待修复确认",
+  completed: "已完成",
+  stopped: "已停止",
+};
+
+const APPROVAL_KIND_LABELS: Record<ApprovalKind, string> = {
+  plan: "计划",
+  repair: "修复方向",
+  patch: "补丁",
+  verification: "验证",
+  command: "命令",
+};
+
+function sessionPhaseBadge(phase: SessionPhase): string {
+  const label = SESSION_PHASE_LABELS[phase];
+  if (phase === "completed") return green(label);
+  if (phase === "stopped" || phase.endsWith("_pending")) return yellow(label);
+  if (phase === "planning" || phase === "executing") return accent(label);
+  return muted(label);
+}
+
+function summarizeSessionPlan(plan: string): string {
+  const compact = escapeTerminalText(plan).replace(/\s+/gu, " ").trim();
+  if (compact.length <= 96) return compact;
+  return `${compact.slice(0, 93)}...`;
+}
+
+function phaseForApproval(kind: ApprovalKind): SessionPhase {
+  switch (kind) {
+    case "plan":
+      return "plan_pending";
+    case "repair":
+      return "repair_pending";
+    case "patch":
+      return "patch_pending";
+    case "verification":
+      return "verification_pending";
+    case "command":
+      return "command_pending";
+  }
+}
+
+function phaseForAgentEvent(event: AgentEvent): SessionPhase | undefined {
+  switch (event.type) {
+    case "plan_proposed":
+      return "planning";
+    case "plan_decision":
+      return event.decision === "approved" ? "executing" : "stopped";
+    case "repair_proposed":
+      return "repair_pending";
+    case "repair_decision":
+      return event.decision === "approved" ? "executing" : "stopped";
+    case "edit_approval_requested":
+      return "patch_pending";
+    case "edit_approval_decision":
+      return event.decision === "approved" ? "executing" : "stopped";
+    case "command_approval_requested":
+      return event.commandKind === "verification" ? "verification_pending" : "command_pending";
+    case "command_approval_decision":
+      return event.decision === "approved" ? "executing" : "stopped";
+    case "agent_completed":
+      return "completed";
+    case "agent_stopped":
+      return "stopped";
+    case "model_requested":
+    case "tool_call":
+    case "tool_execution_started":
+    case "tool_finalized":
+    case "policy_decision":
+    case "final_answer_rejected":
+      return "executing";
+  }
+}
+
 class Header implements Component {
   readonly #options: CliArguments;
+  readonly #viewState: () => SessionViewState;
 
-  constructor(options: CliArguments) {
+  constructor(options: CliArguments, viewState: () => SessionViewState) {
     this.#options = options;
+    this.#viewState = viewState;
   }
 
   invalidate(): void {}
 
   render(width: number): string[] {
+    const viewState = this.#viewState();
     const workspace = escapeTerminalText(
       path.basename(this.#options.workspaceRoot) || this.#options.workspaceRoot,
     );
     const model = escapeTerminalText(modelLabel(this.#options));
     const permissions = escapeTerminalText(toolPermissionLabel(this.#options));
     return [
-      renderLine(`${bold(accent("◆ MiniCode"))}  ${muted("轻量 Coding Agent")}`, width),
+      renderLine(`${bold(accent("◆ MiniCode"))}  ${muted("受控 Coding Agent")}  ${muted("·")} ${sessionPhaseBadge(viewState.phase)}`, width),
       renderLine(`  ${model}  ${muted("·")}  ${permissions}`, width),
       renderLine(`  ${muted("工作区")} ${workspace}  ${muted("·  滚轮浏览历史  ·  Ctrl+O 展开工具细节")}`, width),
       renderLine(muted("─".repeat(Math.max(width, 1))), width),
+    ];
+  }
+}
+
+class SessionPresenter implements Component {
+  readonly #viewState: () => SessionViewState;
+
+  constructor(viewState: () => SessionViewState) {
+    this.#viewState = viewState;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const viewState = this.#viewState();
+    const lines = [
+      renderLine(
+        ` ${bold(accent("会话"))}  ${muted("当前活动")} ${escapeTerminalText(viewState.activity)}`,
+        width,
+      ),
+    ];
+    if (viewState.plan !== undefined) {
+      lines.push(renderLine(`  ${muted("计划")} ${summarizeSessionPlan(viewState.plan)}`, width));
+    } else if (viewState.phase === "planning") {
+      lines.push(renderLine(`  ${muted("计划")} 正在准备可确认的最小步骤`, width));
+    }
+    return lines;
+  }
+}
+
+class ApprovalPresenter implements Component {
+  readonly #viewState: () => SessionViewState;
+
+  constructor(viewState: () => SessionViewState) {
+    this.#viewState = viewState;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const approval = this.#viewState().pendingApproval;
+    if (!approval) return [];
+    return [
+      renderLine(
+        ` ${bold(yellow("待确认操作"))}  ${muted(APPROVAL_KIND_LABELS[approval.kind])}`,
+        width,
+      ),
+      renderLine(
+        `  ${yellow(approval.confirmWord)} ${muted("确认")}  ${muted("·")} ${yellow(approval.cancelWord)} ${muted("取消；控制词仅本地处理")}`,
+        width,
+      ),
     ];
   }
 }
@@ -371,37 +536,28 @@ class ToolTimeline implements Component {
 
 class Footer implements Component {
   readonly #options: CliArguments;
-  readonly #contextTurns: () => number;
-  readonly #isRunning: () => boolean;
-  readonly #isAwaitingApproval: () => boolean;
-  readonly #approvalLabel: () => string | undefined;
+  readonly #viewState: () => SessionViewState;
 
-  constructor(
-    options: CliArguments,
-    contextTurns: () => number,
-    isRunning: () => boolean,
-    isAwaitingApproval: () => boolean,
-    approvalLabel: () => string | undefined,
-  ) {
+  constructor(options: CliArguments, viewState: () => SessionViewState) {
     this.#options = options;
-    this.#contextTurns = contextTurns;
-    this.#isRunning = isRunning;
-    this.#isAwaitingApproval = isAwaitingApproval;
-    this.#approvalLabel = approvalLabel;
+    this.#viewState = viewState;
   }
 
   invalidate(): void {}
 
   render(width: number): string[] {
-    const activity = this.#isAwaitingApproval()
-      ? yellow(`等待确认：${this.#approvalLabel() ?? "CANCEL"}`)
-      : this.#isRunning()
+    const viewState = this.#viewState();
+    const activity = viewState.pendingApproval
+      ? yellow(`等待确认：${viewState.pendingApproval.prompt}`)
+      : viewState.phase === "planning" || viewState.phase === "executing"
         ? yellow("执行中")
-        : green("可输入");
+        : viewState.phase === "stopped"
+          ? yellow("已停止")
+          : green("可输入");
     return [
       renderLine(muted("─".repeat(Math.max(width, 1))), width),
       renderLine(
-        ` ${activity}  ${muted(`上下文 ${this.#contextTurns()} / ${MAX_CONTEXT_TURNS}`)}  ${muted("滚轮历史 · Ctrl+V 粘贴 · /help · /clear · /details · /exit")}`,
+        ` ${activity}  ${muted(`上下文 ${viewState.contextTurns} / ${MAX_CONTEXT_TURNS}`)}  ${muted("滚轮历史 · Ctrl+V 粘贴 · /help · /clear · /details · /exit")}`,
         width,
       ),
     ];
@@ -438,6 +594,9 @@ export class MiniTuiApp {
     kind: ApprovalKind;
     resolve: (approved: boolean) => void;
   };
+  #sessionPhase: SessionPhase = "ready";
+  #sessionActivity = "等待任务";
+  #currentPlan?: string;
   #running = false;
   #started = false;
   #stopped = false;
@@ -510,6 +669,28 @@ export class MiniTuiApp {
     return this.#pendingApproval ? APPROVAL_SPECS[this.#pendingApproval.kind].prompt : undefined;
   }
 
+  get sessionViewState(): SessionViewState {
+    const pendingApproval = this.#pendingApproval;
+    const approvalSpec = pendingApproval ? APPROVAL_SPECS[pendingApproval.kind] : undefined;
+    return {
+      phase: this.#sessionPhase,
+      activity: this.#sessionActivity,
+      contextTurns: this.contextTurns,
+      activityExpanded: this.#timeline.expanded,
+      ...(this.#currentPlan !== undefined ? { plan: this.#currentPlan } : {}),
+      ...(pendingApproval && approvalSpec
+        ? {
+            pendingApproval: {
+              kind: pendingApproval.kind,
+              confirmWord: approvalSpec.confirmWord,
+              cancelWord: "CANCEL",
+              prompt: approvalSpec.prompt,
+            },
+          }
+        : {}),
+    };
+  }
+
   get editorText(): string {
     return this.#editor.getExpandedText();
   }
@@ -518,19 +699,16 @@ export class MiniTuiApp {
     if (this.#started) return;
     this.#started = true;
     this.#terminal.setTitle("MiniCode");
-    this.#tui.addChild(new Header(this.#options));
+    const viewState = () => this.sessionViewState;
+    this.#tui.addChild(new Header(this.#options, viewState));
     this.#tui.addChild(new Text("", 0, 1));
+    this.#tui.addChild(new SessionPresenter(viewState));
     this.#tui.addChild(this.#transcript);
     this.#tui.addChild(this.#activity);
+    this.#tui.addChild(new ApprovalPresenter(viewState));
     this.#tui.addChild(new Text(muted("  输入一个代码任务，Enter 发送，Shift+Enter 换行。"), 0, 1));
     this.#tui.addChild(this.#editor);
-    this.#tui.addChild(new Footer(
-      this.#options,
-      () => this.contextTurns,
-      () => this.#running,
-      () => this.awaitingApproval,
-      () => this.approvalPrompt,
-    ));
+    this.#tui.addChild(new Footer(this.#options, viewState));
     this.appendWelcome();
     this.#tui.setFocus(this.#editor);
     this.#tui.start();
@@ -540,6 +718,8 @@ export class MiniTuiApp {
     if (this.#stopped) return;
     this.#stopped = true;
     this.#running = false;
+    this.#sessionPhase = "stopped";
+    this.#sessionActivity = "会话已结束";
     this.#taskGeneration += 1;
     this.#inputGeneration += 1;
     this.#taskAbortController?.abort();
@@ -585,6 +765,9 @@ export class MiniTuiApp {
     this.#inputGeneration += 1;
     this.#events.splice(0, this.#events.length);
     this.#timeline.setEvents(this.#events);
+    this.#currentPlan = undefined;
+    this.#sessionPhase = this.#options.guided ? "planning" : "executing";
+    this.#sessionActivity = "正在准备任务";
     this.#running = true;
     const taskGeneration = ++this.#taskGeneration;
     const abortController = new AbortController();
@@ -601,6 +784,8 @@ export class MiniTuiApp {
       });
       if (this.#stopped || abortController.signal.aborted || taskGeneration !== this.#taskGeneration) return;
       appendConversation(this.#history, input, result.answer);
+      this.#sessionPhase = "completed";
+      this.#sessionActivity = "任务已完成";
       this.appendAnswer(result.answer);
     } catch (error) {
       if (this.#stopped || taskGeneration !== this.#taskGeneration) return;
@@ -609,6 +794,8 @@ export class MiniTuiApp {
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
+      this.#sessionPhase = "stopped";
+      this.#sessionActivity = "任务未完成";
       this.appendNotice(`任务未完成：${message}`, red);
     } finally {
       if (taskGeneration !== this.#taskGeneration || this.#stopped) return;
@@ -627,7 +814,11 @@ export class MiniTuiApp {
     if (this.#stopped) return;
     this.#events.push(event);
     this.#timeline.setEvents(this.#events);
-    this.#loader.setMessage(eventLabel(event));
+    const activity = eventLabel(event);
+    this.#sessionActivity = activity;
+    const phase = phaseForAgentEvent(event);
+    if (phase) this.#sessionPhase = phase;
+    this.#loader.setMessage(activity);
     this.refreshActivity();
   }
 
@@ -648,10 +839,12 @@ export class MiniTuiApp {
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
     this.#tui.setFocus(this.#editor);
-    this.#tui.requestRender();
 
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "patch", resolve };
+      this.#sessionPhase = "patch_pending";
+      this.#sessionActivity = "等待补丁确认";
+      this.#tui.requestRender();
     });
   }
 
@@ -669,10 +862,13 @@ export class MiniTuiApp {
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
     this.#tui.setFocus(this.#editor);
-    this.#tui.requestRender();
 
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "plan", resolve };
+      this.#currentPlan = request.plan;
+      this.#sessionPhase = "plan_pending";
+      this.#sessionActivity = "等待计划确认";
+      this.#tui.requestRender();
     });
   }
 
@@ -702,10 +898,12 @@ export class MiniTuiApp {
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
     this.#tui.setFocus(this.#editor);
-    this.#tui.requestRender();
 
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "repair", resolve };
+      this.#sessionPhase = "repair_pending";
+      this.#sessionActivity = "等待修复方向确认";
+      this.#tui.requestRender();
     });
   }
 
@@ -736,10 +934,12 @@ export class MiniTuiApp {
     this.#editor.setText("");
     this.#editor.disableSubmit = false;
     this.#tui.setFocus(this.#editor);
-    this.#tui.requestRender();
 
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: request.kind, resolve };
+      this.#sessionPhase = phaseForApproval(request.kind);
+      this.#sessionActivity = isVerification ? "等待验证确认" : "等待命令确认";
+      this.#tui.requestRender();
     });
   }
 
@@ -840,6 +1040,8 @@ export class MiniTuiApp {
     this.#editor.setText("");
     this.#editor.disableSubmit = true;
     const spec = APPROVAL_SPECS[pendingApproval.kind];
+    this.#sessionPhase = approved ? "executing" : "stopped";
+    this.#sessionActivity = approved ? spec.approved : spec.rejected;
     if (showNotice && !this.#stopped) {
       this.appendNotice(approved ? spec.approved : spec.rejected, approved ? green : yellow);
     }
@@ -870,6 +1072,9 @@ export class MiniTuiApp {
         this.#history.splice(0, this.#history.length);
         this.#events.splice(0, this.#events.length);
         this.#timeline.setEvents(this.#events);
+        this.#currentPlan = undefined;
+        this.#sessionPhase = "ready";
+        this.#sessionActivity = "等待任务";
         this.#transcript.clear();
         this.appendWelcome();
         this.appendNotice("已清空会话上下文；审计文件不会被删除。", green);
@@ -916,6 +1121,9 @@ export class MiniTuiApp {
       this.#history.splice(0, this.#history.length);
       this.#events.splice(0, this.#events.length);
       this.#timeline.setEvents(this.#events);
+      this.#currentPlan = undefined;
+      this.#sessionPhase = "ready";
+      this.#sessionActivity = "等待新任务";
       this.appendNotice(
         `已切换到 ${modelLabel(this.#options)}；为避免不同模型混用上下文，后续发送给模型的会话已清空。`,
         green,

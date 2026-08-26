@@ -247,6 +247,7 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
 
     const output = stripAnsi(terminal.output);
     assert.match(output, /MiniCode/);
+    assert.match(output, /会话.*当前活动/);
     assert.match(output, /工具活动已折叠/);
     assert.match(output, /只读代码侦察闭环已完成/);
     assert.doesNotMatch(output, /任务账本/);
@@ -265,6 +266,73 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
     assert.equal(events.at(-1)?.type, "agent_completed");
     app.stop();
   } finally {
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("mini TUI projects phase, persistent plan, and local approval controls without owning approval decisions", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-session-view-"));
+  const terminal = new FakeTerminal();
+  const plan = "- 先读取目标文件\n- 再提出最小补丁";
+  const app = createMiniTui(
+    ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+    terminal,
+  );
+  try {
+    app.start();
+    assert.equal(app.sessionViewState.phase, "ready");
+    assert.equal(app.sessionViewState.activity, "等待任务");
+    assert.equal(app.sessionViewState.activityExpanded, false);
+
+    terminal.send("\u000f");
+    assert.equal(app.sessionViewState.activityExpanded, true);
+
+    const planApproval = app.requestPlanApproval({ plan });
+    assert.equal(app.sessionViewState.phase, "plan_pending");
+    assert.equal(app.sessionViewState.plan, plan);
+    assert.deepEqual(app.sessionViewState.pendingApproval, {
+      kind: "plan",
+      confirmWord: "CONTINUE",
+      cancelWord: "CANCEL",
+      prompt: "CONTINUE / CANCEL",
+    });
+    await waitFor(() => stripAnsi(terminal.output).includes("待确认操作"));
+
+    await app.submit("CONTINUE");
+    assert.equal(await planApproval, true);
+    assert.equal(app.sessionViewState.phase, "executing");
+    assert.equal(app.sessionViewState.plan, plan);
+    assert.equal(app.sessionViewState.pendingApproval, undefined);
+
+    const patchApproval = app.requestEditApproval({
+      path: "src/example.ts",
+      preview: "export const value = 'after';",
+    });
+    const patchView = app.sessionViewState;
+    assert.equal(app.sessionViewState.phase, "patch_pending");
+    assert.equal(patchView.pendingApproval?.confirmWord, "APPLY");
+    await app.submit("CANCEL");
+    assert.equal(await patchApproval, false);
+    assert.equal(app.sessionViewState.phase, "stopped");
+    assert.equal(app.sessionViewState.plan, plan);
+    assert.equal(app.sessionViewState.pendingApproval, undefined);
+
+    const verificationApproval = app.requestCommandApproval({
+      kind: "verification",
+      action: "test",
+      command: "npm test",
+      workingDirectory: process.cwd(),
+      risk: "只运行固定验证命令。",
+      riskLevel: "low",
+    });
+    const verificationView = app.sessionViewState;
+    assert.equal(app.sessionViewState.phase, "verification_pending");
+    assert.equal(verificationView.pendingApproval?.confirmWord, "RUN");
+    await app.submit("RUN");
+    assert.equal(await verificationApproval, true);
+    assert.equal(app.sessionViewState.phase, "executing");
+  } finally {
+    app.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
   }
 });
