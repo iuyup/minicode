@@ -260,6 +260,11 @@ export class MiniTuiApp {
     return this.#pendingApproval ? APPROVAL_SPECS[this.#pendingApproval.kind].prompt : undefined;
   }
 
+  /** 等待本地确认时停止动画，避免把用户决策误显示为自动执行。 */
+  get loading(): boolean {
+    return this.#renderer.loading;
+  }
+
   get sessionViewState(): SessionViewState {
     const pendingApproval = this.#pendingApproval;
     const approvalSpec = pendingApproval ? APPROVAL_SPECS[pendingApproval.kind] : undefined;
@@ -436,6 +441,7 @@ export class MiniTuiApp {
 
   requestEditApproval(request: EditApprovalRequest): Promise<boolean> {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
+    this.#renderer.stopLoader();
     this.#renderer.showEditApproval(request);
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "patch", resolve };
@@ -447,6 +453,7 @@ export class MiniTuiApp {
 
   requestPlanApproval(request: PlanApprovalRequest): Promise<boolean> {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
+    this.#renderer.stopLoader();
     this.#renderer.showPlanApproval(request);
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "plan", resolve };
@@ -459,6 +466,7 @@ export class MiniTuiApp {
 
   requestRepairApproval(request: RepairApprovalRequest): Promise<boolean> {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
+    this.#renderer.stopLoader();
     this.#renderer.showRepairApproval(request);
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: "repair", resolve };
@@ -470,6 +478,7 @@ export class MiniTuiApp {
 
   requestCommandApproval(request: CommandApprovalRequest): Promise<boolean> {
     if (this.#stopped || this.#pendingApproval) return Promise.resolve(false);
+    this.#renderer.stopLoader();
     this.#renderer.showCommandApproval(request);
     return new Promise((resolve) => {
       this.#pendingApproval = { kind: request.kind, resolve };
@@ -581,6 +590,10 @@ export class MiniTuiApp {
     const spec = APPROVAL_SPECS[pendingApproval.kind];
     this.#sessionPhase = approved ? "executing" : "stopped";
     this.#sessionActivity = approved ? spec.approved : spec.rejected;
+    if (this.#running && !this.#stopped) {
+      this.#renderer.setLoaderMessage(this.#sessionActivity);
+      this.#renderer.startLoader();
+    }
     if (showNotice && !this.#stopped) {
       this.appendNotice(approved ? spec.approved : spec.rejected, approved ? "success" : "warning");
     }

@@ -736,6 +736,10 @@ export class PiTuiRenderer {
     return this.#activityExpanded;
   }
 
+  get loading(): boolean {
+    return this.#loading;
+  }
+
   get mountedNodeKeys(): readonly string[] {
     return this.#composer.nodeKeys;
   }

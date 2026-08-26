@@ -792,7 +792,6 @@ test("修复方向面板只接受精确 CONTINUE，错误输入保持等待且�
     assert.equal(harness.runnerCalls, 1);
     assert.equal(harness.modelRequests.length, 2);
     assert.match(pendingOutput, /待确认修复方向.*test/u);
-    assert.match(pendingOutput, /已生成待确认修复方向/u);
     assert.match(pendingOutput, /修复尝试：1 \/ 1/u);
     assert.match(pendingOutput, new RegExp(REPAIR_DIRECTION, "u"));
     assert.match(pendingOutput, /后续补丁仍需 APPLY，复验仍需 RUN/u);
@@ -1317,6 +1316,46 @@ test("guided TUI shows a plan and waits for CONTINUE before tools can run", asyn
     await waitFor(() => app?.contextTurns === 1);
     await waitFor(() => stripAnsi(terminal.output).includes("只读代码侦察闭环已完成"));
     assert.match(stripAnsi(terminal.output), /只读代码侦察闭环已完成/);
+  } finally {
+    app?.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("TUI pauses its loading animation while an approval waits, then resumes after a decision", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-loader-"));
+  const terminal = new FakeTerminal();
+  let resumeExecution: (() => void) | undefined;
+  const model: ChatModel = {
+    async complete(request: ModelRequest): Promise<ModelResponse> {
+      if (request.phase === "planning") {
+        return { kind: "final", content: "先等待计划确认，再给出结论。" };
+      }
+      return new Promise<ModelResponse>((resolve) => {
+        resumeExecution = () => resolve({ kind: "final", content: "确认后的任务已完成。" });
+      });
+    },
+  };
+  let app: MiniTuiApp | undefined;
+  try {
+    app = createMiniTui(
+      ["--guided", "--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+      terminal,
+      { model },
+    );
+    app.start();
+
+    const task = app.submit("等待我确认计划");
+    await waitFor(() => app?.awaitingPlanApproval === true);
+    assert.equal(app.loading, false, "等待用户决定时不应继续显示任务执行动画");
+
+    await app.submit("CONTINUE");
+    await waitFor(() => resumeExecution !== undefined);
+    assert.equal(app.loading, true, "用户作出决定后，任务继续执行时应恢复动画");
+
+    resumeExecution?.();
+    await task;
+    assert.equal(app.loading, false, "任务收口后必须停止动画");
   } finally {
     app?.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
