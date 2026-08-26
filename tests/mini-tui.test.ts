@@ -185,8 +185,9 @@ function assertNoLocalControlWords(requests: readonly ModelRequest[]): void {
 }
 
 test("mini 使用普通终端历史，不进入备用屏幕或开启鼠标捕获", async () => {
-  const source = await fs.readFile(new URL("../src/mini.ts", import.meta.url), "utf8");
+  const source = await fs.readFile(new URL("../src/tui/pi-renderer.ts", import.meta.url), "utf8");
 
+  assert.match(source, /class ScrollbackPreservingTerminal/u);
   assert.doesNotMatch(source, /\?1049[hl]/u);
   assert.doesNotMatch(source, /\?100[0236]h/u);
 });
@@ -312,6 +313,7 @@ test("mini TUI projects phase, persistent plan, and local approval controls with
       prompt: "CONTINUE / CANCEL",
     });
     await waitFor(() => stripAnsi(terminal.output).includes("待确认操作"));
+    assert.match(stripAnsi(terminal.output), /工作流.*计划（待确认）/u);
 
     await app.submit("CONTINUE");
     assert.equal(await planApproval, true);
@@ -343,6 +345,7 @@ test("mini TUI projects phase, persistent plan, and local approval controls with
     const verificationView = app.sessionViewState;
     assert.equal(app.sessionViewState.phase, "verification_pending");
     assert.equal(verificationView.pendingApproval?.confirmWord, "RUN");
+    await waitFor(() => stripAnsi(terminal.output).includes("验证（待确认）"));
     await app.submit("RUN");
     assert.equal(await verificationApproval, true);
     assert.equal(app.sessionViewState.phase, "executing");

@@ -19,7 +19,7 @@
     "eval:plan": "node scripts/run-eval.mjs --plan",
     "eval:run": "node scripts/run-eval.mjs",
     "test:success-chain": "node --test tests/edit-workflow-e2e.test.ts",
-    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/read-file-toctou.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/run-command.test.ts tests/inspect-git.test.ts tests/deepseek-model.test.ts tests/model-profiles.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts tests/mini-tui.test.ts tests/edit-workflow-e2e.test.ts tests/terminal-safety.test.ts tests/eval-suite.test.ts tests/eval-config.test.ts tests/eval-arms.test.ts tests/eval-grader.test.ts tests/eval-runner.test.ts tests/eval-report.test.ts tests/eval-suite-runner.test.ts tests/eval-provenance.test.ts tests/eval-cli.test.ts",
+    "test": "node --test tests/agent-loop.test.ts tests/readonly-workspace.test.ts tests/read-file-toctou.test.ts tests/controlled-patch.test.ts tests/run-project-check.test.ts tests/run-command.test.ts tests/inspect-git.test.ts tests/deepseek-model.test.ts tests/model-profiles.test.ts tests/source-evidence.test.ts tests/cli-source-evidence.test.ts tests/mini-tui.test.ts tests/tui-renderer.test.ts tests/edit-workflow-e2e.test.ts tests/terminal-safety.test.ts tests/eval-suite.test.ts tests/eval-config.test.ts tests/eval-arms.test.ts tests/eval-grader.test.ts tests/eval-runner.test.ts tests/eval-report.test.ts tests/eval-suite-runner.test.ts tests/eval-provenance.test.ts tests/eval-cli.test.ts",
     "check": "tsc -p tsconfig.json"
   },
   "devDependencies": {
