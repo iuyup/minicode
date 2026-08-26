@@ -1185,6 +1185,68 @@ test("a tool request during repair planning is rejected with a terminal lifecycl
   assert.equal(observedEvents.at(-1)?.type, "agent_stopped");
 });
 
+test("an explicit initial check cannot be bypassed or converted into closeout recovery", async () => {
+  const projectCheck = createProjectCheckTool(["nonzero"]);
+  const read = createCountingTool("read_file");
+  let modelCallCount = 0;
+  const model: ChatModel = {
+    async complete(request): Promise<ModelResponse> {
+      modelCallCount += 1;
+      if (modelCallCount === 1) {
+        assert.equal(request.phase, "execution");
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return toolCallResponse("initial-wrong-read", "read_file", {});
+      }
+      if (modelCallCount === 2) {
+        assert.deepEqual(request.tools.map((tool) => tool.name), ["run_project_check"]);
+        assert.deepEqual(request.toolChoice, { type: "function", name: "run_project_check" });
+        return toolCallResponse("initial-test", "run_project_check", { action: "test" });
+      }
+      if (modelCallCount === 3) {
+        assert.equal(request.phase, "repair_planning");
+        assert.deepEqual(request.tools, []);
+        return { kind: "final", content: "读取失败位置，应用最小修复，再运行 test。" };
+      }
+      if (modelCallCount === 4) {
+        assert.equal(request.phase, "execution");
+        assert.equal(request.tools.some((tool) => tool.name === "read_file"), true);
+        return toolCallResponse("repair-read", "read_file", {});
+      }
+      assert.equal(modelCallCount, 5);
+      return { kind: "final", content: "尚未完成修复。" };
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([projectCheck.tool, read.tool]), {
+    workspaceRoot: process.cwd(),
+    maxSteps: 5,
+    maxToolCalls: 1,
+    finalOnlyAfterToolBudget: true,
+    enableFailureRepair: true,
+    initialProjectCheckAction: "test",
+    requestCommandApproval: async () => true,
+    requestRepairApproval: async () => true,
+  }).run("先复现失败，再开始一次有界修复。");
+
+  assert.equal(modelCallCount, 5);
+  assert.equal(projectCheck.executionCount, 1);
+  assert.equal(read.executionCount, 1);
+  assert.equal(result.events.some((event) => event.type === "agent_completed"), false);
+  assert.equal(result.events.filter((event) => event.type === "repair_proposed").length, 1);
+  assert.deepEqual(
+    result.events
+      .filter((event) => event.type === "tool_finalized")
+      .map((event) => event.type === "tool_finalized" ? [event.toolCallId, event.status] : []),
+    [
+      ["initial-wrong-read", "error"],
+      ["initial-test", "error"],
+      ["repair-read", "success"],
+    ],
+  );
+  assert.match(result.answer, /修复尚未完成成功复验/);
+});
+
 test("one approved repair blocks same-turn leftovers and a second failed check enters final-only", async () => {
   const projectCheck = createProjectCheckTool(["nonzero", "nonzero"]);
   const patch = createCountingTool("apply_patch");

@@ -96,6 +96,9 @@ export async function createEvaluationArmAgent(options: CreateEvaluationArmOptio
     requestCommandApproval: approvals.requestCommandApproval,
     onEvent: options.onEvent,
   };
+  const failureRepairInitialProjectCheckAction = fixture.task.flow === "failure_repair"
+    ? EVALUATION_BUDGET.failureRepairInitialProjectCheckAction
+    : undefined;
 
   if (options.arm === "minicode-product") {
     const argumentsValue = parseArguments([
@@ -106,7 +109,11 @@ export async function createEvaluationArmAgent(options: CreateEvaluationArmOptio
       "--audit", path.resolve(options.auditPath),
       fixture.task.prompt,
     ]);
-    return createAgent(argumentsValue, { model: options.model, ...sharedCallbacks });
+    return createAgent(argumentsValue, {
+      model: options.model,
+      initialProjectCheckAction: failureRepairInitialProjectCheckAction,
+      ...sharedCallbacks,
+    });
   }
 
   const guided = options.arm === "minicode-3tool";
@@ -128,6 +135,7 @@ export async function createEvaluationArmAgent(options: CreateEvaluationArmOptio
       requirePlanApproval: guided,
       planningPrompt: guided ? EVALUATION_PROMPTS[options.arm].planning ?? undefined : undefined,
       enableFailureRepair: guided,
+      initialProjectCheckAction: guided ? failureRepairInitialProjectCheckAction : undefined,
       systemPrompt: EVALUATION_PROMPTS[options.arm].system,
       auditLog: new JsonlAuditLog(path.resolve(options.auditPath)),
       ...sharedCallbacks,

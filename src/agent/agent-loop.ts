@@ -64,6 +64,11 @@ export interface AgentLoopOptions {
   planningPrompt?: string;
   /** 固定验证真实失败后，最多允许一次经人工确认的修复循环。 */
   enableFailureRepair?: boolean;
+  /**
+   * 显式要求先运行一次固定验证；仅用于需要先复现真实失败的受控工作流，默认关闭。
+   * 初始验证失败后，复用既有的人工确认失败修复流程。
+   */
+  initialProjectCheckAction?: ProjectCheckAction;
   systemPrompt?: string;
   executionMode?: ToolExecutionMode;
   requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
@@ -90,7 +95,7 @@ const MAX_FAILURE_REPAIR_TOOL_CALLS = 3;
 const MAX_POST_REPAIR_GIT_TOOL_CALLS = 2;
 
 type FailureRepairState = "idle" | "planning" | "executing" | "post_repair" | "completed" | "final_only";
-type ProjectCheckAction = "test" | "check";
+export type ProjectCheckAction = "test" | "check";
 
 const FAILURE_REPAIR_DIRECTION_PROMPT = [
   "固定验证已真实执行并失败。下一轮是无工具的修复方向阶段。",
@@ -361,6 +366,16 @@ function isExecutedProjectActionSuccess(
   return isExecutedProjectCheckSuccess(result) && result.metadata?.action === action;
 }
 
+function isExecutedProjectAction(
+  result: ToolResultMessage,
+  action: ProjectCheckAction,
+): boolean {
+  if (result.name !== "run_project_check" || result.metadata?.action !== action) return false;
+  return result.status === "success" ||
+    result.metadata?.timedOut === true ||
+    typeof result.metadata?.exitCode === "number";
+}
+
 export class AgentLoop {
   private readonly model: ChatModel;
   private readonly tools: ToolRegistry;
@@ -377,6 +392,7 @@ export class AgentLoop {
   readonly #requirePlanApproval: boolean;
   readonly #planningPrompt?: string;
   readonly #enableFailureRepair: boolean;
+  readonly #initialProjectCheckAction?: ProjectCheckAction;
   readonly #systemPrompt: string;
   readonly #executionMode: ToolExecutionMode;
   readonly #requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
@@ -419,6 +435,13 @@ export class AgentLoop {
     this.#requirePlanApproval = options.requirePlanApproval ?? false;
     this.#planningPrompt = options.planningPrompt;
     this.#enableFailureRepair = options.enableFailureRepair ?? false;
+    this.#initialProjectCheckAction = options.initialProjectCheckAction;
+    if (this.#initialProjectCheckAction !== undefined && !this.#enableFailureRepair) {
+      throw new Error("initialProjectCheckAction 需要 enableFailureRepair=true。");
+    }
+    if (this.#initialProjectCheckAction !== undefined && !this.tools.find("run_project_check")) {
+      throw new Error("initialProjectCheckAction 需要注册 run_project_check 工具。");
+    }
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#executionMode = options.executionMode ?? "propose";
     this.#requestEditApproval = options.requestEditApproval;
@@ -454,6 +477,7 @@ export class AgentLoop {
     let failedRepairAction: ProjectCheckAction = "test";
     let repairOriginalCheckRequired = false;
     let postPatchTestRequired = false;
+    let initialProjectCheckRequired = this.#initialProjectCheckAction !== undefined;
     let sameTurnRecoveryStepGranted = false;
     // 受限验证 / Git 收尾阶段的一次本地拒绝，不能让可选收尾挤掉最终回答。
     // 恢复只跳过可选 Git，不增加任何工具额度，也只允许触发一次。
@@ -487,14 +511,19 @@ export class AgentLoop {
         const isRepairCompletedTurn = repairState === "completed";
         const isCloseoutRecoveryFinalOnlyTurn = closeoutRecoveryFinalOnly;
         const isToolBudgetFinalTurn = this.#finalOnlyAfterToolBudget && acceptedToolCalls >= maximumToolCalls;
+        const initialProjectCheckAction: ProjectCheckAction | undefined = initialProjectCheckRequired
+          ? this.#initialProjectCheckAction
+          : undefined;
         const mustVerifyPatchNow = this.#requirePostPatchTest && postPatchTestRequired && (
           repairState === "idle" || (repairState === "executing" && repairPatchSucceeded)
         );
-        const requiredProjectCheckAction: ProjectCheckAction | undefined = mustVerifyPatchNow
-          ? "test"
-          : repairState === "executing" && repairOriginalCheckRequired
-            ? failedRepairAction
-            : undefined;
+        const requiredProjectCheckAction: ProjectCheckAction | undefined = initialProjectCheckAction ?? (
+          mustVerifyPatchNow
+            ? "test"
+            : repairState === "executing" && repairOriginalCheckRequired
+              ? failedRepairAction
+              : undefined
+        );
         const baseAvailableTools: ToolDescription[] = isPlanningTurn || isRepairPlanningTurn ||
           isRepairFinalTurn || isRepairCompletedTurn || isCloseoutRecoveryFinalOnlyTurn ||
           isSourceEvidenceFinalTurn || isToolBudgetFinalTurn
@@ -727,6 +756,19 @@ export class AgentLoop {
           continue;
         }
 
+        if (response.kind === "final" && initialProjectCheckAction !== undefined) {
+          const reason = `尚未执行初始 run_project_check(${initialProjectCheckAction}) 复现当前状态，任务以未完成状态停止。`;
+          messages.push({ role: "assistant", content: response.content });
+          this.recordEvent(events, { type: "agent_stopped", step, reason });
+          return {
+            answer: reason,
+            messages,
+            events: events.events,
+            workingState: ledger.render(),
+            sourceEvidence,
+          };
+        }
+
         if (repairState === "executing" && response.kind === "final") {
           const reason = "修复尚未完成成功复验，任务以未完成状态停止。";
           messages.push({ role: "assistant", content: response.content });
@@ -825,6 +867,7 @@ export class AgentLoop {
                   allowedToolNames,
                   readPaths,
                   requiredProjectCheckAction,
+                  initialProjectCheckAction,
                 )
           );
           const result: ToolResultMessage = rejectionReason
@@ -862,7 +905,10 @@ export class AgentLoop {
             !rejectedForCancellation &&
             localPolicyCheckBeforeCall &&
             !closeoutRecoveryUsed &&
-            (requiredProjectCheckAction !== undefined || repairState === "post_repair")
+            (
+              (requiredProjectCheckAction !== undefined && initialProjectCheckAction === undefined) ||
+              repairState === "post_repair"
+            )
           ) {
             closeoutRecoveryUsed = true;
             if (requiredProjectCheckAction !== undefined) {
@@ -944,6 +990,13 @@ export class AgentLoop {
             status: result.status,
             summary: result.content,
           });
+          if (
+            !rejectionReason &&
+            initialProjectCheckAction !== undefined &&
+            isExecutedProjectAction(result, initialProjectCheckAction)
+          ) {
+            initialProjectCheckRequired = false;
+          }
           if (this.#enableFailureRepair && !rejectionReason) {
             if (repairState === "idle" && isExecutedProjectCheckFailure(result)) {
               failedRepairAction = result.metadata?.action === "check" ? "check" : "test";
@@ -1097,12 +1150,16 @@ export class AgentLoop {
     allowedToolNames: ReadonlySet<string> | undefined,
     readPaths: ReadonlySet<string>,
     requiredProjectCheckAction: ProjectCheckAction | undefined,
+    initialProjectCheckAction: ProjectCheckAction | undefined,
   ): string | undefined {
     if (requiredProjectCheckAction) {
       if (toolCall.name !== "run_project_check") {
         return `当前阶段必须先执行固定 run_project_check(${requiredProjectCheckAction})，当前工具不会执行。`;
       }
       if (projectCheckAction(toolCall) !== requiredProjectCheckAction) {
+        if (initialProjectCheckAction !== undefined) {
+          return `任务要求先执行初始 run_project_check(${initialProjectCheckAction})；当前调用不会执行。`;
+        }
         return requiredProjectCheckAction === "test"
           ? "补丁成功后的固定验证只接受 run_project_check 的 test 动作；当前调用不会执行。"
           : "原失败动作的复验只接受 run_project_check 的 check 动作；当前调用不会执行。";

@@ -35,6 +35,7 @@ export const EVALUATION_BUDGET = Object.freeze({
   postPatchCloseoutExtraModelRequests: 2,
   postPatchCloseoutExtraToolCalls: 2,
   sameTurnRecoveryExtraModelRequests: 1,
+  failureRepairInitialProjectCheckAction: "test",
   failureRepairExtraToolCalls: 3,
   repairPatchValidationExtraToolCalls: 1,
   originalActionRevalidationExtraToolCalls: 1,

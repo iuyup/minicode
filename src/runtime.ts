@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import readline from "node:readline/promises";
 
-import { AgentLoop, type AgentRunResult } from "./agent/agent-loop.ts";
+import { AgentLoop, type AgentRunResult, type ProjectCheckAction } from "./agent/agent-loop.ts";
 import {
   EDIT_HARD_MAX_ACCEPTED_TOOL_CALLS,
   EDIT_HARD_MAX_MODEL_REQUESTS,
@@ -54,6 +54,8 @@ export interface CliArguments {
 
 export interface CreateAgentOptions {
   model?: ChatModel;
+  /** 由宿主显式启用的初始失败复现，不作为普通 CLI/TUI 的默认行为。 */
+  initialProjectCheckAction?: ProjectCheckAction;
   onEvent?: (event: AgentEvent) => void;
   requestEditApproval?: (request: EditApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
   requestPlanApproval?: (request: PlanApprovalRequest, signal?: AbortSignal) => Promise<boolean>;
@@ -365,6 +367,7 @@ export function createAgent(argumentsValue: CliArguments, options: CreateAgentOp
     requirePlanApproval: argumentsValue.guided,
     planningPrompt: argumentsValue.guided ? GUIDED_PLAN_PROMPT : undefined,
     enableFailureRepair: argumentsValue.guided && argumentsValue.agentMode === "edit",
+    initialProjectCheckAction: options.initialProjectCheckAction,
     requireReadBeforeEdit: usesRemoteModel(argumentsValue) && argumentsValue.agentMode === "edit",
     requirePostPatchTest: argumentsValue.agentMode === "edit" && argumentsValue.executionMode === "apply",
     ...(usesRemoteModel(argumentsValue)
