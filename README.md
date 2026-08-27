@@ -61,7 +61,7 @@ cmd.exe /d /c npm run mini
 
 工具调用在主屏默认折叠为简短状态；按 `Ctrl+O` 或输入 `/details` 可展开最近的生命周期事件。滚轮浏览由 VS Code Terminal、Windows Terminal 等宿主终端的原生历史提供，不会占用编辑器的 `PageUp`、`PageDown`、`Home` 或 `End`；窗口 resize 不会主动清除宿主历史，只有 `/clear` 会明确清空当前终端历史。`Ctrl+V` 会从固定的 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` 读取系统剪贴板文本，非标准 Windows 安装会闭锁该功能；控制序列会先转成可见文本，超过 32,000 的文本长度上限时拒绝插入，较早发起但较晚返回的粘贴也不会污染新输入。可用命令：`/help`、`/model [profile]`、`/status`、`/clear`、`/details`、`/exit`。`/clear` 会清空会话上下文和当前终端历史，但不会删除审计；`Ctrl+C` 在空闲时退出，在运行中则取消当前任务、关闭待确认操作并终止可控子进程。
 
-默认启动的 `FakeModel` 只用于可重复的离线演示，不理解自由任务，也不会自主修改代码。要运行真实 Agent，须显式选择一个已配置的网络 Profile；TUI 会在进入远程会话和切换远程 Profile 时显示工作区、目标 Profile 与可能外发的数据类别。默认是只读模式：
+默认启动的 `FakeModel` 只用于可重复的离线演示，不理解自由任务，也不会自主修改代码。它只接受固定示例：说明未知工具的终态、查看 Git status/diff、运行固定验证，以及编辑模式中的 npm 版本查询；其他输入会直接说明边界，不调用工具、不写审计，也不会伪装成一次已完成的代码任务。要运行真实 Agent，须显式选择一个已配置的网络 Profile；TUI 会在进入远程会话和切换远程 Profile 时显示工作区、目标 Profile 与可能外发的数据类别。默认是只读模式：
 
 ```powershell
 cmd.exe /d /c npm run mini -- --model deepseek --deepseek-model deepseek-v4-flash --require-source-evidence
@@ -175,7 +175,7 @@ cmd.exe /d /c npm run demo -- --model deepseek --deepseek-model deepseek-v4-flas
 cmd.exe /d /c npm run demo -- --workspace . --apply "修复一个已确认的问题"
 ```
 
-当前 `FakeModel` 默认演示检索和读取源码；它不会自行发起补丁，受控写入与失败修复由测试中的脚本化模型覆盖。每次 CLI 运行默认写入用户级审计目录：Windows 为 `%LOCALAPPDATA%\MiniCode\audit\session-*.jsonl`，其他平台为 `~/.minicode/audit/session-*.jsonl`；可用 `--audit <path>` 显式改写位置，因此只读检查默认不会在目标仓库中创建 `reports`。审计写入会串行化，使用共同的 `toolCallId` 关联 `tool_call`、`policy_decision` 与 `tool_finalized`；计划、补丁、命令和修复方向确认只保存脱敏元数据与决定，不保存模型上下文、方向正文、文件内容或补丁原文。
+当前 `FakeModel` 只会在明确的固定示例中演示检索和读取源码；它不会自行发起补丁，受控写入与失败修复由测试中的脚本化模型覆盖。每次 CLI 运行默认写入用户级审计目录：Windows 为 `%LOCALAPPDATA%\MiniCode\audit\session-*.jsonl`，其他平台为 `~/.minicode/audit/session-*.jsonl`；可用 `--audit <path>` 显式改写位置，因此只读检查默认不会在目标仓库中创建 `reports`。审计写入会串行化，使用共同的 `toolCallId` 关联 `tool_call`、`policy_decision` 与 `tool_finalized`；计划、补丁、命令和修复方向确认只保存脱敏元数据与决定，不保存模型上下文、方向正文、文件内容或补丁原文。
 
 当任务包含“运行测试”或“运行类型检查”时，`FakeModel` 会分别选择 `run_project_check` 的 `test` 或 `check` 动作。参数通过校验后，Agent Loop 先产生脱敏的命令确认事件；没有确认回调、用户输入 `CANCEL` 或确认界面异常时均默认闭锁，不会进入 `tool_execution_started`。只有精确输入 `RUN` 后，工具才通过 Node 直接启动 npm CLI；它不使用 `shell: true`、`cmd /c` 或模型提供的命令字符串，工作目录固定为工作区根目录。审批前会绑定工作目录、Node/npm 入口和根 `package.json` 的身份与完整内容，执行前再次复核；等待期间任一对象变化都会保持零进程。超时为 60 秒，输出最多保留 12,000 个字符。非零退出码、超时或用户取消会成为 `ToolResultMessage(error)`。审计只保存动作、确认决定、退出码、耗时、输出长度和截断/超时/取消标记。
 

@@ -3,6 +3,7 @@
 import path from "node:path";
 import process from "node:process";
 import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -19,6 +20,7 @@ import type {
   RepairApprovalRequest,
 } from "./agent/contracts.ts";
 import type { AgentEvent } from "./agent/events.ts";
+import { fakeModelUnsupportedTaskMessage, isFakeModelDemoTask } from "./models/fake-model.ts";
 import {
   createAgent,
   listModelProfiles,
@@ -192,6 +194,7 @@ export class MiniTuiApp {
   readonly #onExit?: () => void;
   readonly #readClipboard: () => Promise<string>;
   readonly #createAgent?: () => AgentLoop;
+  readonly #usesBuiltInModelFactory: boolean;
   readonly #renderer: PiTuiRenderer;
   readonly #history: ConversationMessage[] = [];
   readonly #events: AgentEvent[] = [];
@@ -210,12 +213,19 @@ export class MiniTuiApp {
   #taskGeneration = 0;
   #inputGeneration = 0;
 
-  constructor(options: CliArguments, terminal: Terminal, agent: AgentLoop, callbacks: MiniTuiCallbacks = {}) {
+  constructor(
+    options: CliArguments,
+    terminal: Terminal,
+    agent: AgentLoop,
+    callbacks: MiniTuiCallbacks = {},
+    usesBuiltInModelFactory = false,
+  ) {
     this.#options = options;
     this.#agent = agent;
     this.#onExit = callbacks.onExit;
     this.#readClipboard = callbacks.readClipboard ?? readWindowsClipboard;
     this.#createAgent = callbacks.createAgent;
+    this.#usesBuiltInModelFactory = usesBuiltInModelFactory;
     const rendererCallbacks: PiTuiRendererCallbacks = {
       onAction: (action) => this.handleTuiAction(action),
       normalizeInput: (text) => {
@@ -322,6 +332,7 @@ export class MiniTuiApp {
   async submit(rawInput: string): Promise<void> {
     const input = rawInput.trim();
     if (this.#stopped) return;
+    if (input) this.appendUser(input);
     if (this.#pendingApproval) {
       const spec = APPROVAL_SPECS[this.#pendingApproval.kind];
       if (input === spec.confirmWord) {
@@ -350,6 +361,25 @@ export class MiniTuiApp {
       return;
     }
 
+    if (
+      this.#usesBuiltInModelFactory &&
+      this.#options.modelProfile === "fake" &&
+      !isFakeModelDemoTask(input)
+    ) {
+      this.#renderer.setEditorText("");
+      this.#inputGeneration += 1;
+      this.#events.splice(0, this.#events.length);
+      this.#renderer.setActivityEvents(this.#events);
+      this.#currentPlan = undefined;
+      this.#currentCloseout = undefined;
+      this.#sessionPhase = "ready";
+      this.#sessionActivity = "等待任务";
+      this.appendAnswer(fakeModelUnsupportedTaskMessage());
+      this.#renderer.focusEditor();
+      this.#renderer.requestRender();
+      return;
+    }
+
     this.#renderer.setEditorText("");
     this.#renderer.setEditorSubmitDisabled(true);
     this.#inputGeneration += 1;
@@ -363,7 +393,6 @@ export class MiniTuiApp {
     const taskGeneration = ++this.#taskGeneration;
     const abortController = new AbortController();
     this.#taskAbortController = abortController;
-    this.appendUser(input);
     this.#renderer.setLoaderMessage("正在准备任务");
     this.#renderer.startLoader();
 
@@ -510,7 +539,7 @@ export class MiniTuiApp {
     const mode = this.#options.guided
       ? "当前为引导式会话：先确认计划，再进入每个执行阶段。"
       : this.#options.modelProfile === "fake"
-        ? "当前是离线演示；输入 /model 查看并切换已配置的模型 Profile。"
+        ? "当前是离线演示：仅支持固定示例；输入 /help 查看示例，/model 查看并切换已配置的模型 Profile。"
         : this.#options.agentMode === "edit"
           ? "当前是受控编辑会话：补丁逐次等待 APPLY，验证与 Node/npm 命令逐次等待 RUN。"
           : `当前会话会调用 ${modelLabel(this.#options)}，并仅开放已标明的工具权限。`;
@@ -607,7 +636,7 @@ export class MiniTuiApp {
     }
     switch (input) {
       case "/help":
-        this.appendNotice("鼠标滚轮或终端滚动条查看历史；Ctrl+V 粘贴文本；/model 查看或切换模型；/status 查看当前配置；/details 或 Ctrl+O 展开工具活动；/clear 清空会话与当前终端历史；/exit 退出。计划或失败修复确认输入 CONTINUE；编辑确认输入 APPLY；验证或命令确认输入 RUN；CANCEL 取消。", "accent");
+        this.#renderer.appendHelp(this.#options.modelProfile === "fake");
         break;
       case "/status":
         this.appendNotice(
@@ -716,6 +745,7 @@ export function createMiniTui(
   callbacks: MiniTuiCallbacks = {},
 ): MiniTuiApp {
   const options = parseArguments(args);
+  const usesBuiltInModelFactory = callbacks.model === undefined;
 
   let app: MiniTuiApp | undefined;
   const createConfiguredAgent = (): AgentLoop => createAgent(options, {
@@ -730,7 +760,13 @@ export function createMiniTui(
     requestCommandApproval: (request) => app?.requestCommandApproval(request) ?? Promise.resolve(false),
   });
   const agent = createConfiguredAgent();
-  app = new MiniTuiApp(options, terminal, agent, { ...callbacks, createAgent: createConfiguredAgent });
+  app = new MiniTuiApp(
+    options,
+    terminal,
+    agent,
+    { ...callbacks, createAgent: createConfiguredAgent },
+    usesBuiltInModelFactory,
+  );
   return app;
 }
 
@@ -753,7 +789,18 @@ export async function runMini(args: string[] = process.argv.slice(2)): Promise<v
   }
 }
 
-const isMainModule = process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMainModule) {
+function isMainModule(entryPath: string | undefined): boolean {
+  if (entryPath === undefined) return false;
+  const modulePath = fileURLToPath(import.meta.url);
+  try {
+    // `npm link` can reach this file through a symlink or Windows junction.
+    // Compare canonical paths so the linked `mini` command is recognized.
+    return realpathSync(entryPath) === realpathSync(modulePath);
+  } catch {
+    return path.resolve(entryPath) === modulePath;
+  }
+}
+
+if (isMainModule(process.argv[1])) {
   await runMini();
 }

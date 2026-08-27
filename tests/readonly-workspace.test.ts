@@ -355,10 +355,26 @@ test("FakeModel 通过真实搜索和读取工具解释当前 AgentLoop", async 
   }).run("说明未知工具为何仍有完整的终态事件。");
 
   assert.match(result.answer, /只读代码侦察闭环已完成/);
+  assert.match(result.answer, /源代码原文；\$\{\.\.\.\} 表示运行时插值占位符/u);
   assert.match(result.answer, /src\/agent\/agent-loop.ts/);
   assert.match(result.answer, /未知工具/);
   assert.deepEqual(
     result.events.filter((event) => event.type === "tool_call").map((event) => event.toolName),
     ["search_text", "read_file"],
+  );
+});
+
+test("FakeModel 对自由输入说明边界，不伪装成源码侦察", async () => {
+  const registry = new ToolRegistry([listFiles, searchText, readFile]);
+  const result = await new AgentLoop(new FakeModel(), registry, {
+    workspaceRoot: process.cwd(),
+  }).run("你好");
+
+  assert.match(result.answer, /离线 FakeModel 演示/u);
+  assert.match(result.answer, /本次未执行工具/u);
+  assert.doesNotMatch(result.answer, /只读代码侦察闭环已完成/u);
+  assert.deepEqual(
+    result.events.filter((event) => event.type === "tool_call" || event.type === "tool_execution_started"),
+    [],
   );
 });

@@ -438,7 +438,6 @@ const SLOT_ORDER: readonly TuiSlot[] = [
   "activity",
   "closeout",
   "approval",
-  "composer_hint",
   "composer",
   "footer",
 ];
@@ -633,15 +632,7 @@ export function createCoreTuiPlugins(): readonly TuiPlugin[] {
     },
     {
       id: "core.composer",
-      nodes: (context) => [
-        stableNode(
-          "core.composer-hint",
-          "composer_hint",
-          context,
-          () => new Text(muted("  输入一个代码任务，Enter 发送，Shift+Enter 换行。"), 0, 1),
-        ),
-        stableNode("core.composer", "composer", context, () => context.composer),
-      ],
+      nodes: (context) => [stableNode("core.composer", "composer", context, () => context.composer)],
     },
     {
       id: "core.footer",
@@ -839,6 +830,51 @@ export class PiTuiRenderer {
       1,
       MARKDOWN_THEME,
     ));
+    this.requestRender();
+  }
+
+  appendHelp(includeOfflineExamples: boolean): void {
+    const appendSection = (title: string, entries: readonly (readonly [string, string])[]): void => {
+      this.#transcript.addChild(new Text(
+        [
+          bold(accent(title)),
+          ...entries.map(([command, description]) => `  ${yellow(command)}  ${muted(description)}`),
+        ].join("\n"),
+        2,
+        1,
+      ));
+    };
+
+    this.#transcript.addChild(new Text(
+      `${bold(accent("帮助"))}  ${muted("命令与本地确认")}`,
+      1,
+      0,
+    ));
+    appendSection("会话", [
+      ["/model [profile]", "查看或切换模型 Profile"],
+      ["/status", "查看当前配置"],
+      ["/details 或 Ctrl+O", "展开或折叠工具活动"],
+      ["/clear", "清空会话与当前终端历史"],
+      ["/exit", "退出"],
+    ]);
+    appendSection("浏览与输入", [
+      ["滚轮或终端滚动条", "查看历史"],
+      ["Ctrl+V", "粘贴文本"],
+    ]);
+    appendSection("本地确认（仅等待确认时有效）", [
+      ["CONTINUE", "开始计划或继续一次有界修复"],
+      ["APPLY", "写入已预览的补丁"],
+      ["RUN", "执行固定验证或受控命令"],
+      ["CANCEL", "取消当前确认"],
+    ]);
+    if (includeOfflineExamples) {
+      appendSection("离线演示（不会自行修改文件）", [
+        ["源码查看", "说明未知工具为何仍有完整的终态事件"],
+        ["Git 查看", "请查看 Git status 和未暂存 diff 并汇报"],
+        ["测试", "运行测试并汇报结果"],
+        ["编辑模式", "请查看 npm --version 并汇报"],
+      ]);
+    }
     this.requestRender();
   }
 

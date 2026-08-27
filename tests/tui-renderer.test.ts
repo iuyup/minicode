@@ -92,7 +92,6 @@ test("内建 TUI 插件按稳定键和固定槽位挂载，工作流随安全快
       "core.activity",
       "core.closeout",
       "core.approval",
-      "core.composer-hint",
       "core.composer",
       "core.footer",
     ];
@@ -100,6 +99,7 @@ test("内建 TUI 插件按稳定键和固定槽位挂载，工作流随安全快
     assert.equal(new Set(renderer.mountedNodeKeys).size, expectedKeys.length);
     await waitFor(() => stripAnsi(terminal.output).includes("工作流"));
     assert.match(stripAnsi(terminal.output), /工作流/u);
+    assert.doesNotMatch(stripAnsi(terminal.output), /输入一个代码任务，Enter 发送，Shift\+Enter 换行。/u);
 
     state = {
       ...state,

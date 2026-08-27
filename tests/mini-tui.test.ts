@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import type { Terminal } from "@mariozechner/pi-tui";
 
@@ -30,6 +33,9 @@ import {
   type CommandRunResult,
   type CommandRunner,
 } from "../src/tools/run-command.ts";
+
+const execFileAsync = promisify(execFile);
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 class FakeTerminal implements Terminal {
   #onInput?: (data: string) => void;
@@ -192,6 +198,28 @@ test("mini 使用普通终端历史，不进入备用屏幕或开启鼠标捕获
   assert.doesNotMatch(source, /\?100[0236]h/u);
 });
 
+test("npm link 的 junction 入口仍会启动 mini", async () => {
+  const linkParent = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-bin-link-"));
+  const linkedProject = path.join(linkParent, "mini-coding-agent");
+  await fs.symlink(projectRoot, linkedProject, process.platform === "win32" ? "junction" : "dir");
+  try {
+    await assert.rejects(
+      execFileAsync(process.execPath, [path.join(linkedProject, "src", "mini.ts")], {
+        cwd: linkParent,
+        encoding: "utf8",
+      }),
+      (error: unknown) => {
+        const processError = error as Error & { code?: number; stderr?: string };
+        assert.equal(processError.code, 1);
+        assert.match(processError.stderr ?? "", /mini 需要可交互的 TTY 终端/u);
+        return true;
+      },
+    );
+  } finally {
+    await fs.rm(linkParent, { recursive: true, force: true });
+  }
+});
+
 test("长会话保持原生 scrollback，clear 才显式清除当前终端历史", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-scrollback-"));
   const terminal = new FakeTerminal();
@@ -282,6 +310,59 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
     assert.equal(events.at(-1)?.type, "agent_completed");
     app.stop();
   } finally {
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("默认离线 TUI 对自由输入只说明边界，不创建伪任务", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-fake-boundary-"));
+  const auditPath = path.join(reportDirectory, "audit.jsonl");
+  const terminal = new FakeTerminal();
+  const app = createMiniTui(["--workspace", process.cwd(), "--audit", auditPath], terminal);
+  try {
+    app.start();
+    await app.submit("你好");
+    await waitFor(() => stripAnsi(terminal.output).includes("离线 FakeModel 演示"));
+
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /当前是离线演示：仅支持固定示例/u);
+    assert.match(output, /本次未执行工具，也没有修改文件/u);
+    assert.doesNotMatch(output, /只读代码侦察闭环已完成|本次任务收口/u);
+    assert.equal(app.running, false);
+    assert.equal(app.contextTurns, 0);
+    assert.equal(app.sessionViewState.closeout, undefined);
+    await assert.rejects(fs.access(auditPath));
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("提交 /help 会保留用户输入，并以分组格式显示帮助", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-help-"));
+  const terminal = new FakeTerminal();
+  const app = createMiniTui(
+    ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+    terminal,
+  );
+  try {
+    app.start();
+    terminal.send("/help");
+    terminal.send("\r");
+    await waitFor(() => stripAnsi(terminal.output).includes("命令与本地确认"));
+
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /你\s+\/help/u);
+    assert.match(output, /帮助\s+命令与本地确认/u);
+    assert.match(output, /会话\s+\/model \[profile\]\s+查看或切换模型 Profile/u);
+    assert.match(output, /浏览与输入\s+滚轮或终端滚动条\s+查看历史/u);
+    assert.match(output, /本地确认（仅等待确认时有效）\s+CONTINUE\s+开始计划或继续一次有界修复/u);
+    assert.match(output, /离线演示（不会自行修改文件）\s+源码查看\s+说明未知工具为何仍有完整的终态事件/u);
+    assert.doesNotMatch(output, /Ctrl\+V 粘贴文本；\/model 查看或切换模型/u);
+    assert.equal(app.editorText, "");
+    assert.equal(app.contextTurns, 0);
+  } finally {
+    app.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
   }
 });

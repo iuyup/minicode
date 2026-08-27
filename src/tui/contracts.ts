@@ -112,7 +112,6 @@ export type TuiSlot =
   | "activity"
   | "closeout"
   | "approval"
-  | "composer_hint"
   | "composer"
   | "footer";
 

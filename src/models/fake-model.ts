@@ -93,6 +93,49 @@ function findUnknownToolLocation(searchContent: string): { path: string; startLi
   };
 }
 
+function hasTool(request: ModelRequest, name: string): boolean {
+  return request.tools.some((tool) => tool.name === name);
+}
+
+function requestsGitInspection(task: string): boolean {
+  return /git[\s\S]*(?:status|diff|状态|差异|变更)|(?:status|diff|状态|差异|变更)[\s\S]*git/iu.test(task);
+}
+
+function requestsNpmVersion(task: string): boolean {
+  return /(?:查看|运行|执行).*(?:npm\s*(?:--version|-v)|npm\s*版本)|npm\s*(?:--version|-v)/i.test(task);
+}
+
+function requestedProjectCheck(task: string): "test" | "check" | undefined {
+  if (/(?:运行|执行).*(?:测试|test)|npm\s+test/i.test(task)) return "test";
+  if (/(?:运行|执行).*(?:类型检查|检查|check)|npm\s+run\s+check/i.test(task)) return "check";
+  return undefined;
+}
+
+function requestsUnknownToolExplanation(task: string): boolean {
+  return /未知工具/u.test(task) && /(?:终态|错误|处理逻辑)/u.test(task);
+}
+
+/** 离线替身只支持少数可重复、可测试的演示任务。 */
+export function isFakeModelDemoTask(task: string): boolean {
+  return requestsGitInspection(task) ||
+    requestsNpmVersion(task) ||
+    requestedProjectCheck(task) !== undefined ||
+    requestsUnknownToolExplanation(task);
+}
+
+/** 未命中固定演示时的统一边界说明；不应伴随任何工具调用。 */
+export function fakeModelUnsupportedTaskMessage(): string {
+  return [
+    "当前是离线 FakeModel 演示；本次未执行工具，也没有修改文件。",
+    "它不理解自由对话或任意代码任务。可尝试以下固定示例：",
+    "1. 说明未知工具为何仍有完整的终态事件",
+    "2. 请查看 Git status 和未暂存 diff 并汇报（普通或编辑模式）",
+    "3. 运行测试并汇报结果（普通或编辑模式，需本地确认 RUN）",
+    "4. 请查看 npm --version 并汇报（--mode edit，需本地确认 RUN）",
+    "在 TUI 中输入 /help 查看示例；如需自由代码任务，请输入 /model 切换已配置的模型 Profile。",
+  ].join("\n");
+}
+
 /**
  * 确定性的 LLM 替身：先搜索，再读取真实源文件，最后基于 ToolResultMessage 回答。
  */
@@ -117,12 +160,16 @@ export class FakeModel implements ChatModel {
     }
 
     const task = originalUserTask(request);
-    const requestedGit = /git[\s\S]*(?:status|diff|状态|差异|变更)|(?:status|diff|状态|差异|变更)[\s\S]*git/iu.test(task);
+    if (!isFakeModelDemoTask(task)) {
+      return { kind: "final", content: fakeModelUnsupportedTaskMessage() };
+    }
+
+    const requestedGit = requestsGitInspection(task);
     const requestedStagedDiff = requestedGit && /staged[_\s-]?diff|已暂存(?:差异|diff)/iu.test(task);
     const requestedDiff = requestedGit && !requestedStagedDiff && /diff|差异|变更/iu.test(task);
     const requestedStatus = requestedGit && (/status|状态|变更/iu.test(task) || !requestedDiff && !requestedStagedDiff);
     if (requestedGit) {
-      if (!request.tools.some((tool) => tool.name === "inspect_git")) {
+      if (!hasTool(request, "inspect_git")) {
         return {
           kind: "final",
           content: "当前工具集未开放 inspect_git；源码取证模式不会读取 Git，普通 read/edit 模式才提供固定只读 Git 动作。",
@@ -165,11 +212,11 @@ export class FakeModel implements ChatModel {
         ].join("\n"),
       };
     }
-    const requestedNpmVersion = /(?:查看|运行|执行).*(?:npm\s*(?:--version|-v)|npm\s*版本)|npm\s*(?:--version|-v)/i.test(task);
+    const requestedNpmVersion = requestsNpmVersion(task);
     const commandResult = request.messages.find(
       (message): message is ToolResultMessage => message.role === "tool" && message.name === "run_command",
     );
-    if (requestedNpmVersion && request.tools.some((tool) => tool.name === "run_command")) {
+    if (requestedNpmVersion && hasTool(request, "run_command")) {
       if (!commandResult) {
         return {
           kind: "tool_calls",
@@ -197,17 +244,19 @@ export class FakeModel implements ChatModel {
         content: "当前工具集未开放 run_command；请使用 --mode edit 启动离线命令面板演示。",
       };
     }
-    const requestedCheck = /(?:运行|执行).*(?:测试|test)|npm\s+test/i.test(task)
-      ? "test"
-      : /(?:运行|执行).*(?:类型检查|检查|check)|npm\s+run\s+check/i.test(task)
-        ? "check"
-        : undefined;
+    const requestedCheck = requestedProjectCheck(task);
     const projectCheckResult = request.messages.find(
       (message): message is ToolResultMessage =>
         message.role === "tool" && message.name === "run_project_check",
     );
 
     if (requestedCheck) {
+      if (!hasTool(request, "run_project_check")) {
+        return {
+          kind: "final",
+          content: "当前工具集未开放 run_project_check；请在普通或编辑模式启动离线固定验证演示。",
+        };
+      }
       if (!projectCheckResult) {
         return {
           kind: "tool_calls",
@@ -228,6 +277,13 @@ export class FakeModel implements ChatModel {
             .join(" | ")}`,
           "模型只选择固定动作，不传入命令字符串、参数或工作目录。",
         ].join("\n"),
+      };
+    }
+
+    if (!hasTool(request, "search_text") || !hasTool(request, "read_file")) {
+      return {
+        kind: "final",
+        content: "当前工具集未同时开放 search_text 和 read_file；无法运行未知工具源码取证演示。",
       };
     }
 
@@ -271,7 +327,7 @@ export class FakeModel implements ChatModel {
       kind: "final",
       content: [
         "只读代码侦察闭环已完成。",
-        `代码证据：${evidence}`,
+        `代码证据（源代码原文；\${...} 表示运行时插值占位符）：${evidence}`,
         `搜索工具已确认候选位置：${searchResult.content.split("\n").find((line) => line.includes("agent-loop.ts")) ?? "未显示候选位置。"}`,
         "模型是在 search_text 和 read_file 的结果写回消息历史后，才给出该结论。",
       ].join("\n"),
