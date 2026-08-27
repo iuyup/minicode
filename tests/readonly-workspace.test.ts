@@ -87,10 +87,16 @@ test("越界和受保护文件会变成标准化错误终态，而不是被读�
     );
     await assert.rejects(readFile.execute({ path: ".env" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: ".ENV" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: ".ENV.missing" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: "src/.Env.Local" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: ".npmrc" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: "src/.Pypirc" }, context(workspace)), /目标路径受保护/);
     await assert.rejects(readFile.execute({ path: ".ssh/id_rsa" }, context(workspace)), /目标路径受保护/);
+    await assert.rejects(readFile.execute({ path: "missing.txt" }, context(workspace)), /路径不存在/);
+    await assert.rejects(
+      new WorkspacePolicy(workspace).resolveWritePath(".ENV.missing"),
+      /目标路径受保护/,
+    );
 
     let callCount = 0;
     const model: ChatModel = {

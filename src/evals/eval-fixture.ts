@@ -10,6 +10,7 @@ import {
   getEvaluationTask,
   type EvaluationTask,
 } from "./task-definitions.ts";
+import { resolvePlainPath } from "./path-safety.ts";
 
 const MARKER_NAME = "minicode-eval-fixture.json";
 const MARKER_KIND = "minicode-eval-fixture";
@@ -80,29 +81,6 @@ async function lstatIfExists(target: string): Promise<Awaited<ReturnType<typeof 
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
-  }
-}
-
-async function projectedRealPath(target: string): Promise<string> {
-  let cursor = path.resolve(target);
-  const missingSegments: string[] = [];
-  while (true) {
-    const stats = await lstatIfExists(cursor);
-    if (stats) {
-      if (missingSegments.length > 0) {
-        const followed = await fs.stat(cursor);
-        if (!followed.isDirectory()) {
-          throw new Error(`评测目录的既有祖先不是目录：${cursor}`);
-        }
-      }
-      return path.resolve(await fs.realpath(cursor), ...missingSegments);
-    }
-    const parent = path.dirname(cursor);
-    if (samePath(parent, cursor)) {
-      throw new Error(`无法解析评测目录的既有祖先：${target}`);
-    }
-    missingSegments.unshift(path.basename(cursor));
-    cursor = parent;
   }
 }
 
@@ -786,8 +764,10 @@ async function removeValidatedFixtureForReset(runRoot: string, task: EvaluationT
   }
 }
 
-export function evaluationFixtureOperationLockPath(runRoot: string): string {
-  const resolvedRunRoot = path.resolve(runRoot);
+export async function evaluationFixtureOperationLockPath(runRoot: string): Promise<string> {
+  const requestedRunRoot = path.resolve(runRoot);
+  assertOwnedRunRootShape(requestedRunRoot);
+  const resolvedRunRoot = await resolvePlainPath(requestedRunRoot, "评测运行目录");
   assertOwnedRunRootShape(resolvedRunRoot);
   return path.join(
     path.dirname(resolvedRunRoot),
@@ -801,7 +781,7 @@ interface EvaluationFixtureOperationLock {
 }
 
 async function acquireEvaluationFixtureOperationLock(runRoot: string): Promise<EvaluationFixtureOperationLock> {
-  const lockPath = evaluationFixtureOperationLockPath(runRoot);
+  const lockPath = await evaluationFixtureOperationLockPath(runRoot);
   try {
     await fs.mkdir(lockPath, { mode: 0o700 });
   } catch (error) {
@@ -889,7 +869,7 @@ async function describePreservedCreationRoot(
 }
 
 export async function readEvaluationFixture(runRoot: string): Promise<PreparedEvaluationFixture> {
-  const resolvedRunRoot = path.resolve(runRoot);
+  const resolvedRunRoot = await resolvePlainPath(runRoot, "评测运行目录");
   const marker = await readMarker(resolvedRunRoot);
   const task = getEvaluationTask(marker.taskId);
   if (!task) throw new Error(`marker 引用了未知评测任务：${marker.taskId}。`);
@@ -907,17 +887,14 @@ export async function prepareEvaluationFixture(
 ): Promise<PreparedEvaluationFixture> {
   const task = getEvaluationTask(options.taskId);
   if (!task) throw new Error(`未知评测任务：${options.taskId}。`);
-  const runRoot = path.resolve(options.runRoot);
+  const requestedRunRoot = path.resolve(options.runRoot);
+  assertOwnedRunRootShape(requestedRunRoot);
+  const runRoot = await resolvePlainPath(requestedRunRoot, "评测输出目录");
   assertOwnedRunRootShape(runRoot);
-
-  const projected = await projectedRealPath(runRoot);
-  if (!samePath(projected, runRoot)) {
-    throw new Error("评测输出目录经过既有链接或 junction，拒绝创建。");
-  }
 
   await fs.mkdir(path.dirname(runRoot), { recursive: true });
   await assertPlainDirectory(path.dirname(runRoot), "fixture 父目录");
-  if (!samePath(await projectedRealPath(runRoot), runRoot)) {
+  if (!samePath(await resolvePlainPath(runRoot, "评测输出目录"), runRoot)) {
     throw new Error("评测输出目录的真实路径在准备期间发生变化，拒绝创建。");
   }
 
@@ -936,7 +913,7 @@ export async function prepareEvaluationFixture(
       throw new Error("--reset-output 目标不存在；请使用 --output 创建新目录。");
     }
 
-    if (!samePath(await projectedRealPath(runRoot), runRoot)) {
+    if (!samePath(await resolvePlainPath(runRoot, "评测输出目录"), runRoot)) {
       throw new Error("评测输出目录的真实路径在操作锁持有期间发生变化，拒绝创建。");
     }
 

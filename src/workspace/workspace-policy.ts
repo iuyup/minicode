@@ -313,6 +313,11 @@ export class WorkspacePolicy {
       throw new WorkspaceAccessError("路径越出了工作区。");
     }
 
+    const lexicalRelativePath = toDisplayPath(path.relative(this.#workspaceRoot, lexicalCandidate));
+    if (shouldSkipWorkspaceEntry(lexicalRelativePath)) {
+      throw new WorkspaceAccessError(`目标路径受保护，已拒绝${operation}。`);
+    }
+
     let realWorkspaceRoot: string;
     let realCandidate: string;
     try {

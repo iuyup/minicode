@@ -38,6 +38,7 @@ import {
   type EvaluationSourceProvenance,
 } from "./eval-provenance.ts";
 import { evaluationTasks, getEvaluationTask } from "./task-definitions.ts";
+import { resolvePlainPath } from "./path-safety.ts";
 
 type EvaluationProfileId = "deepseek" | "openai-compatible";
 
@@ -195,7 +196,7 @@ function builtInModelFactory(
 }
 
 async function assertNewOutputRoot(outputRoot: string): Promise<string> {
-  const resolved = path.resolve(outputRoot);
+  const resolved = await resolvePlainPath(outputRoot, "评测 suite 输出目录");
   try {
     await fs.lstat(resolved);
     throw new Error("评测 suite 输出目录已存在；正式运行不会覆盖或续跑。");
@@ -203,7 +204,7 @@ async function assertNewOutputRoot(outputRoot: string): Promise<string> {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   await fs.mkdir(resolved, { recursive: false });
-  if (!samePath(await fs.realpath(resolved), resolved)) {
+  if (!samePath(await resolvePlainPath(resolved, "评测 suite 输出目录"), resolved)) {
     throw new Error("评测 suite 输出目录经过链接或 junction，拒绝运行。");
   }
   return resolved;

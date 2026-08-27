@@ -10,6 +10,14 @@ function context(workspaceRoot: string) {
   return { task: "read_file TOCTOU 测试", step: 1, workspaceRoot };
 }
 
+function samePath(left: string, right: string): boolean {
+  const normalizedLeft = path.normalize(path.resolve(left));
+  const normalizedRight = path.normalize(path.resolve(right));
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
 async function createWorkspace(): Promise<string> {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-read-toctou-"));
   await fs.mkdir(path.join(workspace, "src"));
@@ -50,11 +58,12 @@ test("read_file 拒绝 resolve 后、open 前发生的同路径文件替换", as
   const originalPath = path.join(workspace, "src", "original.ts");
   await fs.writeFile(targetPath, "export const version = 'approved';\n");
   await fs.writeFile(replacementPath, "export const version = 'replaced';\n");
+  const canonicalTargetPath = await fs.realpath(targetPath);
 
   const nativeOpen = fs.open;
   let replaced = false;
   fs.open = (async (...args: Parameters<typeof fs.open>) => {
-    if (!replaced && path.resolve(String(args[0])) === path.resolve(targetPath)) {
+    if (!replaced && samePath(String(args[0]), canonicalTargetPath)) {
       replaced = true;
       await fs.rename(targetPath, originalPath);
       await fs.rename(replacementPath, targetPath);
@@ -78,18 +87,19 @@ test("read_file 拒绝句柄读取期间发生的同 inode 原地修改", async 
   const workspace = await createWorkspace();
   const targetPath = path.join(workspace, "src", "changing.ts");
   await fs.writeFile(targetPath, "export const version = 'before';\n");
+  const canonicalTargetPath = await fs.realpath(targetPath);
 
   const nativeOpen = fs.open;
   let changed = false;
   fs.open = (async (...args: Parameters<typeof fs.open>) => {
     const handle = await nativeOpen(...args);
-    if (path.resolve(String(args[0])) === path.resolve(targetPath)) {
+    if (samePath(String(args[0]), canonicalTargetPath)) {
       const nativeReadFile = handle.readFile.bind(handle);
       Object.defineProperty(handle, "readFile", {
         configurable: true,
         value: async (...readArgs: Parameters<typeof handle.readFile>) => {
           const content = await nativeReadFile(...readArgs);
-          await fs.writeFile(targetPath, "export const version = 'after!';\n");
+          await fs.writeFile(targetPath, "export const version = 'after with a different size';\n");
           changed = true;
           return content;
         },
@@ -114,12 +124,13 @@ test("read_file 在非法 UTF-8 错误前关闭已打开的句柄", async () => 
   const workspace = await createWorkspace();
   const targetPath = path.join(workspace, "src", "invalid.ts");
   await fs.writeFile(targetPath, Buffer.from([0x62, 0x61, 0x64, 0x80]));
+  const canonicalTargetPath = await fs.realpath(targetPath);
 
   const nativeOpen = fs.open;
   let closeCalls = 0;
   fs.open = (async (...args: Parameters<typeof fs.open>) => {
     const handle = await nativeOpen(...args);
-    if (path.resolve(String(args[0])) === path.resolve(targetPath)) {
+    if (samePath(String(args[0]), canonicalTargetPath)) {
       const nativeClose = handle.close.bind(handle);
       Object.defineProperty(handle, "close", {
         configurable: true,

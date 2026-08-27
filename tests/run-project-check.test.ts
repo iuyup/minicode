@@ -169,6 +169,7 @@ test("模型不能传入任意命令或额外参数", async () => {
 
 test("用户取消固定验证时不启动 runner，并保留脱敏确认终态", async () => {
   const workspace = await createWorkspace({ test: "node -e \"console.log('SHOULD_NOT_RUN')\"" });
+  const canonicalWorkspace = await fs.realpath(workspace);
   let runnerCalls = 0;
   const runner: ProjectCheckRunner = {
     async run(): Promise<ProjectCheckRunResult> {
@@ -192,7 +193,7 @@ test("用户取消固定验证时不启动 runner，并保留脱敏确认终态"
         assert.equal(request.kind, "verification");
         assert.equal(request.action, "test");
         assert.equal(request.command, "npm test");
-        assert.equal(request.workingDirectory, path.resolve(workspace));
+        assert.equal(request.workingDirectory, canonicalWorkspace);
         assert.equal(request.riskLevel, "medium");
         assert.match(request.risk, /不是操作系统沙箱/);
         return false;

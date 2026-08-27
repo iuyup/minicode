@@ -68,11 +68,18 @@ function initialState(): SessionViewState {
   };
 }
 
+const SHORT_WORKSPACE_PATH = process.platform === "win32" ? "C:\\minicode" : "/minicode";
+
 test("内建 TUI 插件按稳定键和固定槽位挂载，空闲时保持紧凑", async () => {
   const terminal = new FakeTerminal();
   let state = initialState();
   const renderer = new PiTuiRenderer({
-    options: parseArguments(["--workspace", process.cwd(), "--audit", path.join(process.cwd(), "audit.jsonl")]),
+    options: parseArguments([
+      "--workspace",
+      SHORT_WORKSPACE_PATH,
+      "--audit",
+      path.join(SHORT_WORKSPACE_PATH, "audit.jsonl"),
+    ]),
     terminal,
     viewState: () => state,
     callbacks: {
@@ -103,7 +110,7 @@ test("内建 TUI 插件按稳定键和固定槽位挂载，空闲时保持紧凑
     assert.doesNotMatch(stripAnsi(terminal.output), /受控 Coding Agent|工作流|当前活动|工具活动已折叠/u);
     assert.doesNotMatch(stripAnsi(terminal.output), /输入一个代码任务，Enter 发送，Shift\+Enter 换行。/u);
     assert.doesNotMatch(stripAnsi(terminal.output), /\/help · Ctrl\+V 粘贴 · Ctrl\+C 退出 · 上下文/u);
-    assert.ok(stripAnsi(terminal.output).includes(path.resolve(process.cwd())));
+    assert.ok(stripAnsi(terminal.output).includes(SHORT_WORKSPACE_PATH));
     assert.match(stripAnsi(terminal.output), /FakeModel（离线）/u);
 
     state = {
@@ -123,7 +130,7 @@ test("内建 TUI 插件按稳定键和固定槽位挂载，空闲时保持紧凑
 });
 
 test("底栏只显示实际远程模型名，窄窗口优先保留模型", async () => {
-  const workspacePath = path.resolve(process.cwd());
+  const workspacePath = SHORT_WORKSPACE_PATH;
   const terminal = new FakeTerminal();
   terminal.columns = 80;
   const renderer = new PiTuiRenderer({

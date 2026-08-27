@@ -509,9 +509,10 @@ test("mini TUI projects phase, persistent plan, and local approval controls with
 
 test("未指定 audit 时会写入用户级目录而不是工作区 reports", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-default-audit-workspace-"));
-  const localAppData = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-default-audit-user-"));
+  const userRoot = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-default-audit-user-"));
   const terminal = new FakeTerminal();
-  const originalLocalAppData = process.env.LOCALAPPDATA;
+  const userRootEnvironmentVariable = process.platform === "win32" ? "LOCALAPPDATA" : "HOME";
+  const originalUserRoot = process.env[userRootEnvironmentVariable];
   const model: ChatModel = {
     async complete(): Promise<ModelResponse> {
       return { kind: "final", content: "默认审计路径验证完成。" };
@@ -520,12 +521,14 @@ test("未指定 audit 时会写入用户级目录而不是工作区 reports", as
   let app: MiniTuiApp | undefined;
 
   try {
-    process.env.LOCALAPPDATA = localAppData;
+    process.env[userRootEnvironmentVariable] = userRoot;
     app = createMiniTui(["--workspace", workspace], terminal, { model });
     app.start();
     await app.submit("验证默认审计位置");
 
-    const auditRoot = path.join(localAppData, "MiniCode", "audit");
+    const auditRoot = process.platform === "win32"
+      ? path.join(userRoot, "MiniCode", "audit")
+      : path.join(userRoot, ".minicode", "audit");
     const auditFiles = await fs.readdir(auditRoot);
     assert.equal(auditFiles.length, 1);
     assert.match(auditFiles[0] ?? "", /^session-.*\.jsonl$/u);
@@ -534,10 +537,10 @@ test("未指定 audit 时会写入用户级目录而不是工作区 reports", as
     await assert.rejects(fs.access(path.join(workspace, "reports")));
   } finally {
     app?.stop();
-    if (originalLocalAppData === undefined) delete process.env.LOCALAPPDATA;
-    else process.env.LOCALAPPDATA = originalLocalAppData;
+    if (originalUserRoot === undefined) delete process.env[userRootEnvironmentVariable];
+    else process.env[userRootEnvironmentVariable] = originalUserRoot;
     await fs.rm(workspace, { recursive: true, force: true });
-    await fs.rm(localAppData, { recursive: true, force: true });
+    await fs.rm(userRoot, { recursive: true, force: true });
   }
 });
 
@@ -1287,6 +1290,7 @@ test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () =>
     JSON.stringify({ scripts: { check: "tsc -p tsconfig.json" } }),
     "utf8",
   );
+  const canonicalWorkspace = await fs.realpath(workspace);
   const terminal = new FakeTerminal();
   let runnerCalls = 0;
   let modelCalls = 0;
@@ -1295,7 +1299,7 @@ test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () =>
       runnerCalls += 1;
       assert.equal(request.program, "npm");
       assert.deepEqual(request.args, ["run", "check", "--", "--pretty=false"]);
-      assert.equal(request.cwd, path.resolve(workspace));
+      assert.equal(request.cwd, canonicalWorkspace);
       return {
         exitCode: 0,
         durationMs: 4,
@@ -1357,7 +1361,7 @@ test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () =>
     assert.equal(runnerCalls, 0);
     assert.match(pendingOutput, /待确认命令.*run_command/);
     assert.match(pendingOutput, /命令：npm "run" "check" "--" "--pretty=false"/);
-    assert.ok(pendingOutput.includes(`工作目录：${path.resolve(workspace)}`));
+    assert.ok(pendingOutput.includes(`工作目录：${canonicalWorkspace}`));
     assert.match(pendingOutput, /风险等级：中（medium）/);
     assert.match(pendingOutput, /不是操作系统沙箱/);
     assert.match(pendingOutput, /RUN 确认.*CANCEL 取消/);

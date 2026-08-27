@@ -6,6 +6,7 @@ import {
   createEvaluationSuitePlan,
   runEvaluationSuite,
 } from "../src/evals/eval-suite-runner.ts";
+import { resolvePlainPath } from "../src/evals/path-safety.ts";
 
 function usage() {
   return [
@@ -95,23 +96,12 @@ function parseArguments(argv) {
   return options;
 }
 
-function samePath(left, right) {
-  const normalizedLeft = path.normalize(path.resolve(left));
-  const normalizedRight = path.normalize(path.resolve(right));
-  return process.platform === "win32"
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight;
-}
-
 async function readPricing(filePath) {
   if (!filePath) return undefined;
-  const resolved = path.resolve(filePath);
+  const resolved = await resolvePlainPath(filePath, "价格快照");
   const stats = await fs.lstat(resolved);
   if (!stats.isFile() || stats.isSymbolicLink() || stats.size > 64 * 1024) {
     throw new Error("价格快照必须是小于 64 KiB 的普通 JSON 文件。");
-  }
-  if (!samePath(await fs.realpath(resolved), resolved)) {
-    throw new Error("价格快照不能经过符号链接或 junction。");
   }
   return JSON.parse(await fs.readFile(resolved, "utf8"));
 }
@@ -143,12 +133,9 @@ async function main() {
     throw new Error("未执行：请先用 --plan 检查矩阵；真实运行还必须提供 --confirm-real-model <plan-sha256>。");
   }
   if (!parsed.outputRoot) throw new Error("真实运行必须提供新的 --output 目录。");
-  const outputRoot = path.resolve(parsed.outputRoot);
-  const outputParent = path.dirname(outputRoot);
-  await fs.mkdir(outputParent, { recursive: true });
-  if (!samePath(await fs.realpath(outputParent), outputParent)) {
-    throw new Error("--output 父目录经过符号链接或 junction，拒绝运行。");
-  }
+  let outputRoot = await resolvePlainPath(parsed.outputRoot, "--output");
+  await fs.mkdir(path.dirname(outputRoot), { recursive: true });
+  outputRoot = await resolvePlainPath(outputRoot, "--output");
   const run = await runEvaluationSuite({
     ...selection,
     outputRoot,
