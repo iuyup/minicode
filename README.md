@@ -21,7 +21,7 @@
 - `WorkingLedger`：只记录当前任务已验证的观察结果；
 - 生命周期事件：`tool_call`、`command_approval_requested`、`command_approval_decision`、`policy_decision`、`tool_execution_started`、`tool_finalized`、`final_answer_rejected`；
 - `FakeModel`：确定性模拟“按任务调用一个或多个工具，再读取工具结果”的多轮模型行为；
-- `OpenAiCompatibleModel`：通过 Chat Completions 兼容接口把模型回复转换为内部工具调用；`DeepSeekModel` 保留为带“关闭思考”参数的兼容预设；
+- `OpenAiCompatibleModel`：通过 Chat Completions 兼容接口把模型回复转换为内部工具调用；远程 TUI 会用 SSE 逐段展示最终回答，工具参数仍只在本地完整校验后执行；`DeepSeekModel` 保留为带“关闭思考”参数的兼容预设；
 - 只读工具：`list_files`、`search_text`、`read_file`，以及固定动作的 `inspect_git`；
 - 受控写工具：`apply_patch`，仅允许唯一的精确文本替换；
 - 受限验证工具：`run_project_check`，只允许 `test` 和 `check` 两个固定动作；
@@ -50,7 +50,7 @@ cmd.exe /d /c npm run check
 
 ## 交互入口：mini
 
-`demo` 用于单次复现与自动化验证；`mini` 是轻量交互入口。它使用 Pi 的 `@mariozechner/pi-tui` 进行差量渲染和多行输入编辑，并直接使用当前终端缓冲区：顶部只保留一行模型、权限和工作区信息，中部是保留用户输入的会话记录，输入框下方是一条极简状态行，左侧为绝对工作区路径、右侧为当前模型；鼠标滚轮或终端滚动条可以回看历史。它保留最近 6 轮的“用户任务 + 最终回答”模型上下文，不会把工具原文跨轮塞回模型；每个新任务仍独立执行工具、生成审计终态并重新校验源码证据。
+`demo` 用于单次复现与自动化验证；`mini` 是轻量交互入口。它使用 Pi 的 `@mariozechner/pi-tui` 进行差量渲染和多行输入编辑，并直接使用当前终端缓冲区：顶部只保留一行模型、权限和工作区信息，中部是保留用户输入的会话记录，输入框下方是一条极简状态行，左侧为绝对工作区路径、右侧为当前模型；鼠标滚轮或终端滚动条可以回看历史。远程 Profile 的最终回答会逐段显示；若同一模型轮最终改为工具调用、回答未通过本地证据校验、发生错误或用户取消，临时文本会撤回，工具参数和推理字段不会显示。它保留最近 6 轮的“用户任务 + 最终回答”模型上下文，不会把工具原文跨轮塞回模型；每个新任务仍独立执行工具、生成审计终态并重新校验源码证据。
 
 TUI 采用仓库内、静态注册的组件插件：控制器将安全生命周期事实投影为冻结的 `TuiReadModel`，再由带稳定键的 `TuiPlugin` 节点交给 Pi renderer。内建槽位固定为顶部、工作流、会话、对话、活动、收口、审批、输入与底栏；空闲时工作流与会话不渲染，底栏仅保留工作区路径和模型，状态只在执行或等待确认时出现。插件拿不到 `AgentLoop`、审批 resolver、`AbortController`、底层终端写入、原始事件、工具正文或 Git diff；它们不会批准操作或启动工具。当前不支持从配置、磁盘或网络加载第三方插件；这不是插件沙箱，也不会增加任何工具权限。
 
@@ -153,7 +153,7 @@ $env:DEEPSEEK_API_KEY = "在此设置你的密钥"
 cmd.exe /d /c npm run demo -- --model deepseek --workspace . "解释当前 AgentLoop 的工具错误终态"
 ```
 
-适配器使用官方 `https://api.deepseek.com/chat/completions` 接口、非流式调用和非思考模式；单次请求最多生成 2,048 tokens，30 秒超时覆盖响应头和响应正文，响应体上限为 1 MiB，用户取消也会中止等待。适配器会严格解码 UTF-8，并拒绝截断、空答案、空工具调用、重复工具调用 ID 和不支持的 `finish_reason`，不会把损坏或残缺响应记为任务完成。模型得到系统提示、用户任务、已注册工具的 JSON Schema，以及当前会话中的工具结果。普通只读模式能够外发项目概览、目录列表、搜索结果、源码片段，以及被请求的 Git 分支、文件路径、status 和 diff 正文；严格源码取证模式不开放 Git。显式启用编辑模式后，补丁参数和获准进程的输出也会进入当前模型会话。不要在不信任工作区或含敏感内容的任务中启用网络 Profile。API Key 只从环境变量读取，绝不写入审计、报告或仓库。
+适配器使用官方 `https://api.deepseek.com/chat/completions` 接口和非思考模式；交互 TUI 会请求 `stream: true` 的 SSE，普通 CLI 与评测仍使用完整的非流式调用。SSE 必须收到合法 `finish_reason` 与 `[DONE]` 才能形成结果；工具调用的 `id`、名称和 JSON 参数会先完整聚合、再由本地注册表校验，绝不会在半截流中执行。若服务端不支持或损坏流式协议，MiniCode 会停止当前任务而不会自动重试，避免重复计费或重复工具请求。单次请求最多生成 2,048 tokens，30 秒超时覆盖响应头和响应正文，响应体上限为 1 MiB，用户取消也会中止等待。适配器会严格解码 UTF-8，并拒绝截断、空答案、空工具调用、重复工具调用 ID 和不支持的 `finish_reason`，不会把损坏或残缺响应记为任务完成。模型得到系统提示、用户任务、已注册工具的 JSON Schema，以及当前会话中的工具结果。普通只读模式能够外发项目概览、目录列表、搜索结果、源码片段，以及被请求的 Git 分支、文件路径、status 和 diff 正文；严格源码取证模式不开放 Git。显式启用编辑模式后，补丁参数和获准进程的输出也会进入当前模型会话。不要在不信任工作区或含敏感内容的任务中启用网络 Profile。API Key 只从环境变量读取，绝不写入审计、报告或仓库。
 
 DeepSeek 普通只读模式默认暴露 `get_project_overview`、`list_files`、`search_text`、`read_file` 和 `inspect_git`；只有显式传入 `--mode edit` 才增加 `apply_patch`、`run_project_check` 和 `run_command`，严格 `--require-source-evidence` 模式则仍只注册 `search_text` 与 `read_file`。每个工具调用会先在本地注册表按名称查找：未知工具直接成为标准错误终态；仅已找到的工具才会进入 JSON 与 Schema 的 `validate`。DeepSeek 官方文档说明该 API 使用 OpenAI 兼容格式，工具调用结果需要由客户端执行后回传。[官方快速开始](https://api-docs.deepseek.com/) [官方工具调用文档](https://api-docs.deepseek.com/guides/tool_calls)
 

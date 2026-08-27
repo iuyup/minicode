@@ -16,6 +16,7 @@ import type {
   JsonValue,
   ModelRequest,
   ModelResponse,
+  StreamingChatModel,
   ToolExecutionOutput,
 } from "../src/agent/contracts.ts";
 import { ToolRegistry } from "../src/agent/tool-registry.ts";
@@ -266,6 +267,54 @@ test("长会话保持原生 scrollback，clear 才显式清除当前终端历史
     assert.doesNotMatch(clearedOutput, /历史回答 1-|历史回答 2-/);
     assert.equal(app.contextTurns, 0);
     assert.equal(app.sessionViewState.closeout, undefined);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("TUI 在模型完成前显示流式正文，完成后沿用同一回答而非重复追加", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-streaming-"));
+  const terminal = new FakeTerminal();
+  let completeFinal: (() => void) | undefined;
+  const model: StreamingChatModel = {
+    async complete(): Promise<ModelResponse> {
+      throw new Error("本测试应调用 completeStream。");
+    },
+    async completeStream(_request, observer): Promise<ModelResponse> {
+      observer.onTextDelta("先到达的正文");
+      return await new Promise<ModelResponse>((resolve) => {
+        completeFinal = () => {
+          observer.onTextDelta("，随后到达的正文");
+          resolve({ kind: "final", content: "先到达的正文，随后到达的正文" });
+        };
+      });
+    },
+  };
+  const options = parseArguments([
+    "--workspace",
+    process.cwd(),
+    "--audit",
+    path.join(reportDirectory, "audit.jsonl"),
+  ]);
+  const app = new MiniTuiApp(
+    options,
+    terminal,
+    new AgentLoop(model, new ToolRegistry([]), { workspaceRoot: process.cwd() }),
+  );
+
+  try {
+    app.start();
+    const task = app.submit("请流式说明状态");
+    await waitFor(() => stripAnsi(terminal.output).includes("先到达的正文"));
+    assert.equal(app.running, true);
+    assert.equal(app.contextTurns, 0);
+
+    completeFinal?.();
+    await task;
+    await waitFor(() => stripAnsi(terminal.output).includes("随后到达的正文"));
+    assert.equal(app.running, false);
+    assert.equal(app.contextTurns, 1);
   } finally {
     app.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
@@ -989,16 +1038,20 @@ test("stop 会把待确认修复按拒绝收口且不再请求模型", async () 
   }
 });
 
-test("运行中 Ctrl+C 会取消忽略 signal 的模型请求且不追加晚回答", async () => {
+test("运行中 Ctrl+C 会撤回流式草稿、取消忽略 signal 的模型请求且不追加晚回答", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-cancel-model-"));
   const terminal = new FakeTerminal();
   let modelCalls = 0;
   let resolveModel: ((response: ModelResponse) => void) | undefined;
   let exits = 0;
-  const model: ChatModel = {
-    complete(_request, signal): Promise<ModelResponse> {
+  const model: StreamingChatModel = {
+    async complete(): Promise<ModelResponse> {
+      throw new Error("本测试应调用 completeStream。");
+    },
+    completeStream(_request, observer, signal): Promise<ModelResponse> {
       modelCalls += 1;
       assert.ok(signal);
+      observer.onTextDelta("将被撤回的流式草稿");
       return new Promise((resolve) => {
         resolveModel = resolve;
       });
@@ -1020,7 +1073,7 @@ test("运行中 Ctrl+C 会取消忽略 signal 的模型请求且不追加晚回�
   try {
     app.start();
     const task = app.submit("等待一个不会自行结束的模型");
-    await waitFor(() => modelCalls === 1 && app.running);
+    await waitFor(() => modelCalls === 1 && app.running && stripAnsi(terminal.output).includes("将被撤回的流式草稿"));
     terminal.send("\u0003");
     await task;
 

@@ -77,6 +77,19 @@ function asCompletionPayload(payload: unknown): unknown {
   };
 }
 
+function sseResponse(source: string, chunks?: readonly Uint8Array[]): Response {
+  const encoded = new TextEncoder().encode(source);
+  const bodyChunks = chunks ?? [encoded];
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of bodyChunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  }), {
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
 test("DeepSeekModel 发送 OpenAI 兼容请求，并显式关闭思考模式", async () => {
   let capturedUrl = "";
   let capturedInit: RequestInit | undefined;
@@ -148,6 +161,96 @@ test("OpenAiCompatibleModel 使用 Profile 提供的地址与模型，不附加 
   assert.equal(body.model, "local-coder");
   assert.equal("thinking" in body, false);
   assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer test-key");
+});
+
+test("OpenAiCompatibleModel 以 SSE 逐段展示最终回答，并安全处理 UTF-8 与 usage 尾包", async () => {
+  let capturedInit: RequestInit | undefined;
+  const metrics: ModelCallMetric[] = [];
+  const source = [
+    ": keep-alive\r\n\r\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"你\"},\"finish_reason\":null}]}\r\n\r\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\r\n\r\n",
+    "data: [DONE]\r\n\r\n",
+  ].join("");
+  const encoded = new TextEncoder().encode(source);
+  const chineseStart = encoded.findIndex((byte, index) =>
+    byte === 0xe4 && encoded[index + 1] === 0xbd && encoded[index + 2] === 0xa0
+  );
+  assert.ok(chineseStart >= 0);
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "local-coder",
+    providerName: "Test provider",
+    onCallMetric: (metric) => metrics.push(metric),
+    fetchImplementation: async (_input, init) => {
+      capturedInit = init;
+      return sseResponse(source, [
+        encoded.slice(0, chineseStart + 1),
+        encoded.slice(chineseStart + 1, chineseStart + 2),
+        encoded.slice(chineseStart + 2),
+      ]);
+    },
+  });
+  const deltas: string[] = [];
+
+  const result = await model.completeStream(requestFixture(), {
+    onTextDelta: (content) => deltas.push(content),
+  });
+
+  assert.deepEqual(result, { kind: "final", content: "你好" });
+  assert.deepEqual(deltas, ["你", "好"]);
+  const requestBody = JSON.parse(capturedInit?.body as string) as Record<string, unknown>;
+  assert.equal(requestBody.stream, true);
+  assert.equal(metrics[0]?.finishReason, "stop");
+  assert.equal(metrics[0]?.usageSource, "provider");
+  assert.equal(metrics[0]?.totalTokens, 5);
+  assert.ok((metrics[0]?.ttftMs ?? -1) >= 0);
+});
+
+test("OpenAiCompatibleModel 在 [DONE] 后才汇总流式工具参数，且从不把工具参数送给文本观察者", async () => {
+  const source = [
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"准备读取。\",\"tool_calls\":[{\"index\":0,\"id\":\"stream-tool-1\",\"type\":\"function\",\"function\":{\"name\":\"list_files\",\"arguments\":\"{\\\"path\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"src\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+  ].join("");
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "local-coder",
+    providerName: "Test provider",
+    fetchImplementation: async () => sseResponse(source),
+  });
+  const deltas: string[] = [];
+
+  const result = await model.completeStream(requestFixture(), {
+    onTextDelta: (content) => deltas.push(content),
+  });
+
+  assert.deepEqual(deltas, ["准备读取。"]);
+  assert.deepEqual(result, {
+    kind: "tool_calls",
+    content: "准备读取。",
+    toolCalls: [{ id: "stream-tool-1", name: "list_files", input: { path: "src" } }],
+  });
+});
+
+test("OpenAiCompatibleModel 拒绝缺少 [DONE] 的流式响应，不把半截内容当成完整回答", async () => {
+  const model = new OpenAiCompatibleModel({
+    apiKey: "test-key",
+    baseUrl: "https://example.test/v1",
+    model: "local-coder",
+    providerName: "Test provider",
+    fetchImplementation: async () => sseResponse(
+      "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"半截\"},\"finish_reason\":\"stop\"}]}\n\n",
+    ),
+  });
+
+  await assert.rejects(
+    model.completeStream(requestFixture(), { onTextDelta: () => {} }),
+    /流式响应缺少 \[DONE\]/u,
+  );
 });
 
 test("OpenAiCompatibleModel 以白名单遥测报告 provider usage 与端到端延迟", async () => {

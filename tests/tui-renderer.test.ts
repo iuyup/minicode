@@ -170,6 +170,42 @@ test("底栏只显示实际远程模型名，窄窗口优先保留模型", async
   }
 });
 
+test("流式回答复用可变草稿，终态定稿或撤回都不遗留终端控制序列", async () => {
+  const terminal = new FakeTerminal();
+  const renderer = new PiTuiRenderer({
+    options: parseArguments(["--workspace", process.cwd(), "--audit", path.join(process.cwd(), "audit.jsonl")]),
+    terminal,
+    viewState: initialState,
+    callbacks: {
+      onAction: () => assert.fail("展示草稿不应发出输入动作"),
+      normalizeInput: (text) => text,
+    },
+  });
+
+  try {
+    renderer.start();
+    renderer.appendUser("展示流式回答");
+    renderer.appendStreamingAnswerDelta("第一段");
+    renderer.appendStreamingAnswerDelta("\u001B");
+    renderer.appendStreamingAnswerDelta("[6n 第二段");
+    await waitFor(() => stripAnsi(terminal.output).includes("第一段"));
+    assert.equal(renderer.hasStreamingAnswer, true);
+    assert.doesNotMatch(terminal.output, /\u001B\[6n/u);
+    assert.match(stripAnsi(terminal.output), /\\u001B\[6n/u);
+
+    renderer.finalizeStreamingAnswer("最终回答");
+    await waitFor(() => stripAnsi(terminal.output).includes("最终回答"));
+    assert.equal(renderer.hasStreamingAnswer, false);
+
+    renderer.appendStreamingAnswerDelta("待撤回的半截回答");
+    assert.equal(renderer.hasStreamingAnswer, true);
+    renderer.discardStreamingAnswer();
+    assert.equal(renderer.hasStreamingAnswer, false);
+  } finally {
+    renderer.stop();
+  }
+});
+
 test("收口摘要保持低强调、留白，并在窄终端保留完整事实", () => {
   const closeout: TaskCloseoutView = {
     outcome: "completed",

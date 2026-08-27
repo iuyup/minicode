@@ -200,3 +200,21 @@ export type ModelResponse =
 export interface ChatModel {
   complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse>;
 }
+
+/**
+ * 仅供展示层消费的最终回答文本增量。工具调用、工具参数和推理字段不会经过这里。
+ */
+export interface ModelTextDeltaObserver {
+  onTextDelta(content: string): void;
+}
+
+/**
+ * 可选的流式扩展：保留 ChatModel.complete 的非流式契约，让离线模型和现有评测模型无需改动。
+ */
+export interface StreamingChatModel extends ChatModel {
+  completeStream(
+    request: ModelRequest,
+    observer: ModelTextDeltaObserver,
+    signal?: AbortSignal,
+  ): Promise<ModelResponse>;
+}

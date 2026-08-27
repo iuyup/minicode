@@ -10,6 +10,8 @@ import type {
   PreparedCommandExecution,
   RepairApprovalRequest,
   JsonValue,
+  StreamingChatModel,
+  ModelRequest,
   ModelResponse,
   ToolCall,
   ToolDescription,
@@ -40,7 +42,16 @@ export interface AgentRunResult {
 export interface AgentRunOptions {
   conversationHistory?: readonly ConversationMessage[];
   signal?: AbortSignal;
+  /**
+   * 仅用于一次运行期间的临时回答展示，不进入 AgentEvent 或 JSONL 审计。
+   * 模型最终改为工具调用、回答被拒绝或任务取消时，会发出 discarded。
+   */
+  onModelOutput?: (event: AgentModelOutputEvent) => void;
 }
+
+export type AgentModelOutputEvent =
+  | { type: "text_delta"; step: number; text: string }
+  | { type: "discarded"; step: number };
 
 export interface AgentLoopOptions {
   workspaceRoot: string;
@@ -274,6 +285,10 @@ function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal | undefine
   });
 }
 
+function isStreamingChatModel(model: ChatModel): model is StreamingChatModel {
+  return typeof (model as Partial<StreamingChatModel>).completeStream === "function";
+}
+
 function formatSourceEvidence(sourceEvidence: readonly SourceEvidence[]): string {
   return [...new Set(sourceEvidence
     .flatMap(completeEvidenceRanges)
@@ -492,6 +507,20 @@ export class AgentLoop {
       Math.min(this.#hardMaxToolCalls, addToLimit(value, increment));
     const sourceEvidence: SourceEvidence[] = [];
     const readPaths = new Set<string>();
+    let visibleModelOutputStep: number | undefined;
+    const emitModelOutput = (event: AgentModelOutputEvent): void => {
+      try {
+        options.onModelOutput?.(event);
+      } catch {
+        // 展示回调不能参与模型、工具或审计决策。
+      }
+    };
+    const discardModelOutput = (step?: number): void => {
+      const visibleStep = visibleModelOutputStep;
+      if (visibleStep === undefined || (step !== undefined && visibleStep !== step)) return;
+      visibleModelOutputStep = undefined;
+      emitModelOutput({ type: "discarded", step: visibleStep });
+    };
 
     try {
       for (let step = 1; step <= maximumStep; step += 1) {
@@ -561,24 +590,40 @@ export class AgentLoop {
           ...(toolChoice ? { forcedToolName: toolChoice.name } : {}),
         });
         let response: ModelResponse;
+        let acceptsModelOutput = true;
         try {
           const requestMessages: AgentMessage[] = this.#planningPrompt && isPlanningTurn
             ? [...messages, { role: "user", content: this.#planningPrompt }]
             : [...messages];
-          response = await awaitWithAbort(this.model.complete({
+          const request: ModelRequest = {
             messages: requestMessages,
             tools: availableTools,
             workingState: ledger.render(),
             phase: isPlanningTurn ? "planning" : isRepairPlanningTurn ? "repair_planning" : "execution",
             ...(toolChoice ? { toolChoice } : {}),
-          }, options.signal), options.signal);
+          };
+          const completion = options.onModelOutput !== undefined && isStreamingChatModel(this.model)
+            ? this.model.completeStream(request, {
+              onTextDelta: (text) => {
+                if (!acceptsModelOutput || options.signal?.aborted || text === "") return;
+                visibleModelOutputStep = step;
+                emitModelOutput({ type: "text_delta", step, text });
+              },
+            }, options.signal)
+            : this.model.complete(request, options.signal);
+          response = await awaitWithAbort(completion, options.signal);
+          acceptsModelOutput = false;
         } catch (error) {
+          acceptsModelOutput = false;
+          discardModelOutput(step);
           const reason = options.signal?.aborted
             ? cancellationReason()
             : `模型请求失败：${error instanceof Error ? error.message : String(error)}`;
           this.recordEvent(events, { type: "agent_stopped", step, reason });
           throw new Error(reason);
         }
+
+        if (response.kind === "tool_calls") discardModelOutput(step);
 
         const rejectToolResponse = (reason: string): void => {
           if (response.kind !== "tool_calls") return;
@@ -593,6 +638,7 @@ export class AgentLoop {
         };
 
         if (isRepairPlanningTurn) {
+          discardModelOutput(step);
           if (response.kind !== "final") {
             const reason = "修复方向阶段不允许调用工具；请先给出可供用户确认的简短修复方向。";
             rejectToolResponse(reason);
@@ -703,6 +749,7 @@ export class AgentLoop {
         }
 
         if (isPlanningTurn) {
+          discardModelOutput(step);
           if (response.kind !== "final") {
             const reason = "计划阶段不允许调用工具；请先给出可供用户确认的简短计划。";
             rejectToolResponse(reason);
@@ -757,6 +804,7 @@ export class AgentLoop {
         }
 
         if (response.kind === "final" && initialProjectCheckAction !== undefined) {
+          discardModelOutput(step);
           const reason = `尚未执行初始 run_project_check(${initialProjectCheckAction}) 复现当前状态，任务以未完成状态停止。`;
           messages.push({ role: "assistant", content: response.content });
           this.recordEvent(events, { type: "agent_stopped", step, reason });
@@ -770,6 +818,7 @@ export class AgentLoop {
         }
 
         if (repairState === "executing" && response.kind === "final") {
+          discardModelOutput(step);
           const reason = "修复尚未完成成功复验，任务以未完成状态停止。";
           messages.push({ role: "assistant", content: response.content });
           this.recordEvent(events, { type: "agent_stopped", step, reason });
@@ -783,6 +832,7 @@ export class AgentLoop {
         }
 
         if (response.kind === "final" && postPatchTestRequired) {
+          discardModelOutput(step);
           const reason = "补丁尚未通过后续 run_project_check(test) 验证，任务以未完成状态停止。";
           messages.push({ role: "assistant", content: response.content });
           this.recordEvent(events, { type: "agent_stopped", step, reason });
@@ -800,6 +850,7 @@ export class AgentLoop {
             ? validateSourceEvidence(response.content, sourceEvidence)
             : { ok: true };
           if (!sourceEvidenceValidation.ok) {
+            discardModelOutput(step);
             messages.push({ role: "assistant", content: response.content });
             this.recordEvent(events, {
               type: "final_answer_rejected",
@@ -1114,6 +1165,9 @@ export class AgentLoop {
       const reason = `达到最大步数 maxSteps=${maximumStep}，但模型尚未给出最终回答。`;
       this.recordEvent(events, { type: "agent_stopped", step: maximumStep, reason });
       throw new Error(reason);
+    } catch (error) {
+      discardModelOutput();
+      throw error;
     } finally {
       await this.#auditLog?.flush();
     }

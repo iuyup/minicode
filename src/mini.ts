@@ -327,6 +327,7 @@ export class MiniTuiApp {
     this.#taskAbortController?.abort();
     this.#taskAbortController = undefined;
     this.resolvePendingApproval(false, false);
+    this.#renderer.discardStreamingAnswer();
     this.#renderer.stop();
   }
 
@@ -401,6 +402,18 @@ export class MiniTuiApp {
       const result = await this.#agent.run(input, {
         conversationHistory: this.#history,
         signal: abortController.signal,
+        onModelOutput: (event) => {
+          if (
+            this.#stopped ||
+            taskGeneration !== this.#taskGeneration ||
+            abortController.signal.aborted
+          ) return;
+          if (event.type === "text_delta") {
+            this.#renderer.appendStreamingAnswerDelta(event.text);
+          } else {
+            this.#renderer.discardStreamingAnswer();
+          }
+        },
       });
       if (this.#stopped || taskGeneration !== this.#taskGeneration) return;
       this.replaceTaskEvents(result.events);
@@ -411,6 +424,7 @@ export class MiniTuiApp {
         abortController.signal.aborted ? "cancelled" : undefined,
       );
       if (abortController.signal.aborted) {
+        this.#renderer.discardStreamingAnswer();
         this.#sessionPhase = "stopped";
         this.#sessionActivity = "任务已取消";
         this.appendNotice("当前任务已取消，未追加旧回答。", "warning");
@@ -419,10 +433,11 @@ export class MiniTuiApp {
       appendConversation(this.#history, input, result.answer);
       this.#sessionPhase = this.#currentCloseout.outcome === "completed" ? "completed" : "stopped";
       this.#sessionActivity = this.#currentCloseout.outcome === "completed" ? "任务已完成" : "任务未完成";
-      this.appendAnswer(result.answer);
+      this.finalizeAnswer(result.answer);
     } catch (error) {
       if (this.#stopped || taskGeneration !== this.#taskGeneration) return;
       if (abortController.signal.aborted) {
+        this.#renderer.discardStreamingAnswer();
         this.#currentCloseout = deriveTaskCloseout(
           this.#events,
           this.#options.auditPath,
@@ -435,6 +450,7 @@ export class MiniTuiApp {
         return;
       }
       const message = error instanceof Error ? error.message : String(error);
+      this.#renderer.discardStreamingAnswer();
       this.#currentCloseout = deriveTaskCloseout(
         this.#events,
         this.#options.auditPath,
@@ -558,6 +574,10 @@ export class MiniTuiApp {
     this.#renderer.appendAnswer(answer);
   }
 
+  private finalizeAnswer(answer: string): void {
+    this.#renderer.finalizeStreamingAnswer(answer);
+  }
+
   private appendNotice(message: string, tone: NoticeTone): void {
     this.#renderer.appendNotice(message, tone);
   }
@@ -644,6 +664,7 @@ export class MiniTuiApp {
         break;
       case "/clear":
         this.#inputGeneration += 1;
+        this.#renderer.discardStreamingAnswer();
         this.#history.splice(0, this.#history.length);
         this.#events.splice(0, this.#events.length);
         this.#renderer.setActivityEvents(this.#events);
@@ -721,6 +742,7 @@ export class MiniTuiApp {
     if (this.#running) {
       this.resolvePendingApproval(false);
       this.#taskAbortController?.abort();
+      this.#renderer.discardStreamingAnswer();
       this.#inputGeneration += 1;
       this.appendNotice("正在取消当前任务；本次待确认操作已关闭。", "warning");
       return;

@@ -12,6 +12,7 @@ import {
   type JsonValue,
   type ModelRequest,
   type ModelResponse,
+  type StreamingChatModel,
   type ToolExecutionResult,
 } from "../src/agent/contracts.ts";
 import { JsonlAuditLog, sanitizeAgentEvent, type AgentEvent } from "../src/agent/events.ts";
@@ -175,6 +176,81 @@ test("the loop appends a tool result before the model gives its final answer", a
       "agent_completed",
     ],
   );
+});
+
+test("流式候选回答只走展示通道，工具调用前会撤回且不会写入审计事件", async () => {
+  let calls = 0;
+  const outputEvents: Array<{ type: string; step: number; text?: string }> = [];
+  const model: StreamingChatModel = {
+    async complete(): Promise<ModelResponse> {
+      throw new Error("本测试应调用 completeStream。");
+    },
+    async completeStream(_request, observer): Promise<ModelResponse> {
+      calls += 1;
+      if (calls === 1) {
+        observer.onTextDelta("这是工具调用前的临时说明。");
+        return {
+          kind: "tool_calls",
+          content: "这是工具调用前的临时说明。",
+          toolCalls: [{ id: "stream-inspect-1", name: "inspect", input: {} }],
+        };
+      }
+      observer.onTextDelta("已依据工具结果完成。\n");
+      return { kind: "final", content: "已依据工具结果完成。" };
+    },
+  };
+  const inspectingTool: AgentTool<JsonValue> = {
+    ...emptyTool,
+    async execute() {
+      assert.deepEqual(outputEvents, [
+        { type: "text_delta", step: 1, text: "这是工具调用前的临时说明。" },
+        { type: "discarded", step: 1 },
+      ]);
+      return "confirmed-fact";
+    },
+  };
+
+  const result = await new AgentLoop(model, new ToolRegistry([inspectingTool]), {
+    workspaceRoot: process.cwd(),
+  }).run("检查流式工具边界。", {
+    onModelOutput: (event) => outputEvents.push(event),
+  });
+
+  assert.equal(result.answer, "已依据工具结果完成。");
+  assert.deepEqual(outputEvents, [
+    { type: "text_delta", step: 1, text: "这是工具调用前的临时说明。" },
+    { type: "discarded", step: 1 },
+    { type: "text_delta", step: 2, text: "已依据工具结果完成。\n" },
+  ]);
+  assert.equal(JSON.stringify(result.events).includes("临时说明"), false);
+});
+
+test("流式最终回答未通过源码取证时会撤回草稿，不把未验证文本留给展示层", async () => {
+  const outputEvents: Array<{ type: string; step: number; text?: string }> = [];
+  const model: StreamingChatModel = {
+    async complete(): Promise<ModelResponse> {
+      throw new Error("本测试应调用 completeStream。");
+    },
+    async completeStream(_request, observer): Promise<ModelResponse> {
+      observer.onTextDelta("未取证的临时结论。");
+      return { kind: "final", content: "未取证的临时结论。" };
+    },
+  };
+  const agent = new AgentLoop(model, new ToolRegistry([]), {
+    workspaceRoot: process.cwd(),
+    requireSourceEvidence: true,
+  });
+
+  await assert.rejects(
+    agent.run("必须提供源码证据。", {
+      onModelOutput: (event) => outputEvents.push(event),
+    }),
+    /最终回答缺少已读取源码/u,
+  );
+  assert.deepEqual(outputEvents, [
+    { type: "text_delta", step: 1, text: "未取证的临时结论。" },
+    { type: "discarded", step: 1 },
+  ]);
 });
 
 test("the loop preserves supplied conversation turns before the current task", async () => {

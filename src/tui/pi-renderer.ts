@@ -665,6 +665,9 @@ export class PiTuiRenderer {
   #loading = false;
   #activityExpanded = false;
   #hasUserInput = false;
+  #streamingAnswerHeader?: Text;
+  #streamingAnswer?: Markdown;
+  #streamingAnswerText = "";
   #revision = 0;
   #started = false;
   #stopped = false;
@@ -724,6 +727,11 @@ export class PiTuiRenderer {
 
   get mountedNodeKeys(): readonly string[] {
     return this.#composer.nodeKeys;
+  }
+
+  /** 仅供流式展示回归测试读取；不暴露原始模型文本。 */
+  get hasStreamingAnswer(): boolean {
+    return this.#streamingAnswer !== undefined;
   }
 
   start(): void {
@@ -787,6 +795,9 @@ export class PiTuiRenderer {
 
   clearTranscript(): void {
     this.#transcript.clear();
+    this.#streamingAnswerHeader = undefined;
+    this.#streamingAnswer = undefined;
+    this.#streamingAnswerText = "";
     this.#hasUserInput = false;
     this.requestRender();
   }
@@ -822,6 +833,7 @@ export class PiTuiRenderer {
   }
 
   appendAnswer(answer: string): void {
+    this.discardStreamingAnswer();
     this.#transcript.addChild(new Text(`${accent("✦")} ${muted("MiniCode")}`, 1, 0));
     this.#transcript.addChild(new Markdown(
       escapeMultilineTerminalText(answer),
@@ -829,6 +841,50 @@ export class PiTuiRenderer {
       1,
       MARKDOWN_THEME,
     ));
+    this.requestRender();
+  }
+
+  /**
+   * 追加临时回答草稿。始终重新转义完整累计文本，防止跨网络分片的控制序列进入终端。
+   */
+  appendStreamingAnswerDelta(delta: string): void {
+    if (delta === "") return;
+    if (!this.#streamingAnswer) {
+      this.#streamingAnswerHeader = new Text(`${accent("✦")} ${muted("MiniCode")}`, 1, 0);
+      this.#streamingAnswer = new Markdown("", 2, 1, MARKDOWN_THEME);
+      this.#transcript.addChild(this.#streamingAnswerHeader);
+      this.#transcript.addChild(this.#streamingAnswer);
+    }
+    this.#streamingAnswerText += delta;
+    this.#streamingAnswer.setText(escapeMultilineTerminalText(this.#streamingAnswerText));
+    // pi-tui 自带小窗口合并；每个 token 无需重新编排插件树。
+    this.#tui.requestRender();
+  }
+
+  /** 用 AgentLoop 已接纳的最终回答定稿；无流时自动沿用一次性回答。 */
+  finalizeStreamingAnswer(answer: string): void {
+    if (!this.#streamingAnswer) {
+      this.appendAnswer(answer);
+      return;
+    }
+    this.#streamingAnswerText = answer;
+    this.#streamingAnswer.setText(escapeMultilineTerminalText(answer));
+    this.#streamingAnswerHeader = undefined;
+    this.#streamingAnswer = undefined;
+    this.requestRender();
+  }
+
+  /** 工具调用、校验拒绝、取消或错误时移除尚未被 AgentLoop 接纳的临时回答。 */
+  discardStreamingAnswer(): void {
+    if (!this.#streamingAnswerHeader && !this.#streamingAnswer) {
+      this.#streamingAnswerText = "";
+      return;
+    }
+    if (this.#streamingAnswerHeader) this.#transcript.removeChild(this.#streamingAnswerHeader);
+    if (this.#streamingAnswer) this.#transcript.removeChild(this.#streamingAnswer);
+    this.#streamingAnswerHeader = undefined;
+    this.#streamingAnswer = undefined;
+    this.#streamingAnswerText = "";
     this.requestRender();
   }
 
