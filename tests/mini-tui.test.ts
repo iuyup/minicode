@@ -284,13 +284,10 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
 
     const output = stripAnsi(terminal.output);
     assert.match(output, /MiniCode/);
-    assert.match(output, /会话.*当前活动/);
-    assert.match(output, /工具活动已折叠/);
-    assert.match(output, /本次任务收口.*已完成/);
-    assert.match(output, /修改：未写入补丁/);
-    assert.match(output, /验证：未请求固定验证/);
-    assert.match(output, /Git 收口：未读取（不代表工作区干净）/);
-    assert.match(output, /审计目标 audit\.jsonl/);
+    assert.match(output, /❯\s+解释未知工具为何仍有完整的终态事件/u);
+    assert.doesNotMatch(output, /会话.*当前活动|工作流|工具活动已折叠/u);
+    assert.match(output, /✓ 已结束.*工具 2 成功.*未写入.*未运行验证/u);
+    assert.doesNotMatch(output, /Git 未读取|审计 audit\.jsonl|个事件/u);
     assert.match(output, /只读代码侦察闭环已完成/);
     assert.doesNotMatch(output, /任务账本/);
     assert.equal(app.contextTurns, 1);
@@ -299,7 +296,7 @@ test("mini TUI renders compact lifecycle feedback and keeps tool details collaps
 
     terminal.send("\u000f");
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.match(stripAnsi(terminal.output), /工具活动.*Ctrl\+O 折叠/);
+    assert.match(stripAnsi(terminal.output), /工具详情.*Ctrl\+O 收起/);
 
     await app.submit("/clear");
     assert.equal(app.contextTurns, 0);
@@ -325,9 +322,9 @@ test("默认离线 TUI 对自由输入只说明边界，不创建伪任务", asy
     await waitFor(() => stripAnsi(terminal.output).includes("离线 FakeModel 演示"));
 
     const output = stripAnsi(terminal.output);
-    assert.match(output, /当前是离线演示：仅支持固定示例/u);
+    assert.match(output, /当前是离线 FakeModel 演示/u);
     assert.match(output, /本次未执行工具，也没有修改文件/u);
-    assert.doesNotMatch(output, /只读代码侦察闭环已完成|本次任务收口/u);
+    assert.doesNotMatch(output, /只读代码侦察闭环已完成|已结束.*工具/u);
     assert.equal(app.running, false);
     assert.equal(app.contextTurns, 0);
     assert.equal(app.sessionViewState.closeout, undefined);
@@ -338,7 +335,7 @@ test("默认离线 TUI 对自由输入只说明边界，不创建伪任务", asy
   }
 });
 
-test("提交 /help 会保留用户输入，并以分组格式显示帮助", async () => {
+test("提交 /help 会保留用户输入，并以紧凑命令表显示帮助", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-help-"));
   const terminal = new FakeTerminal();
   const app = createMiniTui(
@@ -349,18 +346,43 @@ test("提交 /help 会保留用户输入，并以分组格式显示帮助", asyn
     app.start();
     terminal.send("/help");
     terminal.send("\r");
-    await waitFor(() => stripAnsi(terminal.output).includes("命令与本地确认"));
+    await waitFor(() => stripAnsi(terminal.output).includes("仅在提示时确认"));
 
     const output = stripAnsi(terminal.output);
-    assert.match(output, /你\s+\/help/u);
-    assert.match(output, /帮助\s+命令与本地确认/u);
-    assert.match(output, /会话\s+\/model \[profile\]\s+查看或切换模型 Profile/u);
-    assert.match(output, /浏览与输入\s+滚轮或终端滚动条\s+查看历史/u);
-    assert.match(output, /本地确认（仅等待确认时有效）\s+CONTINUE\s+开始计划或继续一次有界修复/u);
-    assert.match(output, /离线演示（不会自行修改文件）\s+源码查看\s+说明未知工具为何仍有完整的终态事件/u);
+    assert.match(output, /❯\s+\/help/u);
+    assert.match(output, /命令\s+\/model \[profile\]\s+查看或切换模型/u);
+    assert.match(output, /\/status\s+查看当前配置与审计/u);
+    assert.match(output, /仅在提示时确认：\s+CONTINUE\s+APPLY\s+RUN\s+CANCEL/u);
+    assert.match(output, /离线示例：查看源码.*运行测试/u);
     assert.doesNotMatch(output, /Ctrl\+V 粘贴文本；\/model 查看或切换模型/u);
+    assert.doesNotMatch(output, /命令与本地确认|本地确认（仅等待确认时有效）/u);
     assert.equal(app.editorText, "");
     assert.equal(app.contextTurns, 0);
+  } finally {
+    app.stop();
+    await fs.rm(reportDirectory, { recursive: true, force: true });
+  }
+});
+
+test("每条后续输入前以暗淡虚线分隔上一轮输出", async () => {
+  const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-turn-divider-"));
+  const terminal = new FakeTerminal();
+  const app = createMiniTui(
+    ["--workspace", process.cwd(), "--audit", path.join(reportDirectory, "audit.jsonl")],
+    terminal,
+  );
+  try {
+    app.start();
+    await app.submit("/help");
+    await waitFor(() => stripAnsi(terminal.output).includes("离线示例"));
+    await app.submit("/model");
+    await waitFor(() => stripAnsi(terminal.output).includes("模型 Profile"));
+
+    const output = stripAnsi(terminal.output);
+    assert.match(
+      output,
+      /离线示例：查看源码.*运行测试[\s\S]*┄{16,}[\s\S]*❯\s+\/model/u,
+    );
   } finally {
     app.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
@@ -393,8 +415,8 @@ test("mini TUI projects phase, persistent plan, and local approval controls with
       cancelWord: "CANCEL",
       prompt: "CONTINUE / CANCEL",
     });
-    await waitFor(() => stripAnsi(terminal.output).includes("待确认操作"));
-    assert.match(stripAnsi(terminal.output), /工作流.*计划（待确认）/u);
+    await waitFor(() => stripAnsi(terminal.output).includes("计划待确认"));
+    assert.match(stripAnsi(terminal.output), /计划待确认.*CONTINUE.*CANCEL/u);
 
     await app.submit("CONTINUE");
     assert.equal(await planApproval, true);
@@ -426,7 +448,7 @@ test("mini TUI projects phase, persistent plan, and local approval controls with
     const verificationView = app.sessionViewState;
     assert.equal(app.sessionViewState.phase, "verification_pending");
     assert.equal(verificationView.pendingApproval?.confirmWord, "RUN");
-    await waitFor(() => stripAnsi(terminal.output).includes("验证（待确认）"));
+    await waitFor(() => stripAnsi(terminal.output).includes("验证待确认"));
     await app.submit("RUN");
     assert.equal(await verificationApproval, true);
     assert.equal(app.sessionViewState.phase, "executing");
@@ -668,8 +690,9 @@ test("TUI 转义用户、模型、审批和未知工具中的 CSI 与 OSC", asyn
       detail: "ordinary failure",
     });
     app.handleAgentEvent({ type: "agent_stopped", step: 2, reason: "任务已取消。" });
-    await waitFor(() => stripAnsi(terminal.output).includes("1 次失败 · 1 次已取消"));
+    await waitFor(() => app.sessionViewState.phase === "stopped");
     terminal.send("\u000f");
+    await waitFor(() => stripAnsi(terminal.output).includes("工具详情"));
 
     const editApproval = app.requestEditApproval({
       path: `src/${csi}.ts`,
@@ -711,14 +734,14 @@ test("TUI 转义用户、模型、审批和未知工具中的 CSI 与 OSC", asyn
     assert.match(output, /__proto__\\u001B\[6n/u);
     assert.match(output, /constructor\\u001B\]9;MINICODE-PWN\\u0007/u);
     assert.match(output, /任务已取消|已取消/u);
-    assert.match(output, /1 次失败 · 1 次已取消/u);
+    assert.match(output, /工具详情/u);
   } finally {
     app.stop();
     await fs.rm(reportDirectory, { recursive: true, force: true });
   }
 });
 
-test("任务收口卡只渲染结构化元数据，并转义验证与审计文本", async () => {
+test("任务收口卡只渲染安全摘要，并转义验证文本", async () => {
   const reportDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "minicode-mini-closeout-safe-"));
   const terminal = new FakeTerminal();
   const csi = "\u001B[6n";
@@ -766,13 +789,13 @@ test("任务收口卡只渲染结构化元数据，并转义验证与审计文�
   try {
     app.start();
     await app.submit("运行安全的收口卡验证");
-    await waitFor(() => stripAnsi(terminal.output).includes("本次任务收口"));
+    await waitFor(() => stripAnsi(terminal.output).includes("✓ 已结束"));
 
     assert.doesNotMatch(terminal.output, /\u001B\[6n/u);
     assert.doesNotMatch(terminal.output, /\u001B\]9;MINICODE-CLOSEOUT-PWN\u0007/u);
     const output = stripAnsi(terminal.output);
-    assert.match(output, /验证：test\\u001B\[6n 通过.*退出码 0/u);
-    assert.match(output, /审计目标 audit-\\u001B\]9;MINICODE-CLOSEOUT-PWN\\u0007\.jsonl/u);
+    assert.match(output, /验证 test\\u001B\[6n ✓/u);
+    assert.doesNotMatch(output, /审计 audit-|Git 未读取|个事件/u);
     assert.doesNotMatch(output, /CLOSEOUT_DETAIL_SHOULD_NOT_RENDER/u);
   } finally {
     app.stop();
@@ -809,18 +832,24 @@ test("mini TUI lists configured Profiles and switches model without sending a re
 
     await app.submit("/model");
     await waitFor(() => stripAnsi(terminal.output).includes("openai-compatible"));
-    assert.match(stripAnsi(terminal.output), /openai-compatible/);
-    assert.match(stripAnsi(terminal.output), /MINICODE_OPENAI_API_KEY/);
+    const modelOutput = stripAnsi(terminal.output);
+    assert.match(modelOutput, /模型 Profile[\s\S]*● 当前\s+fake[\s\S]*FakeModel（离线）\s+·\s+就绪/u);
+    assert.match(modelOutput, /○ 可选\s+openai-compatible[\s\S]*OpenAI-compatible/u);
+    assert.match(modelOutput, /MINICODE_OPENAI_BASE_URL[\s\S]*MINICODE_OPENAI_MODEL[\s\S]*MINICODE_OPENAI_API_KEY/u);
+    assert.match(modelOutput, /MINICODE_ALLOW_INSECURE_HTTP=1/u);
+    assert.doesNotMatch(modelOutput, /test-key|gateway\.example/u);
 
     await app.submit("/model openai");
-    await waitFor(() => stripAnsi(terminal.output).includes("已切换到 OpenAI-compatible / test-coder"));
+    await waitFor(() => stripAnsi(terminal.output).includes("模型已切换"));
+    const switchedOutput = stripAnsi(terminal.output);
     assert.equal(app.contextTurns, 0);
-    assert.match(stripAnsi(terminal.output), /后续发送给模型的会话已清空/);
-    assert.match(stripAnsi(terminal.output), /远程数据提示/);
-    assert.match(stripAnsi(terminal.output), /目录\/搜索结果、源码片段、Git/);
-    assert.match(stripAnsi(terminal.output), /状态或差异/);
-    assert.match(stripAnsi(terminal.output), /编辑参数和获准进程输出/);
-    assert.match(stripAnsi(terminal.output), /MINICODE_ALLOW_INSECURE_HTTP=1/);
+    assert.match(switchedOutput, /模型已切换[\s\S]*OpenAI-compatible\s+→\s+test-coder/u);
+    assert.match(switchedOutput, /后续发送给模型的会话已清空/u);
+    assert.match(switchedOutput, /远程数据提示[\s\S]*切换本身不发送请求/u);
+    assert.match(switchedOutput, /用户任务.*目录\/搜索结果.*源码片段.*Git 状态或差异/u);
+    assert.match(switchedOutput, /编辑参数.*获准进程输出/u);
+    assert.doesNotMatch(switchedOutput, /已切换到 .*\/.+；/u);
+    assert.doesNotMatch(switchedOutput, /test-key|gateway\.example/u);
   } finally {
     app?.stop();
     if (originalBaseUrl === undefined) delete process.env.MINICODE_OPENAI_BASE_URL;
@@ -876,7 +905,7 @@ test("修复方向面板只接受精确 CONTINUE，错误输入保持等待且�
     assert.match(pendingOutput, /修复尝试：1 \/ 1/u);
     assert.match(pendingOutput, new RegExp(REPAIR_DIRECTION, "u"));
     assert.match(pendingOutput, /后续补丁仍需 APPLY，复验仍需 RUN/u);
-    assert.match(pendingOutput, /等待确认：CONTINUE \/ CANCEL/u);
+    assert.match(pendingOutput, /CONTINUE 确认.*CANCEL 取消/u);
 
     await harness.app.submit("continue");
     assert.equal(harness.app.awaitingRepairApproval, true);
@@ -925,8 +954,7 @@ test("CANCEL 会闭锁后续修复，且不会把取消词发送给模型", asyn
     const output = stripAnsi(harness.terminal.output);
     assert.match(output, /已停止后续修复，当前工作区保持现状/u);
     assert.match(output, /用户未确认修复方向，未继续修改文件或运行验证/u);
-    assert.match(output, /本次任务收口.*未完成/u);
-    assert.match(output, /修改：未写入补丁/u);
+    assert.match(output, /• 已停止.*未写入/u);
     const closeout = harness.app.sessionViewState.closeout;
     assert.ok(closeout);
     assert.equal(closeout.outcome, "stopped");
@@ -1103,7 +1131,7 @@ test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", asyn
     assert.match(pendingOutput, /工作目录：/);
     assert.match(pendingOutput, /package\.json/);
     assert.match(pendingOutput, /访问网络/);
-    assert.match(pendingOutput, /等待确认：RUN \/ CANCEL/);
+    assert.match(pendingOutput, /RUN 确认.*CANCEL 取消/);
 
     await app.submit("run");
     assert.equal(app.awaitingCommandApproval, true);
@@ -1118,8 +1146,8 @@ test("验证命令在 TUI 等待精确 RUN，确认前不会启动 runner", asyn
     await waitFor(() => stripAnsi(terminal.output).includes("验证已确认并完成"));
     const output = stripAnsi(terminal.output);
     assert.match(output, /验证已确认并完成/);
-    assert.match(output, /本次任务收口.*已完成/);
-    assert.match(output, /验证：test 通过.*退出码 0/);
+    assert.match(output, /✓ 已结束/);
+    assert.match(output, /验证 test ✓/);
     const closeout = app.sessionViewState.closeout;
     assert.ok(closeout);
     assert.equal(closeout.verification?.status, "passed");
@@ -1186,8 +1214,8 @@ test("TUI 中取消验证不会启动 runner，也不会把 CANCEL 写入模型�
     const output = stripAnsi(terminal.output);
     assert.match(output, /已取消验证，固定命令未执行/);
     assert.match(output, /验证已由用户取消/);
-    assert.match(output, /本次任务收口.*已完成/);
-    assert.match(output, /验证：check 未执行（已取消）/);
+    assert.match(output, /✓ 已结束/);
+    assert.match(output, /未运行验证（已取消）/);
     const closeout = app.sessionViewState.closeout;
     assert.ok(closeout);
     assert.equal(closeout.verification?.status, "not_run");
@@ -1279,7 +1307,7 @@ test("通用受控命令在 TUI 展示风险并只接受精确 RUN", async () =>
     assert.ok(pendingOutput.includes(`工作目录：${path.resolve(workspace)}`));
     assert.match(pendingOutput, /风险等级：中（medium）/);
     assert.match(pendingOutput, /不是操作系统沙箱/);
-    assert.match(pendingOutput, /等待确认：RUN \/ CANCEL/);
+    assert.match(pendingOutput, /RUN 确认.*CANCEL 取消/);
 
     await app.submit("run");
     assert.equal(app.awaitingCommandApproval, true);
@@ -1357,13 +1385,10 @@ test("只读 Git 检查在 TUI 中直接执行，不进入 RUN 确认状态", as
     assert.equal(app.awaitingCommandApproval, false);
     const output = stripAnsi(terminal.output);
     assert.match(output, /Git 状态已读取；没有执行暂存或提交/);
-    assert.match(output, /本次任务收口.*已完成/);
-    assert.match(output, /修改：未写入补丁/);
-    assert.match(output, /验证：未请求固定验证/);
-    assert.match(output, /Git 收口：状态已读取（只读；未暂存或提交）/);
-    assert.match(output, /审计目标 audit\.jsonl/);
+    assert.match(output, /✓ 已结束.*工具 1 成功.*未写入.*未运行验证/);
+    assert.doesNotMatch(output, /审计 audit\.jsonl/u);
     assert.deepEqual(app.sessionViewState.closeout?.gitInspections, [{ action: "status", status: "completed" }]);
-    assert.doesNotMatch(output, /待确认命令|等待确认：RUN \/ CANCEL/);
+    assert.doesNotMatch(output, /命令待确认/);
   } finally {
     app.stop();
     await fs.rm(workspace, { recursive: true, force: true });
@@ -1485,7 +1510,7 @@ test("编辑模式在 TUI 展示补丁，并且只有 APPLY 会写入文件", as
     const task = app.submit("把 before 改成 after");
     await waitFor(() => stripAnsi(terminal.output).includes("待确认补丁"));
     assert.match(stripAnsi(terminal.output), /输入 APPLY/);
-    assert.match(stripAnsi(terminal.output), /等待确认：APPLY \/ CANCEL/);
+    assert.match(stripAnsi(terminal.output), /APPLY 确认.*CANCEL 取消/);
     assert.doesNotMatch(stripAnsi(terminal.output), /```diff/);
     assert.match(await fs.readFile(targetPath, "utf8"), /before/);
 
@@ -1501,8 +1526,7 @@ test("编辑模式在 TUI 展示补丁，并且只有 APPLY 会写入文件", as
     assert.match(await fs.readFile(targetPath, "utf8"), /after/);
     assert.equal(app.contextTurns, 1);
     const output = stripAnsi(terminal.output);
-    assert.match(output, /本次任务收口.*已完成/);
-    assert.match(output, /修改：本任务已写入 1 个文件：src\/example\.ts/);
+    assert.match(output, /✓ 已结束.*写入 1 个文件/);
     assert.deepEqual(app.sessionViewState.closeout?.appliedPaths, ["src/example.ts"]);
   } finally {
     app?.stop();

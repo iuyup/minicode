@@ -7,7 +7,7 @@ import {
   parseModelProfileId,
   resolveOpenAiCompatibleProfile,
 } from "../src/models/model-profiles.ts";
-import { parseArguments } from "../src/runtime.ts";
+import { activeModelName, modelLabel, parseArguments } from "../src/runtime.ts";
 
 test("OpenAI-compatible Profile 从环境变量解析连接信息，而 Profile 本身不含 API Key", () => {
   const environment: NodeJS.ProcessEnv = {
@@ -78,4 +78,16 @@ test("CLI 支持 Profile 选择，同时保留 DeepSeek 旧参数", () => {
   assert.equal(parseModelProfileId("openai"), "openai-compatible");
   assert.equal(parseArguments(["--profile", "openai", "检查项目"]).modelProfile, "openai-compatible");
   assert.equal(parseArguments(["--model", "deepseek", "检查项目"]).modelProfile, "deepseek");
+});
+
+test("紧凑模型名与完整 Profile 标签分开，避免底栏解析斜杠字符串", () => {
+  const deepseek = parseArguments([
+    "--model",
+    "deepseek",
+    "--deepseek-model",
+    "deepseek-v4-flash",
+  ]);
+  assert.equal(modelLabel(deepseek), "DeepSeek / deepseek-v4-flash");
+  assert.equal(activeModelName(deepseek), "deepseek-v4-flash");
+  assert.equal(activeModelName(parseArguments([])), "FakeModel（离线）");
 });

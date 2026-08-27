@@ -404,6 +404,12 @@ export function modelLabel(argumentsValue: CliArguments): string {
   return profile.kind === "fake" ? profile.label : `${profile.label} / ${profile.model}`;
 }
 
+/** 用于紧凑状态栏的实际调用模型名；不与 Profile/服务名称拼接。 */
+export function activeModelName(argumentsValue: CliArguments): string {
+  const profile = currentModelProfile(argumentsValue);
+  return profile.kind === "fake" ? profile.label : profile.model;
+}
+
 export function toolPermissionLabel(argumentsValue: CliArguments): string {
   return argumentsValue.requireSourceEvidence
     ? "只读源码取证"

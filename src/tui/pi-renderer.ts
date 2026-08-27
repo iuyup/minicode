@@ -14,6 +14,7 @@ import {
   type Terminal,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
 } from "@mariozechner/pi-tui";
 
 import type {
@@ -23,15 +24,14 @@ import type {
   RepairApprovalRequest,
 } from "../agent/contracts.ts";
 import type { AgentEvent } from "../agent/events.ts";
-import { modelLabel, toolPermissionLabel, type CliArguments } from "../runtime.ts";
+import { activeModelName, modelLabel, toolPermissionLabel, type CliArguments } from "../runtime.ts";
 import { escapeMultilineTerminalText, escapeTerminalText } from "../terminal-safety.ts";
 import type {
   ApprovalKind,
   SessionPhase,
   SessionViewState,
-  TaskCloseoutExecutionStatus,
-  TaskCloseoutGitAction,
   TaskCloseoutOutcome,
+  TaskCloseoutView,
   TuiAction,
   TuiNode,
   TuiPlugin,
@@ -39,16 +39,16 @@ import type {
   TuiReadModel,
   TuiSlot,
 } from "./contracts.ts";
-import { MAX_CONTEXT_TURNS } from "./contracts.ts";
 import { createTuiReadModel } from "./read-model.ts";
 
 const RESET = "\u001B[0m";
 
-function color(code: number): (text: string) => string {
+function color(code: number | string): (text: string) => string {
   return (text) => `\u001B[${code}m${text}${RESET}`;
 }
 
-const accent = color(36);
+// 3A：固定深紫 #6D28D9，避免 ANSI 主题映射改变产品强调色。
+const accent = color("38;2;109;40;217");
 const green = color(32);
 const yellow = color(33);
 const red = color(31);
@@ -65,7 +65,7 @@ const SELECT_LIST_THEME: EditorTheme["selectList"] = {
 };
 
 const EDITOR_THEME: EditorTheme = {
-  borderColor: accent,
+  borderColor: muted,
   selectList: SELECT_LIST_THEME,
 };
 
@@ -148,80 +148,111 @@ function sessionPhaseBadge(phase: SessionPhase): string {
   return muted(label);
 }
 
-function summarizeSessionPlan(plan: string): string {
-  const compact = escapeTerminalText(plan).replace(/\s+/gu, " ").trim();
-  if (compact.length <= 96) return compact;
-  return `${compact.slice(0, 93)}...`;
+function compactPermissionLabel(permissionLabel: string): string {
+  switch (permissionLabel) {
+    case "离线演示（不可自主改代码）":
+      return "离线，不改文件";
+    case "受控编辑（逐次确认）":
+      return "编辑需确认";
+    case "引导式受控编辑":
+      return "引导式编辑";
+    case "引导式只读":
+      return "引导式只读";
+    default:
+      return permissionLabel;
+  }
+}
+
+function isTransientPhase(phase: SessionPhase): boolean {
+  return phase !== "ready" && phase !== "completed" && phase !== "stopped";
 }
 
 function closeoutOutcomeLabel(outcome: TaskCloseoutOutcome): string {
   switch (outcome) {
     case "completed":
-      return green("已完成");
-    case "cancelled":
-      return yellow("已取消");
-    case "stopped":
-      return yellow("未完成");
-    case "failed":
-      return red("失败");
-  }
-}
-
-function closeoutExecutionLabel(status: TaskCloseoutExecutionStatus): string {
-  switch (status) {
-    case "completed":
-      return "已读取";
+      return "已结束";
     case "cancelled":
       return "已取消";
+    case "stopped":
+      return "已停止";
     case "failed":
-      return "失败";
+      return "未完成";
   }
 }
 
-function closeoutGitActionLabel(action: TaskCloseoutGitAction): string {
-  switch (action) {
-    case "status":
-      return "状态";
-    case "diff":
-      return "差异";
-    case "staged_diff":
-      return "暂存差异";
-  }
-}
-
-function renderCloseoutModification(closeout: NonNullable<SessionViewState["closeout"]>): string {
+function renderCloseoutModification(closeout: TaskCloseoutView): string {
   if (closeout.appliedPaths.length > 0) {
-    const paths = closeout.appliedPaths.slice(0, 2).map(escapeTerminalText).join("、");
-    const remainder = closeout.appliedPaths.length > 2 ? ` 等 ${closeout.appliedPaths.length - 2} 个文件` : "";
-    return `修改：本任务已写入 ${closeout.appliedPaths.length} 个文件：${paths}${remainder}`;
+    return `写入 ${closeout.appliedPaths.length} 个文件`;
   }
   if (closeout.proposedPatchCount > 0) {
-    return `修改：仅生成 ${closeout.proposedPatchCount} 个补丁预览，未写入`;
+    return `预览 ${closeout.proposedPatchCount} 个补丁`;
   }
-  if (closeout.rejectedPatchCount > 0) return "修改：补丁未写入（未获确认）";
-  return "修改：未写入补丁";
+  return "未写入";
 }
 
-function renderCloseoutVerification(closeout: NonNullable<SessionViewState["closeout"]>): string {
+function renderCloseoutVerification(closeout: TaskCloseoutView): string {
   const verification = closeout.verification;
-  if (!verification) return "验证：未请求固定验证";
+  if (!verification) return "未运行验证";
   const action = escapeTerminalText(verification.action);
-  const attempts = verification.attempts > 1 ? ` · 共 ${verification.attempts} 次` : "";
-  const exitCode = verification.exitCode !== undefined ? ` · 退出码 ${verification.exitCode ?? "未知"}` : "";
-  if (verification.status === "passed") return `验证：${action} 通过${exitCode}${attempts}`;
+  const attempts = verification.attempts > 1 ? ` ×${verification.attempts}` : "";
+  if (verification.status === "passed") return `验证 ${action} ✓${attempts}`;
   if (verification.status === "not_run") {
-    return `验证：${action} 未执行${verification.cancelled ? "（已取消）" : ""}${attempts}`;
+    return `未运行验证${verification.cancelled ? "（已取消）" : ""}${attempts}`;
   }
-  if (verification.status === "cancelled") return `验证：${action} 已取消${attempts}`;
-  return `验证：${action} 未通过${verification.timedOut ? "（超时）" : exitCode}${attempts}`;
+  if (verification.status === "cancelled") return `验证 ${action} 已取消${attempts}`;
+  return `验证 ${action} 未通过${verification.timedOut ? "（超时）" : ""}${attempts}`;
 }
 
-function renderCloseoutGit(closeout: NonNullable<SessionViewState["closeout"]>): string {
-  if (closeout.gitInspections.length === 0) return "Git 收口：未读取（不代表工作区干净）";
-  const inspections = closeout.gitInspections
-    .map((inspection) => `${closeoutGitActionLabel(inspection.action)}${closeoutExecutionLabel(inspection.status)}`)
-    .join(" · ");
-  return `Git 收口：${inspections}（只读；未暂存或提交）`;
+function outcomeMark(outcome: TaskCloseoutOutcome): string {
+  switch (outcome) {
+    case "completed":
+      return green("✓");
+    case "cancelled":
+    case "stopped":
+      return yellow("•");
+    case "failed":
+      return red("×");
+  }
+}
+
+function renderCloseoutToolSummary(closeout: TaskCloseoutView): string {
+  const outcomes = [`工具 ${closeout.successfulTools} 成功`];
+  if (closeout.failedTools > 0) outcomes.push(`${closeout.failedTools} 失败`);
+  if (closeout.cancelledTools > 0) outcomes.push(`${closeout.cancelledTools} 已取消`);
+  return outcomes.join(" / ");
+}
+
+/**
+ * 任务结束后的低强调摘要。末尾一行空白把它与新的输入框明确分隔开，
+ * 但不把 Git、审计文件名等追溯信息挤进主阅读流。
+ */
+export function renderCloseoutSummary(closeout: TaskCloseoutView, width: number): readonly string[] {
+  const outcome = closeoutOutcomeLabel(closeout.outcome);
+  const tools = renderCloseoutToolSummary(closeout);
+  const changes = renderCloseoutModification(closeout);
+  const verification = renderCloseoutVerification(closeout);
+  const summary = ` ${outcomeMark(closeout.outcome)} ${muted(`${outcome} · ${tools} · ${changes} · ${verification}`)}`;
+  const primaryLine = ` ${outcomeMark(closeout.outcome)} ${muted(`${outcome} · ${tools}`)}`;
+  const detailLine = `   ${muted(`${changes} · ${verification}`)}`;
+
+  if (visibleWidth(summary) <= width) {
+    return [renderLine(summary, width), renderLine("", width)];
+  }
+
+  if (visibleWidth(primaryLine) <= width && visibleWidth(detailLine) <= width) {
+    return [
+      renderLine(primaryLine, width),
+      renderLine(detailLine, width),
+      renderLine("", width),
+    ];
+  }
+
+  return [
+    renderLine(` ${outcomeMark(closeout.outcome)} ${muted(outcome)}`, width),
+    renderLine(`   ${muted(tools)}`, width),
+    renderLine(detailLine, width),
+    renderLine("", width),
+  ];
 }
 
 class Header implements Component {
@@ -235,73 +266,34 @@ class Header implements Component {
 
   render(width: number): string[] {
     const view = this.#readModel();
+    const phase = view.session.phase;
+    const phaseBadge = isTransientPhase(phase)
+      ? ` ${muted("·")} ${sessionPhaseBadge(phase)}`
+      : "";
     return [
-      renderLine(`${bold(accent("◆ MiniCode"))}  ${muted("受控 Coding Agent")}  ${muted("·")} ${sessionPhaseBadge(view.session.phase)}`, width),
-      renderLine(`  ${escapeTerminalText(view.chrome.modelLabel)}  ${muted("·")} ${escapeTerminalText(view.chrome.permissionLabel)}`, width),
-      renderLine(`  ${muted("工作区")} ${escapeTerminalText(view.chrome.workspaceName)}  ${muted("·  滚轮浏览历史  ·  Ctrl+O 展开工具细节")}`, width),
-      renderLine(muted("─".repeat(Math.max(width, 1))), width),
+      renderLine(
+        ` ${bold(accent("✦ MiniCode"))} ${muted("·")} ${escapeTerminalText(view.chrome.workspaceName)} ${muted("·")} ${escapeTerminalText(view.chrome.modelLabel)} ${muted("·")} ${muted(compactPermissionLabel(view.chrome.permissionLabel))}${phaseBadge}`,
+        width,
+      ),
     ];
   }
 }
 
 class WorkflowPresenter implements Component {
-  readonly #readModel: () => TuiReadModel;
-
-  constructor(readModel: () => TuiReadModel) {
-    this.#readModel = readModel;
-  }
-
   invalidate(): void {}
 
-  render(width: number): string[] {
-    const { phase, closeout } = this.#readModel().session;
-    const current = phase === "planning" || phase === "plan_pending"
-      ? "plan"
-      : phase === "verification_pending"
-        ? "verification"
-        : closeout !== undefined || phase === "completed" || phase === "stopped"
-          ? "closeout"
-          : phase === "ready"
-            ? "none"
-            : "execution";
-    const marker = (id: "plan" | "execution" | "verification" | "closeout", label: string): string => {
-      if (current !== id) return muted(`○ ${label}`);
-      if (id === "closeout" && closeout) return closeoutOutcomeLabel(closeout.outcome).replace(/已完成|已取消|未完成|失败/u, `● ${label}`);
-      if (phase.endsWith("_pending")) return yellow(`● ${label}（待确认）`);
-      return accent(`● ${label}`);
-    };
-    return [
-      renderLine(
-        ` ${bold(accent("工作流"))}  ${marker("plan", "计划")} ${muted("→")} ${marker("execution", "执行")} ${muted("→")} ${marker("verification", "验证")} ${muted("→")} ${marker("closeout", "收口")}`,
-        width,
-      ),
-    ];
+  render(_width: number): string[] {
+    // 阶段状态只在执行或确认时靠近输入区出现，避免空闲页变成仪表盘。
+    return [];
   }
 }
 
 class SessionPresenter implements Component {
-  readonly #readModel: () => TuiReadModel;
-
-  constructor(readModel: () => TuiReadModel) {
-    this.#readModel = readModel;
-  }
-
   invalidate(): void {}
 
-  render(width: number): string[] {
-    const view = this.#readModel().session;
-    const lines = [
-      renderLine(
-        ` ${bold(accent("会话"))}  ${muted("当前活动")} ${escapeTerminalText(view.activity)}`,
-        width,
-      ),
-    ];
-    if (view.plan !== undefined) {
-      lines.push(renderLine(`  ${muted("计划")} ${summarizeSessionPlan(view.plan)}`, width));
-    } else if (view.phase === "planning") {
-      lines.push(renderLine(`  ${muted("计划")} 正在准备可确认的最小步骤`, width));
-    }
-    return lines;
+  render(_width: number): string[] {
+    // Loader、工具摘要和确认卡会在需要时给出状态；这里不常驻重复会话信息。
+    return [];
   }
 }
 
@@ -319,11 +311,7 @@ class ApprovalPresenter implements Component {
     if (!approval) return [];
     return [
       renderLine(
-        ` ${bold(yellow("待确认操作"))}  ${muted(APPROVAL_KIND_LABELS[approval.kind])}`,
-        width,
-      ),
-      renderLine(
-        `  ${yellow(approval.confirmWord)} ${muted("确认")}  ${muted("·")} ${yellow(approval.cancelWord)} ${muted("取消；控制词仅本地处理")}`,
+        ` ${yellow("⚠")} ${bold(yellow(`${APPROVAL_KIND_LABELS[approval.kind]}待确认`))}  ${yellow(approval.confirmWord)} ${muted("确认")} ${muted("·")} ${yellow(approval.cancelWord)} ${muted("取消")}`,
         width,
       ),
     ];
@@ -342,23 +330,7 @@ class TaskCloseoutPresenter implements Component {
   render(width: number): string[] {
     const closeout = this.#readModel().session.closeout;
     if (!closeout) return [];
-    const toolSummary = [
-      `${closeout.successfulTools} 成功`,
-      ...(closeout.failedTools > 0 ? [`${closeout.failedTools} 失败`] : []),
-      ...(closeout.cancelledTools > 0 ? [`${closeout.cancelledTools} 已取消`] : []),
-    ].join(" · ");
-    return [
-      renderLine(muted("─".repeat(Math.max(width, 1))), width),
-      renderLine(` ${bold(accent("本次任务收口"))}  ${closeoutOutcomeLabel(closeout.outcome)}`, width),
-      renderLine(`  工具：${toolSummary}`, width),
-      renderLine(`  ${renderCloseoutModification(closeout)}`, width),
-      renderLine(`  ${renderCloseoutVerification(closeout)}`, width),
-      renderLine(`  ${renderCloseoutGit(closeout)}`, width),
-      renderLine(
-        `  ${muted("审计目标")} ${escapeTerminalText(closeout.auditFileName)} ${muted(`· ${closeout.eventCount} 个生命周期事件`)}`,
-        width,
-      ),
-    ];
+    return [...renderCloseoutSummary(closeout, width)];
   }
 }
 
@@ -377,28 +349,43 @@ class ToolTimeline implements Component {
     if (activity.items.length === 0) return [];
 
     if (!view.session.activityExpanded) {
-      const unsuccessfulParts = [
-        ...(activity.failedCount > 0 ? [`${activity.failedCount} 次失败`] : []),
-        ...(activity.cancelledCount > 0 ? [`${activity.cancelledCount} 次已取消`] : []),
-      ];
-      const issueSummary = unsuccessfulParts.join(" · ");
-      const outcome = activity.outcome === "stopped"
-        ? yellow(`任务已停止${issueSummary ? `（${issueSummary}）` : ""}`)
-        : activity.outcome === "cancelled"
-          ? yellow(`任务已取消${issueSummary ? `（${issueSummary}）` : ""}`)
-          : activity.outcome === "completed"
-            ? green(issueSummary ? `已完成（${issueSummary}）` : "成功完成")
-            : issueSummary
-              ? (activity.failedCount > 0 ? red(issueSummary) : yellow(issueSummary))
-              : muted("进行中");
-      return [renderLine(`  ${muted("工具活动已折叠")} · ${activity.finalizedCount} 次处理 · ${outcome}`, width)];
+      // 默认视图只保留 Loader 与最终收口；工具详情由用户按需展开。
+      return [];
     }
 
     return [
-      renderLine(`  ${bold(accent("工具活动"))} ${muted("Ctrl+O 折叠")}`, width),
-      ...activity.items.map((item) => renderLine(`  ${muted("·")} ${item.label}`, width)),
+      renderLine(`  ${bold(accent("工具详情"))} ${muted("· Ctrl+O 收起")}`, width),
+      ...activity.items.map((item) => renderLine(`  ${muted("↳")} ${item.label}`, width)),
     ];
   }
+}
+
+/** 每轮输入前的弱分隔线，只服务于阅读节奏，不承载任何状态或控制语义。 */
+class TranscriptTurnDivider implements Component {
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    const dashCount = Math.max(width - 2, 1);
+    return [renderLine(` ${muted("┄".repeat(dashCount))}`, width)];
+  }
+}
+
+/** 输入区下方的固定状态行：路径靠左，实际调用模型靠右。 */
+export function renderFooterStatus(workspacePath: string, modelName: string, width: number): string {
+  const safeWorkspacePath = escapeTerminalText(workspacePath);
+  const safeModelName = escapeTerminalText(modelName);
+  const contentWidth = Math.max(width - 1, 1);
+  const modelWidth = visibleWidth(safeModelName);
+
+  // 窄终端优先保留当前模型；正常宽度下路径靠左、模型靠右。
+  if (modelWidth >= contentWidth) {
+    return renderLine(accent(truncateToWidth(safeModelName, contentWidth)), width);
+  }
+
+  const workspaceWidth = Math.max(contentWidth - modelWidth - 1, 1);
+  const displayedPath = truncateToWidth(safeWorkspacePath, workspaceWidth);
+  const gap = Math.max(contentWidth - visibleWidth(displayedPath) - modelWidth, 1);
+  return renderLine(` ${muted(displayedPath)}${" ".repeat(gap)}${accent(safeModelName)}`, width);
 }
 
 class Footer implements Component {
@@ -411,21 +398,8 @@ class Footer implements Component {
   invalidate(): void {}
 
   render(width: number): string[] {
-    const view = this.#readModel().session;
-    const activity = view.pendingApproval
-      ? yellow(`等待确认：${view.pendingApproval.prompt}`)
-      : view.phase === "planning" || view.phase === "executing"
-        ? yellow("执行中")
-        : view.phase === "stopped"
-          ? yellow("已停止")
-          : green("可输入");
-    return [
-      renderLine(muted("─".repeat(Math.max(width, 1))), width),
-      renderLine(
-        ` ${activity}  ${muted(`上下文 ${view.contextTurns} / ${MAX_CONTEXT_TURNS}`)}  ${muted("滚轮历史 · Ctrl+V 粘贴 · /help · /clear · /details · /exit")}`,
-        width,
-      ),
-    ];
+    const chrome = this.#readModel().chrome;
+    return [renderFooterStatus(chrome.workspacePath, chrome.modelName, width)];
   }
 }
 
@@ -597,13 +571,13 @@ export function createCoreTuiPlugins(): readonly TuiPlugin[] {
     {
       id: "core.workflow",
       nodes: (context) => [
-        stableNode("core.workflow", "workflow", context, () => new WorkflowPresenter(context.readModel)),
+        stableNode("core.workflow", "workflow", context, () => new WorkflowPresenter()),
       ],
     },
     {
       id: "core.session",
       nodes: (context) => [
-        stableNode("core.session", "session", context, () => new SessionPresenter(context.readModel)),
+        stableNode("core.session", "session", context, () => new SessionPresenter()),
       ],
     },
     {
@@ -648,6 +622,22 @@ export interface PiTuiRendererCallbacks {
   readonly normalizeInput: (text: string) => string;
 }
 
+/** `/model` 面板需要展示的公开 Profile 摘要；不包含 base URL、API Key 或请求内容。 */
+export interface TuiModelProfileView {
+  readonly id: string;
+  readonly label: string;
+  readonly readiness: string;
+  readonly current: boolean;
+  readonly ready: boolean;
+}
+
+/** 模型切换后的公开展示摘要；不包含 base URL、API Key 或请求内容。 */
+export interface TuiModelSwitchSummary {
+  readonly profileLabel?: string;
+  readonly modelName: string;
+  readonly remoteWorkspacePath?: string;
+}
+
 export interface PiTuiRendererOptions {
   readonly options: CliArguments;
   readonly terminal: Terminal;
@@ -674,6 +664,7 @@ export class PiTuiRenderer {
   #events: readonly AgentEvent[] = [];
   #loading = false;
   #activityExpanded = false;
+  #hasUserInput = false;
   #revision = 0;
   #started = false;
   #stopped = false;
@@ -796,6 +787,7 @@ export class PiTuiRenderer {
 
   clearTranscript(): void {
     this.#transcript.clear();
+    this.#hasUserInput = false;
     this.requestRender();
   }
 
@@ -803,27 +795,34 @@ export class PiTuiRenderer {
     this.#terminal.write("\u001B[3J");
   }
 
-  appendWelcome(mode: string, remoteDataNotice?: string): void {
-    this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))} ${muted(escapeMultilineTerminalText(mode))}`, 1, 0));
-    if (remoteDataNotice !== undefined) {
-      this.#transcript.addChild(new Text(
-        yellow(`  ${escapeMultilineTerminalText(remoteDataNotice)}`),
-        1,
-        0,
-      ));
-    }
-    this.#transcript.addChild(new Text(muted("  鼠标滚轮或终端滚动条可查看历史；支持 Ctrl+V 粘贴，工具细节默认折叠。"), 1, 1));
+  appendWelcome(mode: string, remoteWorkspacePath?: string): void {
+    this.#transcript.addChild(new Text(
+      `${accent("✦")} ${escapeMultilineTerminalText(mode)}`,
+      1,
+      1,
+    ));
+    if (remoteWorkspacePath !== undefined) this.appendRemoteDataNotice(remoteWorkspacePath);
     this.requestRender();
   }
 
   appendUser(input: string): void {
-    this.#transcript.addChild(new Text(`${bold(green("你"))}`, 1, 0));
-    this.#transcript.addChild(new Text(escapeMultilineTerminalText(input), 2, 1));
+    const lines = escapeMultilineTerminalText(input).split("\n");
+    const hasPreviousTurn = this.#hasUserInput;
+    if (hasPreviousTurn) this.#transcript.addChild(new TranscriptTurnDivider());
+    this.#transcript.addChild(new Text(
+      [
+        `${bold(accent("❯"))} ${lines[0] ?? ""}`,
+        ...lines.slice(1).map((line) => `  ${line}`),
+      ].join("\n"),
+      hasPreviousTurn ? 0 : 1,
+      1,
+    ));
+    this.#hasUserInput = true;
     this.requestRender();
   }
 
   appendAnswer(answer: string): void {
-    this.#transcript.addChild(new Text(`${bold(accent("MiniCode"))}`, 1, 0));
+    this.#transcript.addChild(new Text(`${accent("✦")} ${muted("MiniCode")}`, 1, 0));
     this.#transcript.addChild(new Markdown(
       escapeMultilineTerminalText(answer),
       2,
@@ -834,60 +833,102 @@ export class PiTuiRenderer {
   }
 
   appendHelp(includeOfflineExamples: boolean): void {
-    const appendSection = (title: string, entries: readonly (readonly [string, string])[]): void => {
-      this.#transcript.addChild(new Text(
-        [
-          bold(accent(title)),
-          ...entries.map(([command, description]) => `  ${yellow(command)}  ${muted(description)}`),
-        ].join("\n"),
-        2,
-        1,
-      ));
-    };
-
+    this.#transcript.addChild(new Text(bold("命令"), 1, 0));
     this.#transcript.addChild(new Text(
-      `${bold(accent("帮助"))}  ${muted("命令与本地确认")}`,
+      [
+        `  ${yellow("/model [profile]")}  ${muted("查看或切换模型")}`,
+        `  ${yellow("/status")}           ${muted("查看当前配置与审计")}`,
+        `  ${yellow("/details")}${muted(" / Ctrl+O")}  ${muted("展开工具过程")}`,
+        `  ${yellow("/clear")}            ${muted("清空会话与终端历史")}`,
+        `  ${yellow("/exit")}             ${muted("退出")}`,
+        "",
+        `  ${muted("仅在提示时确认：")} ${yellow("CONTINUE")} ${yellow("APPLY")} ${yellow("RUN")} ${yellow("CANCEL")}`,
+        ...(includeOfflineExamples
+          ? [`  ${muted("离线示例：查看源码 · 查看 Git status · 运行测试")}`]
+          : []),
+      ].join("\n"),
       1,
-      0,
+      1,
     ));
-    appendSection("会话", [
-      ["/model [profile]", "查看或切换模型 Profile"],
-      ["/status", "查看当前配置"],
-      ["/details 或 Ctrl+O", "展开或折叠工具活动"],
-      ["/clear", "清空会话与当前终端历史"],
-      ["/exit", "退出"],
-    ]);
-    appendSection("浏览与输入", [
-      ["滚轮或终端滚动条", "查看历史"],
-      ["Ctrl+V", "粘贴文本"],
-    ]);
-    appendSection("本地确认（仅等待确认时有效）", [
-      ["CONTINUE", "开始计划或继续一次有界修复"],
-      ["APPLY", "写入已预览的补丁"],
-      ["RUN", "执行固定验证或受控命令"],
-      ["CANCEL", "取消当前确认"],
-    ]);
-    if (includeOfflineExamples) {
-      appendSection("离线演示（不会自行修改文件）", [
-        ["源码查看", "说明未知工具为何仍有完整的终态事件"],
-        ["Git 查看", "请查看 Git status 和未暂存 diff 并汇报"],
-        ["测试", "运行测试并汇报结果"],
-        ["编辑模式", "请查看 npm --version 并汇报"],
-      ]);
-    }
+    this.requestRender();
+  }
+
+  /** 用独立面板呈现 Profile，避免把列表、配置和安全说明挤进通用通知。 */
+  appendModelProfiles(profiles: readonly TuiModelProfileView[]): void {
+    const safeProfiles = profiles.map((profile) => ({
+      id: escapeTerminalText(profile.id),
+      label: escapeTerminalText(profile.label),
+      readiness: escapeTerminalText(profile.readiness),
+      current: profile.current,
+      ready: profile.ready,
+    }));
+    const profileLines = safeProfiles.flatMap((profile, index) => {
+      const marker = profile.current ? accent("● 当前") : muted("○ 可选");
+      const readiness = profile.ready ? green(profile.readiness) : yellow(profile.readiness);
+      return [
+        `  ${marker}  ${yellow(profile.id)}`,
+        `      ${profile.label} ${muted("·")} ${readiness}`,
+        ...(index < safeProfiles.length - 1 ? [""] : []),
+      ];
+    });
+    this.#transcript.addChild(new Text(
+      [
+        bold(accent("模型 Profile")),
+        "",
+        ...profileLines,
+        "",
+        bold(accent("切换")),
+        `  ${yellow("/model <profile>")}  ${muted("切换；会清空后续发送给模型的会话上下文。")}`,
+        "",
+        bold(accent("OpenAI-compatible 配置")),
+        `  ${muted("BASE URL")}  ${yellow("MINICODE_OPENAI_BASE_URL")}`,
+        `  ${muted("MODEL")}     ${yellow("MINICODE_OPENAI_MODEL")}`,
+        `  ${muted("API KEY")}   ${yellow("MINICODE_OPENAI_API_KEY")}`,
+        "",
+        bold(accent("连接限制")),
+        `  ${muted("默认仅 HTTPS 或本机回环 HTTP。")}`,
+        `  ${yellow("MINICODE_ALLOW_INSECURE_HTTP=1")} ${muted("会放行其他明文 HTTP；可能暴露密钥和正文。")}`,
+      ].join("\n"),
+      1,
+      1,
+    ));
+    this.requestRender();
+  }
+
+  /** 固定结构的切换摘要，避免用两段自动折行的通用通知表达状态与数据边界。 */
+  appendModelSwitchSummary(summary: TuiModelSwitchSummary): void {
+    const profileLabel = summary.profileLabel === undefined
+      ? undefined
+      : escapeTerminalText(summary.profileLabel);
+    const modelName = escapeTerminalText(summary.modelName);
+    const identity = profileLabel === undefined ? accent(modelName) : `${muted(profileLabel)} ${muted("→")} ${accent(modelName)}`;
+    this.#transcript.addChild(new Text(
+      [
+        `${green("✓")} ${bold(green("模型已切换"))}`,
+        `  ${identity}`,
+        `  ${muted("后续发送给模型的会话已清空。")}`,
+      ].join("\n"),
+      1,
+      1,
+    ));
+    if (summary.remoteWorkspacePath !== undefined) this.appendRemoteDataNotice(summary.remoteWorkspacePath);
     this.requestRender();
   }
 
   appendNotice(message: string, tone: "accent" | "success" | "warning" | "error" | "muted"): void {
-    const painter = {
-      accent,
-      success: green,
-      warning: yellow,
-      error: red,
-      muted,
+    const presentation = {
+      accent: { icon: "•", painter: accent },
+      success: { icon: "✓", painter: green },
+      warning: { icon: "!", painter: yellow },
+      error: { icon: "×", painter: red },
+      muted: { icon: "·", painter: muted },
     }[tone];
+    const lines = escapeMultilineTerminalText(message).split("\n");
     this.#transcript.addChild(new Text(
-      painter(`  ${escapeMultilineTerminalText(message)}`),
+      [
+        ` ${presentation.painter(presentation.icon)} ${lines[0] ?? ""}`,
+        ...lines.slice(1).map((line) => `   ${line}`),
+      ].join("\n"),
       1,
       1,
     ));
@@ -1010,9 +1051,25 @@ export class PiTuiRenderer {
       this.#revision,
       {
         workspaceName: path.basename(this.#options.workspaceRoot) || this.#options.workspaceRoot,
+        workspacePath: path.resolve(this.#options.workspaceRoot),
+        modelName: activeModelName(this.#options),
         modelLabel: modelLabel(this.#options),
         permissionLabel: toolPermissionLabel(this.#options),
       },
     );
+  }
+
+  private appendRemoteDataNotice(workspacePath: string): void {
+    this.#transcript.addChild(new Text(
+      [
+        `${yellow("!")} ${bold(yellow("远程数据提示"))}`,
+        `  ${muted("工作区")}  ${escapeTerminalText(workspacePath)}`,
+        `  ${muted("切换本身不发送请求；任务执行时可能发送：")}`,
+        `  ${muted("用户任务 · 目录/搜索结果 · 源码片段 · Git 状态或差异")}`,
+        `  ${muted("编辑参数 · 获准进程输出")}`,
+      ].join("\n"),
+      1,
+      1,
+    ));
   }
 }

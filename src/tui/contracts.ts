@@ -84,6 +84,10 @@ export interface TuiActivityView {
 /** 顶部与底部栏可展示的已净化配置摘要。 */
 export interface TuiChromeView {
   readonly workspaceName: string;
+  /** 输入区下方显示的绝对工作区路径。 */
+  readonly workspacePath: string;
+  /** 输入区下方显示的实际调用模型名；不包含 Profile 名称。 */
+  readonly modelName: string;
   readonly modelLabel: string;
   readonly permissionLabel: string;
 }

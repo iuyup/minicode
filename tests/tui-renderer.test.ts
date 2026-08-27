@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
 
-import { Text, type Terminal } from "@mariozechner/pi-tui";
+import { Text, type Terminal, visibleWidth } from "@mariozechner/pi-tui";
 
-import { PiTuiRenderer } from "../src/tui/pi-renderer.ts";
-import type { SessionViewState, TuiPlugin } from "../src/tui/contracts.ts";
+import { PiTuiRenderer, renderCloseoutSummary, renderFooterStatus } from "../src/tui/pi-renderer.ts";
+import type { SessionViewState, TaskCloseoutView, TuiPlugin } from "../src/tui/contracts.ts";
 import { parseArguments } from "../src/runtime.ts";
 
 class FakeTerminal implements Terminal {
@@ -68,7 +68,7 @@ function initialState(): SessionViewState {
   };
 }
 
-test("内建 TUI 插件按稳定键和固定槽位挂载，工作流随安全快照刷新", async () => {
+test("内建 TUI 插件按稳定键和固定槽位挂载，空闲时保持紧凑", async () => {
   const terminal = new FakeTerminal();
   let state = initialState();
   const renderer = new PiTuiRenderer({
@@ -97,9 +97,14 @@ test("内建 TUI 插件按稳定键和固定槽位挂载，工作流随安全快
     ];
     assert.deepEqual(renderer.mountedNodeKeys, expectedKeys);
     assert.equal(new Set(renderer.mountedNodeKeys).size, expectedKeys.length);
-    await waitFor(() => stripAnsi(terminal.output).includes("工作流"));
-    assert.match(stripAnsi(terminal.output), /工作流/u);
+    await waitFor(() => stripAnsi(terminal.output).includes("MiniCode"));
+    assert.match(terminal.output, /\u001B\[38;2;109;40;217m/u);
+    assert.match(stripAnsi(terminal.output), /MiniCode/u);
+    assert.doesNotMatch(stripAnsi(terminal.output), /受控 Coding Agent|工作流|当前活动|工具活动已折叠/u);
     assert.doesNotMatch(stripAnsi(terminal.output), /输入一个代码任务，Enter 发送，Shift\+Enter 换行。/u);
+    assert.doesNotMatch(stripAnsi(terminal.output), /\/help · Ctrl\+V 粘贴 · Ctrl\+C 退出 · 上下文/u);
+    assert.ok(stripAnsi(terminal.output).includes(path.resolve(process.cwd())));
+    assert.match(stripAnsi(terminal.output), /FakeModel（离线）/u);
 
     state = {
       ...state,
@@ -110,11 +115,92 @@ test("内建 TUI 插件按稳定键和固定槽位挂载，工作流随安全快
     renderer.requestRender();
 
     assert.deepEqual(renderer.mountedNodeKeys, expectedKeys);
-    await waitFor(() => stripAnsi(terminal.output).includes("计划（待确认）"));
-    assert.match(stripAnsi(terminal.output), /计划（待确认）/u);
+    await waitFor(() => stripAnsi(terminal.output).includes("计划待确认"));
+    assert.match(stripAnsi(terminal.output), /计划待确认.*CONTINUE.*CANCEL/u);
   } finally {
     renderer.stop();
   }
+});
+
+test("底栏只显示实际远程模型名，窄窗口优先保留模型", async () => {
+  const workspacePath = path.resolve(process.cwd());
+  const terminal = new FakeTerminal();
+  terminal.columns = 80;
+  const renderer = new PiTuiRenderer({
+    options: parseArguments([
+      "--workspace",
+      workspacePath,
+      "--audit",
+      path.join(workspacePath, "audit.jsonl"),
+      "--model",
+      "deepseek",
+      "--deepseek-model",
+      "deepseek-v4-flash",
+    ]),
+    terminal,
+    viewState: initialState,
+    callbacks: {
+      onAction: () => assert.fail("纯展示刷新不应发出输入动作"),
+      normalizeInput: (text) => text,
+    },
+  });
+
+  try {
+    renderer.start();
+    await waitFor(() => stripAnsi(terminal.output).includes("deepseek-v4-flash"));
+    const output = stripAnsi(terminal.output);
+    assert.match(output, /✦ MiniCode.*DeepSeek \/ deepseek-v4-flash/u);
+
+    const footer = stripAnsi(renderFooterStatus(workspacePath, "deepseek-v4-flash", 80));
+    assert.ok(footer.includes(workspacePath));
+    assert.ok(footer.endsWith("deepseek-v4-flash"));
+    assert.doesNotMatch(footer, /DeepSeek\s*\//u);
+    assert.equal(visibleWidth(footer), 80);
+
+    const narrowFooter = stripAnsi(renderFooterStatus(
+      "C:\\very-long-workspace-path\\with\\many\\segments",
+      "deepseek-v4-flash",
+      24,
+    ));
+    assert.ok(narrowFooter.endsWith("deepseek-v4-flash"));
+    assert.doesNotMatch(narrowFooter, /DeepSeek\s*\//u);
+    assert.ok(visibleWidth(narrowFooter) <= 24);
+  } finally {
+    renderer.stop();
+  }
+});
+
+test("收口摘要保持低强调、留白，并在窄终端保留完整事实", () => {
+  const closeout: TaskCloseoutView = {
+    outcome: "completed",
+    eventCount: 34,
+    successfulTools: 6,
+    failedTools: 5,
+    cancelledTools: 0,
+    appliedPaths: [],
+    proposedPatchCount: 0,
+    rejectedPatchCount: 0,
+    gitInspections: [],
+    auditFileName: "audit.jsonl",
+  };
+
+  const wide = renderCloseoutSummary(closeout, 100);
+  assert.deepEqual(wide.map(stripAnsi), [
+    " ✓ 已结束 · 工具 6 成功 / 5 失败 · 未写入 · 未运行验证",
+    "",
+  ]);
+  assert.match(wide[0] ?? "", /\u001B\[90m/u);
+  assert.doesNotMatch(wide[0] ?? "", /\u001B\[1m/u);
+  assert.doesNotMatch(stripAnsi(wide.join("\n")), /Git|审计|事件/u);
+
+  const narrow = renderCloseoutSummary(closeout, 31).map(stripAnsi);
+  assert.deepEqual(narrow, [
+    " ✓ 已结束",
+    "   工具 6 成功 / 5 失败",
+    "   未写入 · 未运行验证",
+    "",
+  ]);
+  for (const line of narrow) assert.ok(visibleWidth(line) <= 31);
 });
 
 test("组件插件只读取冻结展示模型，更新不会重复创建稳定键组件", () => {

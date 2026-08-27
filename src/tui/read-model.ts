@@ -355,6 +355,8 @@ export function createTuiReadModel(
     revision,
     chrome: Object.freeze({
       workspaceName: escapeTerminalText(chrome.workspaceName),
+      workspacePath: escapeTerminalText(chrome.workspacePath),
+      modelName: escapeTerminalText(chrome.modelName),
       modelLabel: escapeTerminalText(chrome.modelLabel),
       permissionLabel: escapeTerminalText(chrome.permissionLabel),
     }),

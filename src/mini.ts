@@ -22,6 +22,7 @@ import type {
 import type { AgentEvent } from "./agent/events.ts";
 import { fakeModelUnsupportedTaskMessage, isFakeModelDemoTask } from "./models/fake-model.ts";
 import {
+  activeModelName,
   createAgent,
   listModelProfiles,
   modelLabel,
@@ -537,23 +538,16 @@ export class MiniTuiApp {
 
   private appendWelcome(): void {
     const mode = this.#options.guided
-      ? "当前为引导式会话：先确认计划，再进入每个执行阶段。"
+      ? "引导式会话：先确认计划，再进入每个执行阶段。"
       : this.#options.modelProfile === "fake"
-        ? "当前是离线演示：仅支持固定示例；输入 /help 查看示例，/model 查看并切换已配置的模型 Profile。"
+        ? "离线演示：不会修改文件；/help 查看固定示例，/model 切换模型。"
         : this.#options.agentMode === "edit"
-          ? "当前是受控编辑会话：补丁逐次等待 APPLY，验证与 Node/npm 命令逐次等待 RUN。"
-          : `当前会话会调用 ${modelLabel(this.#options)}，并仅开放已标明的工具权限。`;
+          ? "受控编辑：补丁等待 APPLY；验证和命令等待 RUN。"
+          : "远程会话：仅开放已标明的工具权限。";
     this.#renderer.appendWelcome(
       mode,
-      this.#options.modelProfile !== "fake" ? this.remoteDataNotice() : undefined,
+      this.#options.modelProfile !== "fake" ? this.#options.workspaceRoot : undefined,
     );
-  }
-
-  private remoteDataNotice(): string {
-    return [
-      `远程数据提示：当前工作区 ${this.#options.workspaceRoot} 将连接 ${modelLabel(this.#options)}。`,
-      "按工具实际调用，用户任务、目录/搜索结果、源码片段、Git 状态或差异，以及编辑参数和获准进程输出可能发送给该远程服务。",
-    ].join(" ");
   }
 
   private appendUser(input: string): void {
@@ -677,13 +671,16 @@ export class MiniTuiApp {
     const requestedProfile = input.slice("/model".length).trim();
     if (requestedProfile === "") {
       const choices = listModelProfiles().map((profile) => {
-        const marker = profile.id === this.#options.modelProfile ? "当前" : "可选";
-        return `${marker} ${profile.id} · ${profile.label} · ${modelProfileReadiness(profile)}`;
+        const readiness = modelProfileReadiness(profile);
+        return {
+          id: profile.id,
+          label: profile.label,
+          readiness,
+          current: profile.id === this.#options.modelProfile,
+          ready: readiness === "就绪",
+        };
       });
-      this.appendNotice(
-        `模型 Profile：\n${choices.join("\n")}\nOpenAI-compatible 配置：MINICODE_OPENAI_BASE_URL、MINICODE_OPENAI_MODEL、MINICODE_OPENAI_API_KEY。默认只允许 HTTPS 或本机回环 HTTP；MINICODE_ALLOW_INSECURE_HTTP=1 可显式放行其他明文 HTTP，但会暴露密钥与正文。\n输入 /model <profile> 切换；切换会清除后续发送给模型的会话上下文。`,
-        "accent",
-      );
+      this.#renderer.appendModelProfiles(choices);
       return;
     }
     if (!this.#createAgent) {
@@ -707,13 +704,11 @@ export class MiniTuiApp {
       this.#currentCloseout = undefined;
       this.#sessionPhase = "ready";
       this.#sessionActivity = "等待新任务";
-      this.appendNotice(
-        `已切换到 ${modelLabel(this.#options)}；为避免不同模型混用上下文，后续发送给模型的会话已清空。`,
-        "success",
-      );
-      if (this.#options.modelProfile !== "fake") {
-        this.appendNotice(this.remoteDataNotice(), "warning");
-      }
+      this.#renderer.appendModelSwitchSummary({
+        ...(profile.kind === "fake" ? {} : { profileLabel: profile.label }),
+        modelName: activeModelName(this.#options),
+        ...(this.#options.modelProfile === "fake" ? {} : { remoteWorkspacePath: this.#options.workspaceRoot }),
+      });
       this.refreshActivity();
     } catch (error) {
       Object.assign(this.#options, previousOptions);
