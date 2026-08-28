@@ -1465,6 +1465,7 @@ test("guided TUI shows a plan and waits for CONTINUE before tools can run", asyn
 
     const task = app.submit("解释未知工具为何仍有完整的终态事件");
     await waitFor(() => app?.awaitingPlanApproval === true);
+    await waitFor(() => stripAnsi(terminal.output).includes("待确认计划"));
     assert.equal(app.contextTurns, 0);
     assert.match(stripAnsi(terminal.output), /待确认计划/);
     assert.match(stripAnsi(terminal.output), /CONTINUE/);
