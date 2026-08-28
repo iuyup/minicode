@@ -3,7 +3,25 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A small, auditable coding-agent learning project.",
+  "description": "A small, auditable TypeScript coding agent with explicit approvals and read-only Git closeout.",
+  "license": "MIT",
+  "author": "iuyup",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iuyup/minicode.git"
+  },
+  "homepage": "https://github.com/iuyup/minicode#readme",
+  "bugs": {
+    "url": "https://github.com/iuyup/minicode/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "typescript",
+    "tui",
+    "llm",
+    "deepseek",
+    "openai-compatible"
+  ],
   "bin": {
     "mini": "src/mini.ts"
   },
